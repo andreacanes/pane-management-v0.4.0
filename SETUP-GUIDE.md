@@ -595,6 +595,14 @@ Then in the app:
 - Make sure tmux is installed inside WSL: `wsl -e which tmux`
 - Make sure a tmux session is running: `wsl -e tmux list-sessions`
 
+### Something else is broken
+Run the diagnostics script to collect system info for the developer:
+```powershell
+cd path\to\pane-management
+powershell -File diagnostics.ps1
+```
+This creates a `diagnostics-report-<timestamp>.txt` file. Send it to the developer — it contains dependency versions, WSL status, tmux state, patch status, and system resources. No personal data or code is collected.
+
 ---
 
 ## Summary Checklist
