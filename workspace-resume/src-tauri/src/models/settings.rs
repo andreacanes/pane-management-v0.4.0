@@ -22,7 +22,7 @@ pub struct TerminalSettings {
 }
 
 fn default_tmux_session_name() -> String {
-    "workspace".to_string()
+    "main".to_string()
 }
 
 impl Default for TerminalSettings {
@@ -62,7 +62,7 @@ mod tests {
     fn test_default_settings() {
         let settings = TerminalSettings::default();
         assert_eq!(settings.backend, TerminalBackend::Tmux);
-        assert_eq!(settings.tmux_session_name, "workspace");
+        assert_eq!(settings.tmux_session_name, "main");
     }
 
     #[test]

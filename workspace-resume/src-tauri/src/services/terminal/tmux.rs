@@ -9,7 +9,7 @@ pub struct TmuxLauncher {
 impl TmuxLauncher {
     pub fn new() -> Self {
         Self {
-            session_name: "workspace".to_string(),
+            session_name: "main".to_string(),
         }
     }
 
