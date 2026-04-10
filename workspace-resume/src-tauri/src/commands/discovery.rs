@@ -3,21 +3,48 @@ use crate::models::session::SessionInfo;
 use crate::services::path_decoder;
 use crate::services::scanner;
 
-#[tauri::command]
-pub async fn list_projects() -> Result<Vec<ProjectInfo>, String> {
-    let projects_dir = dirs::home_dir()
-        .ok_or("Cannot find home directory")?
-        .join(".claude")
-        .join("projects");
-
-    if !projects_dir.exists() {
-        return Ok(vec![]);
+/// Convert a WSL path like /mnt/c/Users/... to a Windows path C:\Users\...
+/// so that path_exists checks work from the Windows side.
+fn wsl_path_to_windows(path: &str) -> Option<String> {
+    if path.starts_with("/mnt/") && path.len() >= 7 && path.as_bytes()[5].is_ascii_alphabetic() && path.as_bytes()[6] == b'/' {
+        let drive = path.as_bytes()[5].to_ascii_uppercase() as char;
+        Some(format!("{}:{}", drive, path[6..].replace('/', "\\")))
+    } else {
+        None
     }
+}
 
-    let mut projects = Vec::new();
+/// Check if a path exists, handling WSL paths by converting to Windows format.
+fn check_path_exists(actual_path: &str) -> bool {
+    // Try the path as-is first (works for Windows paths like C:\Users\...)
+    if std::path::Path::new(actual_path).exists() {
+        return true;
+    }
+    // If it's a WSL /mnt/ path, convert to Windows and try again
+    if let Some(win_path) = wsl_path_to_windows(actual_path) {
+        return std::path::Path::new(&win_path).exists();
+    }
+    // For WSL-native paths like /home/andrea/..., check via UNC
+    if actual_path.starts_with('/') {
+        let unc = format!("\\\\wsl.localhost\\Ubuntu{}", actual_path.replace('/', "\\"));
+        return std::path::Path::new(&unc).exists();
+    }
+    false
+}
 
-    let entries = std::fs::read_dir(&projects_dir)
-        .map_err(|e| format!("Cannot read projects directory: {}", e))?;
+/// Scan a single projects directory and collect ProjectInfo entries.
+fn scan_projects_dir(
+    projects_dir: &std::path::Path,
+    seen: &mut std::collections::HashSet<String>,
+    projects: &mut Vec<(ProjectInfo, std::time::SystemTime)>,
+) {
+    let entries = match std::fs::read_dir(projects_dir) {
+        Ok(e) => e,
+        Err(e) => {
+            eprintln!("[discovery] Cannot read {}: {}", projects_dir.display(), e);
+            return;
+        }
+    };
 
     for entry in entries {
         let entry = match entry {
@@ -35,12 +62,11 @@ pub async fn list_projects() -> Result<Vec<ProjectInfo>, String> {
 
         let encoded_name = entry.file_name().to_string_lossy().to_string();
 
-        // Only discover WSL-encoded paths (-mnt-c- prefix).
-        // Windows-encoded paths (C-- prefix) stay on disk but are hidden from the UI.
-        // This avoids duplicates after session migration from Windows to WSL.
-        if !encoded_name.starts_with("-mnt-c-") {
+        // Skip if we've already seen this encoded name (dedup across scan dirs)
+        if seen.contains(&encoded_name) {
             continue;
         }
+        seen.insert(encoded_name.clone());
 
         // Count .jsonl files and find the most recently modified one
         let mut session_count = 0usize;
@@ -61,15 +87,19 @@ pub async fn list_projects() -> Result<Vec<ProjectInfo>, String> {
             }
         }
 
+        // Skip empty project dirs (no sessions)
+        if session_count == 0 {
+            continue;
+        }
+
         // Get actual path from cwd field in first JSONL record
         let actual_path = path_decoder::extract_cwd_from_first_record(&path)
             .unwrap_or_else(|| {
-                // Fallback: use encoded name as-is with a note
                 format!("[unresolved] {}", encoded_name)
             });
 
         // Per locked decision: missing folders still returned, frontend prompts user
-        let path_exists = std::path::Path::new(&actual_path).exists();
+        let path_exists = check_path_exists(&actual_path);
 
         projects.push((ProjectInfo {
             encoded_name,
@@ -77,6 +107,26 @@ pub async fn list_projects() -> Result<Vec<ProjectInfo>, String> {
             session_count,
             path_exists,
         }, latest_modified));
+    }
+}
+
+#[tauri::command]
+pub async fn list_projects() -> Result<Vec<ProjectInfo>, String> {
+    let mut projects: Vec<(ProjectInfo, std::time::SystemTime)> = Vec::new();
+    let mut seen = std::collections::HashSet::new();
+
+    // 1. Scan WSL home ~/.claude/projects/ via UNC path (primary — where active sessions live)
+    let wsl_projects = std::path::PathBuf::from(r"\\wsl.localhost\Ubuntu\home\andrea\.claude\projects");
+    if wsl_projects.exists() {
+        scan_projects_dir(&wsl_projects, &mut seen, &mut projects);
+    }
+
+    // 2. Scan Windows home ~/.claude/projects/ (secondary — legacy or Windows-native sessions)
+    if let Some(win_home) = dirs::home_dir() {
+        let win_projects = win_home.join(".claude").join("projects");
+        if win_projects.exists() {
+            scan_projects_dir(&win_projects, &mut seen, &mut projects);
+        }
     }
 
     // Sort by most recently modified session file (newest first)
@@ -86,17 +136,29 @@ pub async fn list_projects() -> Result<Vec<ProjectInfo>, String> {
     Ok(projects)
 }
 
+/// Find the project directory by checking WSL first, then Windows home.
+fn find_project_dir(encoded_project: &str) -> Option<std::path::PathBuf> {
+    // Check WSL home first (primary)
+    let wsl_dir = std::path::PathBuf::from(format!(
+        r"\\wsl.localhost\Ubuntu\home\andrea\.claude\projects\{}", encoded_project
+    ));
+    if wsl_dir.exists() {
+        return Some(wsl_dir);
+    }
+    // Check Windows home (secondary)
+    if let Some(win_home) = dirs::home_dir() {
+        let win_dir = win_home.join(".claude").join("projects").join(encoded_project);
+        if win_dir.exists() {
+            return Some(win_dir);
+        }
+    }
+    None
+}
+
 #[tauri::command]
 pub async fn list_sessions(encoded_project: String) -> Result<Vec<SessionInfo>, String> {
-    let project_dir = dirs::home_dir()
-        .ok_or("Cannot find home directory")?
-        .join(".claude")
-        .join("projects")
-        .join(&encoded_project);
-
-    if !project_dir.exists() {
-        return Err(format!("Project directory not found: {}", encoded_project));
-    }
+    let project_dir = find_project_dir(&encoded_project)
+        .ok_or_else(|| format!("Project directory not found: {}", encoded_project))?;
 
     let mut sessions = Vec::new();
 
@@ -171,11 +233,8 @@ pub async fn list_sessions(encoded_project: String) -> Result<Vec<SessionInfo>, 
 
 #[tauri::command]
 pub async fn delete_session(encoded_project: String, session_id: String) -> Result<(), String> {
-    let project_dir = dirs::home_dir()
-        .ok_or("Cannot find home directory")?
-        .join(".claude")
-        .join("projects")
-        .join(&encoded_project);
+    let project_dir = find_project_dir(&encoded_project)
+        .ok_or_else(|| format!("Project directory not found: {}", encoded_project))?;
 
     let session_file = project_dir.join(format!("{}.jsonl", session_id));
     if !session_file.exists() {

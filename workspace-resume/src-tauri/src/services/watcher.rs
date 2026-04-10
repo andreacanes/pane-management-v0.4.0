@@ -26,20 +26,27 @@ pub async fn start_watcher(
     )
     .map_err(|e| format!("Failed to create watcher: {}", e))?;
 
-    let claude_projects = dirs::home_dir()
+    // Watch WSL home projects (primary — where active sessions live)
+    let wsl_projects = std::path::PathBuf::from(r"\\wsl.localhost\Ubuntu\home\andrea\.claude\projects");
+    if wsl_projects.exists() {
+        watcher
+            .watch(&wsl_projects, RecursiveMode::Recursive)
+            .map_err(|e| format!("Failed to watch WSL directory: {}", e))?;
+    }
+
+    // Also watch Windows home projects (secondary — legacy sessions)
+    let win_projects = dirs::home_dir()
         .ok_or("Cannot find home directory")?
         .join(".claude")
         .join("projects");
-
-    if claude_projects.exists() {
+    if win_projects.exists() {
         watcher
-            .watch(&claude_projects, RecursiveMode::Recursive)
-            .map_err(|e| format!("Failed to watch directory: {}", e))?;
-    } else {
-        eprintln!(
-            "Warning: {:?} does not exist, watcher has nothing to watch",
-            claude_projects
-        );
+            .watch(&win_projects, RecursiveMode::Recursive)
+            .map_err(|e| format!("Failed to watch Windows directory: {}", e))?;
+    }
+
+    if !wsl_projects.exists() && !win_projects.exists() {
+        eprintln!("Warning: no Claude projects directory found to watch");
     }
 
     // Debounced event processing task
