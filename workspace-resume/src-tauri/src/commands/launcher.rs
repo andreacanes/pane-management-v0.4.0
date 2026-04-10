@@ -124,8 +124,8 @@ pub async fn resume_session(
     // Read terminal settings from store
     let settings = load_terminal_settings(&app)?;
 
-    // Create launcher for the selected backend
-    let launcher = terminal::create_launcher(&settings.backend);
+    // Create launcher for the selected backend (passes tmux_session_name for tmux)
+    let launcher = terminal::create_launcher_from_settings(&settings);
 
     // If selected launcher isn't available, try fallbacks in order: tmux → powershell
     let (launcher, _fallback_used) = if !launcher.is_available() {
@@ -136,7 +136,9 @@ pub async fn resume_session(
         };
         let mut found = None;
         for fb in fallback_order {
-            let fallback = terminal::create_launcher(&fb);
+            let mut fallback_settings = settings.clone();
+            fallback_settings.backend = fb;
+            let fallback = terminal::create_launcher_from_settings(&fallback_settings);
             if fallback.is_available() {
                 found = Some(fallback);
                 break;
@@ -219,8 +221,11 @@ pub async fn update_terminal_settings(
     )
     .map_err(|e| format!("Invalid backend value: {}", e))?;
 
+    // Preserve existing tmux_session_name when only changing backend
+    let existing = load_terminal_settings(&app).unwrap_or_default();
     let settings = TerminalSettings {
         backend: backend_enum,
+        tmux_session_name: existing.tmux_session_name,
     };
 
     save_terminal_settings(&app, &settings)?;

@@ -40,11 +40,21 @@ pub trait TerminalLauncher: Send + Sync {
     fn is_available(&self) -> bool;
 }
 
-use crate::models::settings::TerminalBackend;
+use crate::models::settings::{TerminalBackend, TerminalSettings};
 
 pub fn create_launcher(backend: &TerminalBackend) -> Box<dyn TerminalLauncher> {
     match backend {
         TerminalBackend::Tmux => Box::new(tmux::TmuxLauncher::new()),
+        TerminalBackend::Warp => Box::new(warp::WarpLauncher::new()),
+        TerminalBackend::Powershell => Box::new(powershell::PowerShellLauncher::new()),
+    }
+}
+
+pub fn create_launcher_from_settings(settings: &TerminalSettings) -> Box<dyn TerminalLauncher> {
+    match settings.backend {
+        TerminalBackend::Tmux => Box::new(tmux::TmuxLauncher::with_session_name(
+            settings.tmux_session_name.clone(),
+        )),
         TerminalBackend::Warp => Box::new(warp::WarpLauncher::new()),
         TerminalBackend::Powershell => Box::new(powershell::PowerShellLauncher::new()),
     }

@@ -19,6 +19,7 @@ export type TerminalBackend = "tmux" | "warp" | "powershell";
 
 export interface TerminalSettings {
   backend: TerminalBackend;
+  tmux_session_name: string;
 }
 
 export interface ResumeResult {

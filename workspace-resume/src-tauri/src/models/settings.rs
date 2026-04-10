@@ -17,12 +17,19 @@ impl Default for TerminalBackend {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TerminalSettings {
     pub backend: TerminalBackend,
+    #[serde(default = "default_tmux_session_name")]
+    pub tmux_session_name: String,
+}
+
+fn default_tmux_session_name() -> String {
+    "workspace".to_string()
 }
 
 impl Default for TerminalSettings {
     fn default() -> Self {
         Self {
             backend: TerminalBackend::default(),
+            tmux_session_name: default_tmux_session_name(),
         }
     }
 }
@@ -55,6 +62,7 @@ mod tests {
     fn test_default_settings() {
         let settings = TerminalSettings::default();
         assert_eq!(settings.backend, TerminalBackend::Tmux);
+        assert_eq!(settings.tmux_session_name, "workspace");
     }
 
     #[test]

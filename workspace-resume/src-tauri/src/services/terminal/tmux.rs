@@ -2,11 +2,19 @@ use super::{LaunchError, LaunchResult, TerminalLauncher};
 #[cfg(windows)]
 use std::os::windows::process::CommandExt;
 
-pub struct TmuxLauncher;
+pub struct TmuxLauncher {
+    session_name: String,
+}
 
 impl TmuxLauncher {
     pub fn new() -> Self {
-        Self
+        Self {
+            session_name: "workspace".to_string(),
+        }
+    }
+
+    pub fn with_session_name(session_name: String) -> Self {
+        Self { session_name }
     }
 
     /// Convert a Windows path to a WSL mount path
@@ -58,8 +66,8 @@ impl TerminalLauncher for TmuxLauncher {
         eprintln!("[TmuxLauncher] window_name: {}", window_name);
         eprintln!("[TmuxLauncher] command: {:?}", command);
 
-        // Use a dedicated session name for all workspace-resume windows.
-        let session = "workspace";
+        // Use the configured session name for all workspace-resume windows.
+        let session = &self.session_name;
 
         // Single bash script that does everything in one wsl.exe call:
         // 1. Create 'workspace' session if it doesn't exist
