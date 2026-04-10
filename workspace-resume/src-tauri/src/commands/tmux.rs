@@ -6,7 +6,7 @@ use std::os::windows::process::CommandExt;
 
 /// Run a tmux command via wsl.exe and return stdout as a String.
 /// Returns Ok(empty string) for "no server running" / "no sessions" (not an error).
-fn run_tmux_command(script: &str) -> Result<String, String> {
+pub fn run_tmux_command(script: &str) -> Result<String, String> {
     let mut cmd = std::process::Command::new("wsl.exe");
     cmd.args(["-e", "bash", "-c", script]);
 

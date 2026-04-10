@@ -2,6 +2,7 @@ use tauri::Manager;
 use tauri_plugin_global_shortcut::{GlobalShortcutExt, Shortcut, ShortcutState};
 
 mod commands;
+mod companion;
 mod models;
 mod services;
 
@@ -96,6 +97,14 @@ pub fn run() {
                         std::mem::forget(watcher);
                     }
                     Err(e) => eprintln!("Failed to start file watcher: {}", e),
+                }
+            });
+
+            // Spawn the companion HTTP/WS service (mobile API over Tailscale).
+            let app_handle_companion = app.handle().clone();
+            tauri::async_runtime::spawn(async move {
+                if let Err(e) = companion::spawn(app_handle_companion).await {
+                    eprintln!("Companion service error: {}", e);
                 }
             });
             Ok(())
