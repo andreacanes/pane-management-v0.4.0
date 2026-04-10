@@ -21,11 +21,11 @@ pub fn run() {
             commands::discovery::open_directory,
             commands::discovery::get_inode,
             commands::discovery::find_inode_in_tree,
-            commands::discovery::dev_restart, // DEV-ONLY: remove before production
             commands::launcher::resume_session,
             commands::launcher::get_active_sessions,
             commands::launcher::get_terminal_settings,
             commands::launcher::update_terminal_settings,
+            commands::launcher::update_tmux_session_name,
             commands::launcher::get_error_log,
             commands::launcher::clear_error_log,
             commands::tmux::list_tmux_sessions,

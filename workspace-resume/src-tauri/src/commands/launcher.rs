@@ -233,6 +233,30 @@ pub async fn update_terminal_settings(
 }
 
 #[tauri::command]
+pub async fn update_tmux_session_name(
+    session_name: String,
+    app: tauri::AppHandle,
+) -> Result<TerminalSettings, String> {
+    let trimmed = session_name.trim().to_string();
+    if trimmed.is_empty() {
+        return Err("Session name cannot be empty".into());
+    }
+    // tmux session names can't contain dots, colons, or whitespace
+    if trimmed.contains('.') || trimmed.contains(':') || trimmed.contains(char::is_whitespace) {
+        return Err("Session name cannot contain dots, colons, or whitespace".into());
+    }
+
+    let existing = load_terminal_settings(&app).unwrap_or_default();
+    let settings = TerminalSettings {
+        backend: existing.backend,
+        tmux_session_name: trimmed,
+    };
+
+    save_terminal_settings(&app, &settings)?;
+    Ok(settings)
+}
+
+#[tauri::command]
 pub async fn get_error_log(
     app: tauri::AppHandle,
 ) -> Result<Vec<ErrorLogEntry>, String> {

@@ -59,6 +59,10 @@ export async function updateTerminalSettings(backend: string): Promise<TerminalS
   return invoke("update_terminal_settings", { backend });
 }
 
+export async function updateTmuxSessionName(sessionName: string): Promise<TerminalSettings> {
+  return invoke("update_tmux_session_name", { sessionName });
+}
+
 export async function getErrorLog(): Promise<ErrorLogEntry[]> {
   return invoke("get_error_log");
 }
@@ -233,7 +237,3 @@ export async function findInodeInTree(root: string, targetInode: number, maxDept
   return invoke("find_inode_in_tree", { root, targetInode, maxDepth });
 }
 
-/** DEV-ONLY: Hard exit so dev server rebuilds. Remove before production. */
-export async function devRestart(): Promise<void> {
-  return invoke("dev_restart");
-}

@@ -10,7 +10,7 @@ import {
   killWindow,
   renameSession,
   renameWindow,
-  devRestart, // DEV-ONLY
+  getTerminalSettings,
 } from "../../lib/tauri-commands";
 import type { TmuxSession, TmuxWindow } from "../../lib/types";
 import { NeonTitleSign } from "../theme/NeonSigns";
@@ -293,7 +293,9 @@ export function TopBar() {
 
   async function handleCreateSession() {
     const existing = new Set(state.tmuxSessions.map((s) => s.name));
-    let name = "workspace";
+    // Default new-session name comes from terminal_settings, not a hardcoded value
+    const settings = await getTerminalSettings().catch(() => null);
+    let name = settings?.tmux_session_name || "main";
     let i = 2;
     while (existing.has(name)) {
       name = `session-${i++}`;
@@ -439,14 +441,6 @@ export function TopBar() {
           title="Settings"
         >
           {"\u2699"}
-        </button>
-        {/* DEV-ONLY: rebuild button — remove before production */}
-        <button
-          class="dev-rebuild-btn"
-          onClick={() => devRestart()}
-          title="Rebuild (dev server will recompile and relaunch)"
-        >
-          {"\u21BB"}
         </button>
       </div>
 

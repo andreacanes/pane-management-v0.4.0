@@ -245,10 +245,9 @@ export function AppProvider(props: { children: JSX.Element }) {
 
       if (sessions.length === 0) return;
 
-      // Auto-select "workspace" session if it exists, otherwise first attached
-      const workspace = sessions.find((s) => s.name === "workspace");
+      // Auto-select the attached session if any; otherwise fall back to the first
       const attached = sessions.find((s) => s.attached);
-      const target = workspace ?? attached ?? sessions[0];
+      const target = attached ?? sessions[0];
 
       await selectTmuxSessionInternal(target.name);
     } catch (e) {

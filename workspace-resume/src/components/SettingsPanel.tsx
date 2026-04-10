@@ -3,6 +3,7 @@ import { LazyStore } from "@tauri-apps/plugin-store";
 import {
   getTerminalSettings,
   updateTerminalSettings,
+  updateTmuxSessionName,
   getErrorLog,
   clearErrorLog,
 } from "../lib/tauri-commands";
@@ -39,6 +40,9 @@ const THEMES = [
 
 export function SettingsPanel() {
   const [backend, setBackend] = createSignal<TerminalBackend>("tmux");
+  const [tmuxSessionName, setTmuxSessionName] = createSignal("main");
+  const [tmuxSessionDraft, setTmuxSessionDraft] = createSignal("main");
+  const [sessionNameError, setSessionNameError] = createSignal<string | null>(null);
   const [errors, setErrors] = createSignal<ErrorLogEntry[]>([]);
   const [updating, setUpdating] = createSignal(false);
 
@@ -46,6 +50,8 @@ export function SettingsPanel() {
     try {
       const settings = await getTerminalSettings();
       setBackend(settings.backend);
+      setTmuxSessionName(settings.tmux_session_name);
+      setTmuxSessionDraft(settings.tmux_session_name);
     } catch (e) {
       console.error("[SettingsPanel] Failed to load settings:", e);
     }
@@ -68,6 +74,26 @@ export function SettingsPanel() {
       setBackend(result.backend);
     } catch (e) {
       console.error("[SettingsPanel] Failed to update settings:", e);
+    } finally {
+      setUpdating(false);
+    }
+  }
+
+  async function handleSaveSessionName() {
+    const draft = tmuxSessionDraft().trim();
+    if (draft === tmuxSessionName()) {
+      setSessionNameError(null);
+      return;
+    }
+    setUpdating(true);
+    setSessionNameError(null);
+    try {
+      const result = await updateTmuxSessionName(draft);
+      setTmuxSessionName(result.tmux_session_name);
+      setTmuxSessionDraft(result.tmux_session_name);
+    } catch (e) {
+      setSessionNameError(String(e));
+      setTmuxSessionDraft(tmuxSessionName());
     } finally {
       setUpdating(false);
     }
@@ -170,6 +196,24 @@ export function SettingsPanel() {
           <option value="powershell">PowerShell</option>
         </select>
       </div>
+      <div class="settings-row">
+        <label for="tmux-session-name">tmux session name:</label>
+        <input
+          id="tmux-session-name"
+          type="text"
+          value={tmuxSessionDraft()}
+          disabled={updating() || backend() !== "tmux"}
+          onInput={(e) => setTmuxSessionDraft(e.currentTarget.value)}
+          onBlur={handleSaveSessionName}
+          onKeyDown={(e) => {
+            if (e.key === "Enter") (e.currentTarget as HTMLInputElement).blur();
+          }}
+          placeholder="main"
+        />
+      </div>
+      <Show when={sessionNameError()}>
+        <div class="settings-row-error">{sessionNameError()}</div>
+      </Show>
 
       <details class="error-log-details">
         <summary>
