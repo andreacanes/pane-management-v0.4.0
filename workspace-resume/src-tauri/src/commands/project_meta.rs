@@ -422,6 +422,8 @@ mod tests {
                 display_name: Some("My Project".to_string()),
                 tier: ProjectTier::Pinned,
                 bound_session: None,
+                inode: None,
+                claude_project_dirs: None,
             },
         );
         let json = serde_json::to_string(&map).unwrap();

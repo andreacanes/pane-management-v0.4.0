@@ -108,6 +108,8 @@ mod tests {
             display_name: Some("My Project".to_string()),
             tier: ProjectTier::Pinned,
             bound_session: Some("session-123".to_string()),
+            inode: None,
+            claude_project_dirs: None,
         };
         let json = serde_json::to_string(&meta).unwrap();
         let deserialized: ProjectMeta = serde_json::from_str(&json).unwrap();
