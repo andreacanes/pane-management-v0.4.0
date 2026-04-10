@@ -27,11 +27,15 @@ pub async fn start_watcher(
     .map_err(|e| format!("Failed to create watcher: {}", e))?;
 
     // Watch WSL home projects (primary — where active sessions live)
-    let wsl_projects = std::path::PathBuf::from(r"\\wsl.localhost\Ubuntu\home\andrea\.claude\projects");
-    if wsl_projects.exists() {
-        watcher
-            .watch(&wsl_projects, RecursiveMode::Recursive)
-            .map_err(|e| format!("Failed to watch WSL directory: {}", e))?;
+    let wsl_projects = crate::services::wsl::wsl_info().map(|info| info.claude_projects_unc());
+    let mut wsl_watched = false;
+    if let Some(ref path) = wsl_projects {
+        if path.exists() {
+            watcher
+                .watch(path, RecursiveMode::Recursive)
+                .map_err(|e| format!("Failed to watch WSL directory: {}", e))?;
+            wsl_watched = true;
+        }
     }
 
     // Also watch Windows home projects (secondary — legacy sessions)
@@ -39,13 +43,15 @@ pub async fn start_watcher(
         .ok_or("Cannot find home directory")?
         .join(".claude")
         .join("projects");
+    let mut win_watched = false;
     if win_projects.exists() {
         watcher
             .watch(&win_projects, RecursiveMode::Recursive)
             .map_err(|e| format!("Failed to watch Windows directory: {}", e))?;
+        win_watched = true;
     }
 
-    if !wsl_projects.exists() && !win_projects.exists() {
+    if !wsl_watched && !win_watched {
         eprintln!("Warning: no Claude projects directory found to watch");
     }
 

@@ -2,6 +2,7 @@ use crate::models::project::ProjectInfo;
 use crate::models::session::SessionInfo;
 use crate::services::path_decoder;
 use crate::services::scanner;
+use crate::services::wsl;
 
 /// Convert a WSL path like /mnt/c/Users/... to a Windows path C:\Users\...
 /// so that path_exists checks work from the Windows side.
@@ -26,8 +27,27 @@ fn check_path_exists(actual_path: &str) -> bool {
     }
     // For WSL-native paths like /home/andrea/..., check via UNC
     if actual_path.starts_with('/') {
-        let unc = format!("\\\\wsl.localhost\\Ubuntu{}", actual_path.replace('/', "\\"));
-        return std::path::Path::new(&unc).exists();
+        if let Some(info) = wsl::wsl_info() {
+            let unc = format!(
+                r"\\wsl.localhost\{}{}",
+                info.distro,
+                actual_path.replace('/', "\\")
+            );
+            return std::path::Path::new(&unc).exists();
+        }
+    }
+    false
+}
+
+/// Returns true if the given actual_path looks like the WSL user's home directory
+/// itself (not a sub-project). Claude Code creates a `-home-<user>` JSONL dir when
+/// running `claude` from the home dir; it's not a real project.
+fn is_home_root(actual_path: &str) -> bool {
+    if let Some(info) = wsl::wsl_info() {
+        let home = format!("/home/{}", info.user);
+        if actual_path == home || actual_path == format!("{}/", home) {
+            return true;
+        }
     }
     false
 }
@@ -98,6 +118,11 @@ fn scan_projects_dir(
                 format!("[unresolved] {}", encoded_name)
             });
 
+        // Skip the bogus "home root" project that Claude Code creates when run from $HOME
+        if is_home_root(&actual_path) {
+            continue;
+        }
+
         // Per locked decision: missing folders still returned, frontend prompts user
         let path_exists = check_path_exists(&actual_path);
 
@@ -116,9 +141,11 @@ pub async fn list_projects() -> Result<Vec<ProjectInfo>, String> {
     let mut seen = std::collections::HashSet::new();
 
     // 1. Scan WSL home ~/.claude/projects/ via UNC path (primary — where active sessions live)
-    let wsl_projects = std::path::PathBuf::from(r"\\wsl.localhost\Ubuntu\home\andrea\.claude\projects");
-    if wsl_projects.exists() {
-        scan_projects_dir(&wsl_projects, &mut seen, &mut projects);
+    if let Some(info) = wsl::wsl_info() {
+        let wsl_projects = info.claude_projects_unc();
+        if wsl_projects.exists() {
+            scan_projects_dir(&wsl_projects, &mut seen, &mut projects);
+        }
     }
 
     // 2. Scan Windows home ~/.claude/projects/ (secondary — legacy or Windows-native sessions)
@@ -139,11 +166,11 @@ pub async fn list_projects() -> Result<Vec<ProjectInfo>, String> {
 /// Find the project directory by checking WSL first, then Windows home.
 fn find_project_dir(encoded_project: &str) -> Option<std::path::PathBuf> {
     // Check WSL home first (primary)
-    let wsl_dir = std::path::PathBuf::from(format!(
-        r"\\wsl.localhost\Ubuntu\home\andrea\.claude\projects\{}", encoded_project
-    ));
-    if wsl_dir.exists() {
-        return Some(wsl_dir);
+    if let Some(info) = wsl::wsl_info() {
+        let wsl_dir = info.claude_projects_unc().join(encoded_project);
+        if wsl_dir.exists() {
+            return Some(wsl_dir);
+        }
     }
     // Check Windows home (secondary)
     if let Some(win_home) = dirs::home_dir() {
@@ -346,9 +373,3 @@ pub async fn find_inode_in_tree(
     }
 }
 
-/// DEV-ONLY: Hard exit so the dev loop script relaunches the app.
-/// Remove before production builds.
-#[tauri::command]
-pub async fn dev_restart() {
-    std::process::exit(0);
-}
