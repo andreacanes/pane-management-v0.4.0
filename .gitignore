@@ -2,8 +2,9 @@
 graphics/
 deployment-package/
 
-# Claude Code local config
-.claude/
+# Claude Code local config — rules, skills, agents are committed; only the
+# per-machine settings file is ignored
+.claude/settings.local.json
 
 # OS files
 .DS_Store
