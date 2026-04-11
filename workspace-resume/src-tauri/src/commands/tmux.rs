@@ -96,6 +96,54 @@ where
 // Query IPC Commands
 // ---------------------
 
+/// Cross-session "all panes running Claude" query.
+/// Returns a flat list of panes across every tmux session whose
+/// current_command contains "claude".
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct ActivePane {
+    pub id: String,
+    pub session_name: String,
+    pub window_index: u32,
+    pub window_name: String,
+    pub pane_index: u32,
+    pub current_command: String,
+    pub current_path: String,
+}
+
+#[tauri::command]
+pub async fn list_active_claude_panes() -> Result<Vec<ActivePane>, String> {
+    let script = "tmux list-panes -a -F \
+        '#{session_name}|#{window_index}|#{window_name}|#{pane_index}|#{pane_current_command}|#{pane_current_path}' 2>/dev/null";
+    let out = run_tmux_command(script)?;
+    let mut result = Vec::new();
+    for line in out.lines() {
+        let parts: Vec<&str> = line.split('|').collect();
+        if parts.len() < 6 {
+            continue;
+        }
+        let session = parts[0].to_string();
+        let window_index: u32 = parts[1].parse().unwrap_or(0);
+        let window_name = parts[2].to_string();
+        let pane_index: u32 = parts[3].parse().unwrap_or(0);
+        let current_command = parts[4].to_string();
+        let current_path = parts[5..].join("|");
+        // Only include panes that are clearly Claude sessions
+        if !current_command.eq_ignore_ascii_case("claude") {
+            continue;
+        }
+        result.push(ActivePane {
+            id: format!("{}:{}.{}", session, window_index, pane_index),
+            session_name: session,
+            window_index,
+            window_name,
+            pane_index,
+            current_command,
+            current_path,
+        });
+    }
+    Ok(result)
+}
+
 #[tauri::command]
 pub async fn list_tmux_sessions() -> Result<Vec<TmuxSession>, String> {
     let script =

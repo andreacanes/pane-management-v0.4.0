@@ -6,6 +6,10 @@ import {
   updateTmuxSessionName,
   getErrorLog,
   clearErrorLog,
+  getCompanionConfig,
+  getCompanionQr,
+  rotateCompanionToken,
+  type CompanionConfig,
 } from "../lib/tauri-commands";
 import type { TerminalBackend, ErrorLogEntry } from "../lib/types";
 
@@ -46,6 +50,10 @@ export function SettingsPanel() {
   const [errors, setErrors] = createSignal<ErrorLogEntry[]>([]);
   const [updating, setUpdating] = createSignal(false);
 
+  const [companionConfig, setCompanionConfig] = createSignal<CompanionConfig | null>(null);
+  const [companionQr, setCompanionQr] = createSignal<string | null>(null);
+  const [tokenRevealed, setTokenRevealed] = createSignal(false);
+
   onMount(async () => {
     try {
       const settings = await getTerminalSettings();
@@ -55,8 +63,41 @@ export function SettingsPanel() {
     } catch (e) {
       console.error("[SettingsPanel] Failed to load settings:", e);
     }
+    await loadCompanion();
     await refreshErrors();
   });
+
+  async function loadCompanion() {
+    try {
+      const cfg = await getCompanionConfig();
+      setCompanionConfig(cfg);
+      const qr = await getCompanionQr();
+      setCompanionQr(qr);
+    } catch (e) {
+      console.error("[SettingsPanel] Failed to load companion config:", e);
+    }
+  }
+
+  async function handleRotateToken() {
+    if (!window.confirm("Rotate the companion bearer token? Existing phone sessions will need to re-auth.")) {
+      return;
+    }
+    try {
+      const cfg = await rotateCompanionToken();
+      setCompanionConfig(cfg);
+      const qr = await getCompanionQr();
+      setCompanionQr(qr);
+    } catch (e) {
+      console.error("[SettingsPanel] rotate failed:", e);
+    }
+  }
+
+  function maskedToken(): string {
+    const t = companionConfig()?.bearer_token ?? "";
+    if (!t) return "—";
+    if (tokenRevealed()) return t;
+    return `${t.slice(0, 4)}${"•".repeat(Math.max(t.length - 8, 0))}${t.slice(-4)}`;
+  }
 
   async function refreshErrors() {
     try {
@@ -214,6 +255,73 @@ export function SettingsPanel() {
       <Show when={sessionNameError()}>
         <div class="settings-row-error">{sessionNameError()}</div>
       </Show>
+      </div>
+
+      <div class="settings-section">
+        <h4>Mobile companion</h4>
+        <Show when={companionConfig()} fallback={<p style={{ "opacity": 0.7 }}>Loading…</p>}>
+          <div class="settings-row">
+            <label>URL for phone</label>
+            <input
+              type="text"
+              readOnly
+              value={companionConfig()!.suggested_url}
+              onFocus={(e) => (e.currentTarget as HTMLInputElement).select()}
+            />
+          </div>
+          <div class="settings-row">
+            <label>Bearer token</label>
+            <input
+              type="text"
+              readOnly
+              value={maskedToken()}
+              onFocus={(e) => (e.currentTarget as HTMLInputElement).select()}
+            />
+            <button
+              class="modal-btn"
+              style={{ "margin-left": "6px" }}
+              onClick={() => setTokenRevealed(!tokenRevealed())}
+            >
+              {tokenRevealed() ? "Hide" : "Reveal"}
+            </button>
+            <button
+              class="modal-btn"
+              style={{ "margin-left": "6px" }}
+              onClick={() => {
+                navigator.clipboard.writeText(companionConfig()!.bearer_token);
+              }}
+            >
+              Copy
+            </button>
+          </div>
+          <div class="settings-row">
+            <label>ntfy topic</label>
+            <input
+              type="text"
+              readOnly
+              value={companionConfig()!.ntfy_topic}
+              onFocus={(e) => (e.currentTarget as HTMLInputElement).select()}
+            />
+          </div>
+          <Show when={companionQr()}>
+            <div style={{ "display": "flex", "justify-content": "center", "padding": "12px" }}>
+              <img
+                src={companionQr()!}
+                alt="Setup QR code"
+                style={{ "width": "220px", "height": "220px", "background": "#fff", "border-radius": "4px" }}
+              />
+            </div>
+          </Show>
+          <div class="settings-row" style={{ "justify-content": "space-between" }}>
+            <button class="modal-btn" onClick={loadCompanion}>Refresh</button>
+            <button class="modal-btn" onClick={handleRotateToken} style={{ "color": "#e66" }}>
+              Rotate token
+            </button>
+          </div>
+        </Show>
+      </div>
+
+      <div class="settings-section">
 
       <details class="error-log-details">
         <summary>

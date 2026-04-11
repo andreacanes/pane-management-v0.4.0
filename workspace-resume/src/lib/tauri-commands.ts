@@ -13,6 +13,10 @@ import type {
   ProjectMeta,
   PanePreset,
   WindowPaneStatus,
+  ProjectUsage,
+  UsageSummary,
+  GitInfo,
+  ActivePane,
 } from "./types";
 
 export async function listProjects(): Promise<ProjectInfo[]> {
@@ -61,6 +65,55 @@ export async function updateTerminalSettings(backend: string): Promise<TerminalS
 
 export async function updateTmuxSessionName(sessionName: string): Promise<TerminalSettings> {
   return invoke("update_tmux_session_name", { sessionName });
+}
+
+// Phase B1: Usage
+export async function getProjectUsage(encodedName: string): Promise<ProjectUsage> {
+  return invoke("get_project_usage", { encodedName });
+}
+
+export async function getAllUsage(): Promise<Record<string, ProjectUsage>> {
+  return invoke("get_all_usage");
+}
+
+export async function getUsageSummary(): Promise<UsageSummary> {
+  return invoke("get_usage_summary");
+}
+
+// Phase B2: Worktree / git
+export async function getGitInfo(path: string): Promise<GitInfo> {
+  return invoke("get_git_info", { path });
+}
+
+export async function createWorktree(projectPath: string, slug: string): Promise<string> {
+  return invoke("create_worktree", { projectPath, slug });
+}
+
+// Phase B4: Global active view
+export async function listActiveClaudePanes(): Promise<ActivePane[]> {
+  return invoke("list_active_claude_panes");
+}
+
+// Companion admin: bearer token / QR / rotation
+export interface CompanionConfig {
+  bearer_token: string;
+  hook_secret: string;
+  ntfy_topic: string;
+  port: number;
+  bind: string;
+  suggested_url: string;
+}
+
+export async function getCompanionConfig(): Promise<CompanionConfig> {
+  return invoke("get_companion_config");
+}
+
+export async function getCompanionQr(): Promise<string> {
+  return invoke("get_companion_qr");
+}
+
+export async function rotateCompanionToken(): Promise<CompanionConfig> {
+  return invoke("rotate_companion_token");
 }
 
 export async function getErrorLog(): Promise<ErrorLogEntry[]> {

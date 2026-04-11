@@ -3,6 +3,7 @@ import { getCurrentWebviewWindow } from "@tauri-apps/api/webviewWindow";
 import { createSortable, SortableProvider, transformStyle } from "@thisbeyond/solid-dnd";
 import { useApp } from "../../contexts/AppContext";
 import { SettingsPanel, showAnimations, showHotkeyHint } from "../SettingsPanel";
+import { GlobalActivePanel } from "./GlobalActivePanel";
 import {
   createSession,
   killSession,
@@ -159,6 +160,7 @@ function SortableWindowTab(props: {
 export function TopBar() {
   const { state, selectTmuxSession, selectTmuxWindow, refreshTmuxState, activeProjectCount, pausePolling, resumePolling } = useApp();
   const [showSettings, setShowSettings] = createSignal(false);
+  const [showGlobalActive, setShowGlobalActive] = createSignal(false);
   const [alwaysOnTop, setAlwaysOnTop] = createSignal(true);
   const [appFocused, setAppFocused] = createSignal(true);
   const [blurFlash, setBlurFlash] = createSignal(false);
@@ -436,6 +438,13 @@ export function TopBar() {
           </button>
         </div>
         <button
+          class="global-active-btn"
+          onClick={() => setShowGlobalActive((v) => !v)}
+          title="All active Claude sessions"
+        >
+          {"\u2735"}
+        </button>
+        <button
           class="settings-gear-btn"
           onClick={() => setShowSettings((v) => !v)}
           title="Settings"
@@ -453,6 +462,16 @@ export function TopBar() {
             </div>
             <div class="settings-modal-body">
               <SettingsPanel />
+            </div>
+          </div>
+        </div>
+      </Show>
+
+      <Show when={showGlobalActive()}>
+        <div class="modal-backdrop" onClick={() => setShowGlobalActive(false)}>
+          <div class="settings-modal" onClick={(e) => e.stopPropagation()}>
+            <div class="settings-modal-body">
+              <GlobalActivePanel onClose={() => setShowGlobalActive(false)} />
             </div>
           </div>
         </div>

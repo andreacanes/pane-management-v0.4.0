@@ -32,6 +32,8 @@ pub fn router(state: AppState) -> Router {
         .route("/panes/{id}/cancel", post(cancel_pane))
         .route("/approvals", get(list_approvals))
         .route("/approvals/{id}", post(resolve_approval))
+        .route("/usage", get(usage_summary))
+        .route("/usage/projects/{encoded_name}", get(project_usage))
         .route("/events", get(ws::upgrade))
         .route_layer(axum::middleware::from_fn_with_state(
             state.clone(),
@@ -193,6 +195,47 @@ async fn resolve_approval(
     let pending = guard.remove(&id).ok_or(AppError::NotFound)?;
     let _ = pending.responder.send(resp);
     Ok(StatusCode::NO_CONTENT)
+}
+
+async fn usage_summary(State(_s): State<AppState>) -> Result<Json<serde_json::Value>, AppError> {
+    let all = crate::commands::usage::get_all_usage()
+        .await
+        .map_err(|e| AppError::BadRequest(e))?;
+    let mut projects = 0u32;
+    let mut sessions = 0u32;
+    let mut input = 0u64;
+    let mut output = 0u64;
+    let mut cache_write = 0u64;
+    let mut cache_read = 0u64;
+    let mut cost = 0.0f64;
+    for (_, p) in all.iter() {
+        projects += 1;
+        sessions += p.sessions.len() as u32;
+        input += p.total_input;
+        output += p.total_output;
+        cache_write += p.total_cache_write;
+        cache_read += p.total_cache_read;
+        cost += p.total_cost_usd;
+    }
+    Ok(Json(serde_json::json!({
+        "projects": projects,
+        "sessions": sessions,
+        "input_tokens": input,
+        "output_tokens": output,
+        "cache_write_tokens": cache_write,
+        "cache_read_tokens": cache_read,
+        "total_cost_usd": cost,
+    })))
+}
+
+async fn project_usage(
+    State(_s): State<AppState>,
+    Path(encoded): Path<String>,
+) -> Result<Json<crate::services::usage::ProjectUsage>, AppError> {
+    let p = crate::commands::usage::get_project_usage(encoded)
+        .await
+        .map_err(|e| AppError::BadRequest(e))?;
+    Ok(Json(p))
 }
 
 // ---------------------------------------------------------------------------

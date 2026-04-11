@@ -126,11 +126,15 @@ fn scan_projects_dir(
         // Per locked decision: missing folders still returned, frontend prompts user
         let path_exists = check_path_exists(&actual_path);
 
+        // Git info is filled in later by a single batched wsl.exe call
         projects.push((ProjectInfo {
             encoded_name,
             actual_path,
             session_count,
             path_exists,
+            git_branch: None,
+            is_linked_worktree: false,
+            worktree_count: 0,
         }, latest_modified));
     }
 }
@@ -158,7 +162,25 @@ pub async fn list_projects() -> Result<Vec<ProjectInfo>, String> {
 
     // Sort by most recently modified session file (newest first)
     projects.sort_by(|a, b| b.1.cmp(&a.1));
-    let projects: Vec<ProjectInfo> = projects.into_iter().map(|(p, _)| p).collect();
+    let mut projects: Vec<ProjectInfo> = projects.into_iter().map(|(p, _)| p).collect();
+
+    // Batch-probe git info for every resolvable path in a single wsl.exe call.
+    // ~1 wsl.exe spawn total vs N spawns if we did it per-project.
+    let paths: Vec<&str> = projects
+        .iter()
+        .filter(|p| p.path_exists && !p.actual_path.starts_with("[unresolved]"))
+        .map(|p| p.actual_path.as_str())
+        .collect();
+    if !paths.is_empty() {
+        let git_map = crate::services::git::probe_many(&paths);
+        for proj in projects.iter_mut() {
+            if let Some(info) = git_map.get(&proj.actual_path) {
+                proj.git_branch = info.branch.clone();
+                proj.is_linked_worktree = info.is_linked_worktree;
+                proj.worktree_count = info.worktree_count;
+            }
+        }
+    }
 
     Ok(projects)
 }

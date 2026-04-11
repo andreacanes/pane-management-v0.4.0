@@ -3,6 +3,58 @@ export interface ProjectInfo {
   actual_path: string;
   session_count: number;
   path_exists: boolean;
+  git_branch?: string;
+  is_linked_worktree?: boolean;
+  worktree_count?: number;
+}
+
+export interface SessionUsage {
+  session_id: string;
+  model: string | null;
+  input_tokens: number;
+  output_tokens: number;
+  cache_write_tokens: number;
+  cache_read_tokens: number;
+  message_count: number;
+  cost_usd: number;
+}
+
+export interface ProjectUsage {
+  encoded_name: string;
+  sessions: SessionUsage[];
+  total_input: number;
+  total_output: number;
+  total_cache_write: number;
+  total_cache_read: number;
+  total_cost_usd: number;
+  total_messages: number;
+}
+
+export interface UsageSummary {
+  projects: number;
+  sessions: number;
+  total_input: number;
+  total_output: number;
+  total_cache_write: number;
+  total_cache_read: number;
+  total_cost_usd: number;
+}
+
+export interface GitInfo {
+  branch: string | null;
+  worktree_root: string | null;
+  is_linked_worktree: boolean;
+  worktree_count: number;
+}
+
+export interface ActivePane {
+  id: string;
+  session_name: string;
+  window_index: number;
+  window_name: string;
+  pane_index: number;
+  current_command: string;
+  current_path: string;
 }
 
 export interface SessionInfo {

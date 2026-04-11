@@ -1,4 +1,4 @@
-import { createSignal, Show } from "solid-js";
+import { createResource, createSignal, Show } from "solid-js";
 import { createDraggable } from "@thisbeyond/solid-dnd";
 import { useApp } from "../../contexts/AppContext";
 import {
@@ -6,10 +6,26 @@ import {
   setProjectTier,
   getInode,
   updateProjectInode,
+  getProjectUsage,
+  createWorktree,
 } from "../../lib/tauri-commands";
 import { open } from "@tauri-apps/plugin-dialog";
 import { launchToPane, newSessionInPane } from "../../lib/launch";
 import type { ProjectWithMeta, ProjectTier } from "../../lib/types";
+
+/** Format a token count into a short human-readable string. */
+function fmtTokens(n: number): string {
+  if (n >= 1_000_000) return `${(n / 1_000_000).toFixed(1)}M`;
+  if (n >= 1_000) return `${(n / 1_000).toFixed(1)}k`;
+  return String(n);
+}
+
+/** Format a USD amount. */
+function fmtUSD(n: number): string {
+  if (n >= 100) return `$${n.toFixed(0)}`;
+  if (n >= 10) return `$${n.toFixed(1)}`;
+  return `$${n.toFixed(2)}`;
+}
 
 /**
  * Derive a display name from the project's actual path.
@@ -36,6 +52,18 @@ export function ProjectCard(props: { project: ProjectWithMeta }) {
     props.project.meta.display_name || deriveName(props.project.actual_path);
 
   const isActive = () => isProjectActive(props.project.encoded_name);
+
+  // Lazy usage fetch — one Rust call per card on mount, cached by SolidJS.
+  const [usage] = createResource(
+    () => props.project.encoded_name,
+    async (encoded) => {
+      try {
+        return await getProjectUsage(encoded);
+      } catch {
+        return null;
+      }
+    },
+  );
 
   // -- Inline rename -------------------------------------------------------
 
@@ -126,6 +154,24 @@ export function ProjectCard(props: { project: ProjectWithMeta }) {
     }
   }
 
+  async function handleNewWorktree() {
+    setError(null);
+    const slug = window.prompt(
+      "New worktree slug (will create a branch with this name):",
+    );
+    if (!slug || !slug.trim()) return;
+    setLaunching(true);
+    try {
+      const newPath = await createWorktree(props.project.actual_path, slug.trim());
+      console.log("[ProjectCard] created worktree:", newPath);
+      refreshProjects();
+    } catch (e) {
+      setError(e instanceof Error ? e.message : String(e));
+    } finally {
+      setLaunching(false);
+    }
+  }
+
   async function handleNewSession() {
     setError(null);
     const tmuxSession = state.selectedTmuxSession;
@@ -195,6 +241,34 @@ export function ProjectCard(props: { project: ProjectWithMeta }) {
         </Show>
       </div>
 
+      {/* Branch + worktree badge */}
+      <Show when={props.project.git_branch}>
+        <div class="project-card-git" style={{ "font-size": "0.72rem", "opacity": 0.75, "margin-top": "2px" }}>
+          <span title="Git branch">⎇ {props.project.git_branch}</span>
+          <Show when={props.project.is_linked_worktree}>
+            <span title="Linked worktree" style={{ "margin-left": "6px" }}>🔗</span>
+          </Show>
+          <Show when={(props.project.worktree_count ?? 1) > 1}>
+            <span title="Worktree count" style={{ "margin-left": "6px" }}>
+              ({props.project.worktree_count})
+            </span>
+          </Show>
+        </div>
+      </Show>
+
+      {/* Usage overlay */}
+      <Show when={usage() && usage()!.total_messages > 0}>
+        <div class="project-card-usage" style={{ "font-size": "0.72rem", "opacity": 0.85, "margin-top": "2px" }}>
+          <span title="Total cost">{fmtUSD(usage()!.total_cost_usd)}</span>
+          <span style={{ "margin-left": "6px" }} title="Total tokens (in+out+cache)">
+            · {fmtTokens(usage()!.total_input + usage()!.total_output + usage()!.total_cache_write + usage()!.total_cache_read)}
+          </span>
+          <span style={{ "margin-left": "6px" }} title="Message count">
+            · {usage()!.total_messages} msgs
+          </span>
+        </div>
+      </Show>
+
       {/* Meta line */}
       <div class="project-card-meta">
         <span>{props.project.session_count} sessions</span>
@@ -262,6 +336,16 @@ export function ProjectCard(props: { project: ProjectWithMeta }) {
         >
           +
         </button>
+        <Show when={props.project.git_branch && !props.project.is_linked_worktree}>
+          <button
+            class="new-worktree-btn"
+            disabled={launching()}
+            onClick={handleNewWorktree}
+            title="Create a new linked worktree + branch"
+          >
+            ⎇+
+          </button>
+        </Show>
         <button class="project-settings-btn" onClick={() => openProjectSettings(props.project)}>
           Settings
         </button>
