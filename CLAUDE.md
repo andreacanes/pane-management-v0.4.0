@@ -73,75 +73,84 @@ The fork is personalized for Andrea's single machine. Things that are **hardcode
 
 ## Code layout
 
-```
-workspace-resume/                        ← Tauri project root
-├── src-tauri/
-│   ├── Cargo.toml                       ← Rust deps (axum, tower-http, tokio full,
-│   │                                       serde, uuid, base64, reqwest, notify,
-│   │                                       qrcode, sha2, chrono, ...)
-│   └── src/
-│       ├── lib.rs                       ← Tauri Builder + companion::spawn() in .setup()
-│       ├── commands/                    ← Tauri IPC commands (invoke targets)
-│       │   ├── discovery.rs             ← list_projects, scans WSL+Windows .claude/projects
-│       │   ├── launcher.rs              ← resume_session + terminal settings
-│       │   ├── tmux.rs                  ← list_tmux_*, create_pane, send_keys,
-│       │   │                              list_active_claude_panes
-│       │   ├── project_meta.rs          ← tier/display_name/pane_assignments store
-│       │   ├── usage.rs                 ← get_project_usage, get_all_usage, summary
-│       │   ├── git.rs                   ← get_git_info, create_worktree
-│       │   └── companion_admin.rs       ← get_companion_config, qr, rotate_token
-│       ├── services/                    ← Logic shared by commands + companion
-│       │   ├── wsl.rs                   ← Distro/user detection (OnceLock cached)
-│       │   ├── scanner.rs               ← Session metadata parser
-│       │   ├── path_decoder.rs          ← Extract cwd from JSONL first record
-│       │   ├── watcher.rs               ← notify-based session-changed events
-│       │   ├── usage.rs                 ← JSONL → tokens + USD cost (Anthropic pricing)
-│       │   ├── git.rs                   ← Batched wsl.exe probe (branches + worktrees)
-│       │   └── terminal/                ← TmuxLauncher / PowerShellLauncher / WarpLauncher
-│       ├── companion/                   ← Embedded HTTP+WS API on :8833
-│       │   ├── mod.rs                   ← spawn() entry, tokio::spawn from Tauri setup
-│       │   ├── http.rs                  ← axum Router + AppState wiring
-│       │   ├── state.rs                 ← PaneRecord, approvals, broadcast channels
-│       │   ├── auth.rs                  ← bearer_mw + hook_secret_mw (subtle::ct_eq)
-│       │   ├── ws.rs                    ← WebSocket event stream
-│       │   ├── hook_sink.rs             ← Notification hook park-and-wait
-│       │   ├── ntfy_server.rs           ← Embedded ntfy wire protocol (POST /:topic, GET /:topic/json)
-│       │   ├── tmux_poller.rs           ← 2s loop scraping pane state via SHA-256 hash diff
-│       │   └── models.rs                ← DTOs (PaneDto, SessionDto, ApprovalDto, EventDto, ...)
-│       └── models/                      ← Shared Serde structs
-│
-├── src/                                 ← SolidJS frontend (Tauri webview)
-│   ├── App.tsx, index.tsx
-│   ├── lib/
-│   │   ├── tauri-commands.ts            ← invoke() wrappers. New commands go here too.
-│   │   ├── types.ts                     ← ProjectInfo, PaneDto, EventDto, ...
-│   │   └── launch.ts                    ← launchToPane / newSessionInPane
-│   ├── contexts/AppContext.tsx          ← Global state, polling, pane assignments
-│   └── components/
-│       ├── layout/
-│       │   ├── TopBar.tsx               ← Session tabs, window tabs, ⚙/✵ buttons
-│       │   ├── Sidebar.tsx, MainArea.tsx
-│       │   └── GlobalActivePanel.tsx    ← "All active Claudes" modal
-│       ├── project/ProjectCard.tsx      ← Cards with usage + git branch + worktree button
-│       ├── pane/PaneSlot.tsx            ← Individual tmux pane UI
-│       └── SettingsPanel.tsx            ← Terminal / Mobile companion / Error log
-│
-└── package.json                         ← vite-solid build → dist/, consumed by Tauri
+All paths below are relative to `/home/andrea/pane-management/` (the WSL source of truth).
 
-pane-management-mobile/                  ← Android repo (nested, separate git)
-├── app/src/main/java/com/andreacanes/panemgmt/
-│   ├── MainActivity.kt, PaneMgmtApp.kt (NavHost)
-│   ├── data/
-│   │   ├── CompanionClient.kt           ← Ktor HTTP + WebSocket client
-│   │   ├── AuthStore.kt                 ← DataStore Preferences (URL + bearer)
-│   │   └── models/Dtos.kt                ← Must match Rust companion wire format
-│   ├── ui/
-│   │   ├── setup/SetupScreen.kt          ← URL + bearer, test, save
-│   │   ├── grid/PaneGridScreen.kt        ← LazyColumn of pane cards, live via WS
-│   │   └── detail/PaneDetailScreen.kt    ← Capture + input + mic + approval dialog
-│   └── voice/VoiceInputController.kt     ← SpeechRecognizer wrapper (offline preferred)
-├── gradle/libs.versions.toml             ← Kotlin 2.1, Compose BOM 2025.01.01, Ktor 3
-└── app/build.gradle.kts                  ← compileSdk 36, minSdk 26, JDK 21
+```
+.                                        ← /home/andrea/pane-management/
+├── sync.sh                              ← WSL → Windows scratch rsync (run before builds)
+├── CLAUDE.md                            ← this file
+├── .gitignore                           ← ignores pane-management-mobile/ (nested repo)
+├── BACKLOG.md, DEPENDENCIES.md, SETUP-GUIDE.md, PORTABILITY-AUDIT.md
+│                                           ← upstream sky-salsa design docs (kept for reference)
+│
+├── workspace-resume/                    ← Tauri project root
+│   ├── src-tauri/
+│   │   ├── Cargo.toml                   ← Rust deps (axum, tower-http, tokio full,
+│   │   │                                   serde, uuid, base64, reqwest, notify,
+│   │   │                                   qrcode, sha2, chrono, ...)
+│   │   └── src/
+│   │       ├── lib.rs                   ← Tauri Builder + companion::spawn() in .setup()
+│   │       ├── commands/                ← Tauri IPC commands (invoke targets)
+│   │       │   ├── discovery.rs         ← list_projects, scans WSL+Windows .claude/projects
+│   │       │   ├── launcher.rs          ← resume_session + terminal settings
+│   │       │   ├── tmux.rs              ← list_tmux_*, create_pane, send_keys,
+│   │       │   │                          list_active_claude_panes
+│   │       │   ├── project_meta.rs      ← tier/display_name/pane_assignments store
+│   │       │   ├── usage.rs             ← get_project_usage, get_all_usage, summary
+│   │       │   ├── git.rs               ← get_git_info, create_worktree
+│   │       │   └── companion_admin.rs   ← get_companion_config, qr, rotate_token
+│   │       ├── services/                ← Logic shared by commands + companion
+│   │       │   ├── wsl.rs               ← Distro/user detection (OnceLock cached)
+│   │       │   ├── scanner.rs           ← Session metadata parser
+│   │       │   ├── path_decoder.rs      ← Extract cwd from JSONL first record
+│   │       │   ├── watcher.rs           ← notify-based session-changed events
+│   │       │   ├── usage.rs             ← JSONL → tokens + USD cost (Anthropic pricing)
+│   │       │   ├── git.rs               ← Batched wsl.exe probe (branches + worktrees)
+│   │       │   └── terminal/            ← TmuxLauncher / PowerShellLauncher / WarpLauncher
+│   │       ├── companion/               ← Embedded HTTP+WS API on :8833
+│   │       │   ├── mod.rs               ← spawn() entry, tokio::spawn from Tauri setup
+│   │       │   ├── http.rs              ← axum Router + AppState wiring
+│   │       │   ├── state.rs             ← PaneRecord, approvals, broadcast channels
+│   │       │   ├── auth.rs              ← bearer_mw + hook_secret_mw (subtle::ct_eq)
+│   │       │   ├── ws.rs                ← WebSocket event stream
+│   │       │   ├── hook_sink.rs         ← Notification hook park-and-wait
+│   │       │   ├── ntfy_server.rs       ← Embedded ntfy wire (POST /:topic, GET /:topic/json)
+│   │       │   ├── tmux_poller.rs       ← 2s loop scraping pane state via SHA-256 hash diff
+│   │       │   └── models.rs            ← DTOs (PaneDto, SessionDto, ApprovalDto, EventDto, ...)
+│   │       └── models/                  ← Shared Serde structs
+│   │
+│   ├── src/                             ← SolidJS frontend (Tauri webview)
+│   │   ├── App.tsx, index.tsx
+│   │   ├── lib/
+│   │   │   ├── tauri-commands.ts        ← invoke() wrappers. New commands go here too.
+│   │   │   ├── types.ts                 ← ProjectInfo, PaneDto, EventDto, ...
+│   │   │   └── launch.ts                ← launchToPane / newSessionInPane
+│   │   ├── contexts/AppContext.tsx      ← Global state, polling, pane assignments
+│   │   └── components/
+│   │       ├── layout/
+│   │       │   ├── TopBar.tsx           ← Session tabs, window tabs, ⚙/✵ buttons
+│   │       │   ├── Sidebar.tsx, MainArea.tsx
+│   │       │   └── GlobalActivePanel.tsx ← "All active Claudes" modal
+│   │       ├── project/ProjectCard.tsx  ← Cards with usage + git branch + worktree button
+│   │       ├── pane/PaneSlot.tsx        ← Individual tmux pane UI
+│   │       └── SettingsPanel.tsx        ← Terminal / Mobile companion / Error log
+│   │
+│   └── package.json                     ← vite-solid build → dist/, consumed by Tauri
+│
+└── pane-management-mobile/              ← Android repo (nested, own .git, gitignored by outer)
+    ├── app/src/main/java/com/andreacanes/panemgmt/
+    │   ├── MainActivity.kt, PaneMgmtApp.kt (NavHost)
+    │   ├── data/
+    │   │   ├── CompanionClient.kt       ← Ktor HTTP + WebSocket client
+    │   │   ├── AuthStore.kt             ← DataStore Preferences (URL + bearer)
+    │   │   └── models/Dtos.kt           ← Must match Rust companion wire format
+    │   ├── ui/
+    │   │   ├── setup/SetupScreen.kt     ← URL + bearer, test, save
+    │   │   ├── grid/PaneGridScreen.kt   ← LazyColumn of pane cards, live via WS
+    │   │   └── detail/PaneDetailScreen.kt ← Capture + input + mic + approval dialog
+    │   └── voice/VoiceInputController.kt ← SpeechRecognizer wrapper (offline preferred)
+    ├── gradle/libs.versions.toml        ← Kotlin 2.1, Compose BOM 2025.01.01, Ktor 3
+    └── app/build.gradle.kts             ← compileSdk 36, minSdk 26, JDK 21
 ```
 
 ## Build / run / test
