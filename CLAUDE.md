@@ -2,14 +2,29 @@
 
 Two tightly-coupled repos that let Andrea control Claude Code sessions across tmux from a Windows desktop app and an Android phone, with everything routed over Tailscale — **no cloud APIs**.
 
+## Source-of-truth layout
+
+**Canonical source lives on WSL**: `/home/andrea/pane-management/`
+**Build scratch lives on Windows**: `C:\Users\Andrea\Desktop\Botting\pane-management-v0.4.0\`
+
+Why the split: Tauri (MSVC) and Android (Gradle) toolchains must run on Windows. Cross-filesystem builds from WSL via `\\wsl.localhost\` are 3–5× slower and prone to file-lock issues. Source-of-truth lives in WSL for fast git / rg / editing; the Windows scratch is a disposable mirror that holds the persistent `target/`, `node_modules/`, `.gradle/` caches so cargo/gradle get fast incremental builds.
+
+**Sync direction is always WSL → scratch**, never the reverse. The scratch's `.git` directories have been deliberately removed to prevent accidental commits; all git operations (commit / push / pull / rebase) run from `/home/andrea/pane-management/`.
+
+To sync before a build:
+```bash
+/home/andrea/pane-management/sync.sh
+```
+Takes ~1–3s typically. `rm -rf` the scratch anytime — next sync rebuilds it, and the first build after a clean will be cold.
+
 ## Repos
 
-This directory contains **both** projects. They track independent git history.
+Both repos are nested in the WSL source-of-truth directory. They track independent git history.
 
-| Path | Git origin | Purpose |
+| Path (WSL) | Git origin | Purpose |
 |---|---|---|
-| `.` (this repo) | `andreacanes/pane-management-v0.4.0` (fork of `sky-salsa/pane-management-v0.4.0`) | Tauri 2 + SolidJS + Rust desktop app. Runs on Windows, talks to WSL tmux via `wsl.exe`. Embeds the companion HTTP/WebSocket API on port 8833. |
-| `pane-management-mobile/` | `andreacanes/pane-management-mobile` | Kotlin + Jetpack Compose + Ktor Android app. Connects to the companion over Tailscale (or ADB reverse tunnel for dev). Voice input via Android `SpeechRecognizer`. |
+| `/home/andrea/pane-management/` | `andreacanes/pane-management-v0.4.0` (fork of `sky-salsa/pane-management-v0.4.0`) | Tauri 2 + SolidJS + Rust desktop app. Runs on Windows, talks to WSL tmux via `wsl.exe`. Embeds the companion HTTP/WebSocket API on port 8833. |
+| `/home/andrea/pane-management/pane-management-mobile/` | `andreacanes/pane-management-mobile` | Kotlin + Jetpack Compose + Ktor Android app. Connects to the companion over Tailscale (or ADB reverse tunnel for dev). Voice input via Android `SpeechRecognizer`. |
 
 The mobile repo is nested here (ignored by the outer git via `.gitignore`) so both projects can be worked on from one Claude Code session — they share DTOs, the API contract, and pricing/state-machine logic.
 
@@ -131,18 +146,21 @@ pane-management-mobile/                  ← Android repo (nested, separate git)
 
 ## Build / run / test
 
-All builds happen on the Windows side (MSVC + Android SDK live there). From a WSL shell:
+All edits happen in WSL (`/home/andrea/pane-management/`). Before any build, run `sync.sh` to refresh the Windows scratch. Builds then run native on Windows where the toolchains live.
 
 ### Desktop (Tauri)
 ```bash
-# Full release build — produces workspace-resume.exe + MSI + NSIS
-cmd.exe /c "cd /d C:\Users\Andrea\Desktop\Botting\pane-management-v0.4.0\workspace-resume && npm run tauri build"
+# Sync + full release build — produces workspace-resume.exe + MSI + NSIS
+/home/andrea/pane-management/sync.sh && \
+  cmd.exe /c "cd /d C:\Users\Andrea\Desktop\Botting\pane-management-v0.4.0\workspace-resume && npm run tauri build"
 
-# Fast Rust check only (no bundle)
-cmd.exe /c "cd /d C:\Users\Andrea\Desktop\Botting\pane-management-v0.4.0\workspace-resume\src-tauri && cargo check"
+# Sync + fast Rust check only (no bundle)
+/home/andrea/pane-management/sync.sh && \
+  cmd.exe /c "cd /d C:\Users\Andrea\Desktop\Botting\pane-management-v0.4.0\workspace-resume\src-tauri && cargo check"
 
-# Fast frontend check
-cmd.exe /c "cd /d C:\Users\Andrea\Desktop\Botting\pane-management-v0.4.0\workspace-resume && npm run build"
+# Sync + fast frontend check
+/home/andrea/pane-management/sync.sh && \
+  cmd.exe /c "cd /d C:\Users\Andrea\Desktop\Botting\pane-management-v0.4.0\workspace-resume && npm run build"
 
 # Kill a running instance before rebuilding (required — exe is locked while running)
 cmd.exe /c "taskkill /IM workspace-resume.exe /F"
@@ -157,8 +175,9 @@ cd /mnt/c/Users/Andrea && nohup \
 ```bash
 ADB=/mnt/c/Users/Andrea/AppData/Local/Android/Sdk/platform-tools/adb.exe
 
-# Build debug APK
-cmd.exe /c "cd /d C:\Users\Andrea\Desktop\Botting\pane-management-v0.4.0\pane-management-mobile && gradlew.bat assembleDebug"
+# Sync + build debug APK
+/home/andrea/pane-management/sync.sh && \
+  cmd.exe /c "cd /d C:\Users\Andrea\Desktop\Botting\pane-management-v0.4.0\pane-management-mobile && gradlew.bat assembleDebug"
 
 # Install + launch
 $ADB install -r 'C:\Users\Andrea\Desktop\Botting\pane-management-v0.4.0\pane-management-mobile\app\build\outputs\apk\debug\app-debug.apk'
@@ -167,6 +186,15 @@ $ADB shell am start -n com.andreacanes.panemgmt/.MainActivity
 # App URL options:
 #   Tailscale (no tether needed):  http://100.110.47.29:8833
 #   ADB reverse tunnel (dev):      $ADB reverse tcp:8833 tcp:8833 ; then http://localhost:8833
+```
+
+### git from WSL (never from the scratch)
+```bash
+# The scratch has no .git directories on purpose.
+# All git operations run from /home/andrea/pane-management/ or the nested
+# /home/andrea/pane-management/pane-management-mobile/.
+cd /home/andrea/pane-management && git status
+cd /home/andrea/pane-management/pane-management-mobile && git push
 ```
 
 ### Smoke-test the companion from WSL
@@ -222,6 +250,9 @@ To surface them in the app, read via the `get_companion_config` Tauri command (u
 11. **AGP 8.7.3 warns about compileSdk 36** — version-mismatch warning, not an error. Suppress with `android.suppressUnsupportedCompileSdk=36` in `gradle.properties` if it gets noisy.
 12. **Pre-existing test failures** in the Rust side: `test_extract_cwd_from_valid_jsonl` and `test_build_uri_simple_path` hardcode `Sky` (upstream's username). These are **not ours** — don't "fix" them without user approval.
 13. **Tauri store writes lose unrelated keys** if you overwrite the whole object. Always read-modify-write with `StoreExt::get` → mutate → `StoreExt::set` → `save`.
+14. **Never edit files in the Windows scratch directly**. The scratch is output-only from `sync.sh`'s perspective — next sync's `--delete` will wipe any edits you made there. Always edit in `/home/andrea/pane-management/`.
+15. **Never `git` in the Windows scratch**. Its `.git` dirs have been deliberately removed so accidental commits aren't even possible. If you somehow recreate them, delete again; canonical git lives in WSL only.
+16. **Forgetting to run `sync.sh`** before a build = you're building stale source. Symptom: your edit "didn't take". The iteration loop is `edit → sync.sh → build`, not `edit → build`.
 
 ## Current state (April 2026)
 
