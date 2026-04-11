@@ -28,3 +28,7 @@ npm-debug.log*
 # Temp files
 *.orig
 *.tmp
+
+# Android companion repo — nested for co-location, tracks its own git history
+# See pane-management-mobile/.git and https://github.com/andreacanes/pane-management-mobile
+pane-management-mobile/

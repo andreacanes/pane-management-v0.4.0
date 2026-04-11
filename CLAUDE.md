@@ -1,188 +1,252 @@
-<!-- GSD:project-start source:PROJECT.md -->
-## Project
+# Pane Management
 
-**Workspace Resume**
+Two tightly-coupled repos that let Andrea control Claude Code sessions across tmux from a Windows desktop app and an Android phone, with everything routed over Tailscale — **no cloud APIs**.
 
-A lightweight Windows desktop app (Tauri) for resuming Claude Code sessions across multiple projects. It provides a taskbar-pinnable dashboard where projects appear as freely arrangeable cards. Each card lets you resume the most recent session or pick from a session list — launching a terminal window that remembers its screen position across restarts, crashes, and multi-monitor setups.
+## Repos
 
-**Core Value:** Reliable session resumption from a visual dashboard — if you can discover, select, and resume Claude Code sessions from cards, the product is useful. Window position memory and canvas layout make it magical, but resume is the foundation everything else builds on.
+This directory contains **both** projects. They track independent git history.
 
-### Constraints
+| Path | Git origin | Purpose |
+|---|---|---|
+| `.` (this repo) | `andreacanes/pane-management-v0.4.0` (fork of `sky-salsa/pane-management-v0.4.0`) | Tauri 2 + SolidJS + Rust desktop app. Runs on Windows, talks to WSL tmux via `wsl.exe`. Embeds the companion HTTP/WebSocket API on port 8833. |
+| `pane-management-mobile/` | `andreacanes/pane-management-mobile` | Kotlin + Jetpack Compose + Ktor Android app. Connects to the companion over Tailscale (or ADB reverse tunnel for dev). Voice input via Android `SpeechRecognizer`. |
 
-- **Framework**: Tauri (Rust backend + system webview) — chosen for fast startup and low memory footprint
-- **Platform**: Windows 11 only for v1
-- **Terminal**: Warp as initial default, but architecture must support swapping terminal emulators
-- **Session data**: Must read local Claude Code session files (same approach as claudecodeui) — no API dependencies
-- **Position tracking**: Must survive hard shutdowns — no reliance on graceful close events alone
-<!-- GSD:project-end -->
+The mobile repo is nested here (ignored by the outer git via `.gitignore`) so both projects can be worked on from one Claude Code session — they share DTOs, the API contract, and pricing/state-machine logic.
 
-<!-- GSD:stack-start source:research/STACK.md -->
-## Technology Stack
-
-## Recommended Stack
-### Core Framework
-| Technology | Version | Purpose | Why | Confidence |
-|------------|---------|---------|-----|------------|
-| Tauri | 2.10.x | Desktop app framework (Rust backend + system webview) | Constraint from PROJECT.md. Fast startup, low RAM (~30MB vs Electron's ~150MB+), small binary. v2 is stable since Oct 2024 with active maintenance (2.10.3 released March 2026). | HIGH |
-| SolidJS | 1.9.x | Frontend UI framework | Best runtime performance of any JS framework (no VDOM, signal-based fine-grained reactivity). Smallest bundle size alongside Svelte. React-like JSX syntax lowers learning curve. Ideal for a dashboard app that needs to feel native-fast. Official Tauri template support via `create-tauri-app`. | HIGH |
-| TypeScript | 5.x | Type safety | Non-negotiable for any project with IPC between Rust and JS. Catches contract drift between frontend and backend commands at compile time. | HIGH |
-| Rust | 1.77.2+ | Backend (Tauri core) | Required by Tauri. Handles process spawning, file system access, Win32 API calls for external window management. Version floor set by Tauri plugin requirements. | HIGH |
-### Build Tooling
-| Technology | Version | Purpose | Why | Confidence |
-|------------|---------|---------|-----|------------|
-| Vite | 6.x (LTS) | Frontend bundler/dev server | Official Tauri recommendation. `vite-plugin-solid` explicitly supports Vite 3/4/5/6. Vite 7 and 8 exist but are very new (8 released March 12, 2026). Vite 6 still receives security patches and has the widest plugin ecosystem compatibility. Upgrade to 7+ after ecosystem catches up. | HIGH |
-| vite-plugin-solid | 2.11.x | SolidJS Vite integration | Official SolidJS Vite plugin. Provides JSX transform, HMR, and SSR support. Actively maintained. | HIGH |
-### Styling
-| Technology | Version | Purpose | Why | Confidence |
-|------------|---------|---------|-----|------------|
-| Tailwind CSS | 4.x | Utility-first CSS | v4 stable since Jan 2025. CSS-first config (no tailwind.config.js needed). Faster builds via Oxide engine. Perfect for a dashboard with cards and spatial layout -- utility classes map cleanly to free-arrange canvas positioning. | HIGH |
-### Tauri Official Plugins
-| Plugin | Cargo Crate | npm Package | Purpose | Why | Confidence |
-|--------|-------------|-------------|---------|-----|------------|
-| **Shell** | `tauri-plugin-shell` ~2.3 | `@tauri-apps/plugin-shell` | Spawn terminal processes | Core requirement: launch Warp/WT/PowerShell with `claude -r`. Provides `Command.create()` with allowlist-based security scoping. Supports stdout/stderr streaming and process lifecycle (spawn/kill). | HIGH |
-| **File System** | `tauri-plugin-fs` ~2.x | `@tauri-apps/plugin-fs` | Read Claude Code session files | Core requirement: read JSONL session files from `~/.claude/projects/`. Scope to `$HOME/.claude/**/*` for read access. Tauri's permission model prevents accidental full-disk access. | HIGH |
-| **Store** | `tauri-plugin-store` ~2.4 | `@tauri-apps/plugin-store` | Persistent app state (card positions, project pins, settings) | Key-value JSON store with auto-save (100ms debounce). Survives crashes because writes are debounced and atomic. `LazyStore` defers loading until first access for faster startup. | HIGH |
-| **Window State** | `tauri-plugin-window-state` ~2.4 | `@tauri-apps/plugin-window-state` | Remember main dashboard window position/size | Automatically saves/restores the dashboard window itself across restarts. Note: this is for the Tauri app's OWN windows, not for spawned terminal windows. | HIGH |
-| **Autostart** | `tauri-plugin-autostart` ~2.x | `@tauri-apps/plugin-autostart` | Optional: launch on Windows startup | Nice-to-have for a dashboard app. Uses Windows registry for startup entry. Defer to post-MVP. | MEDIUM |
-### Windows-Specific Dependencies (Rust Side)
-| Crate | Version | Purpose | Why | Confidence |
-|-------|---------|---------|-----|------------|
-| `windows` | 0.62.x | Win32 API bindings | Microsoft's official Rust bindings for Windows APIs. Required for tracking/positioning EXTERNAL terminal windows (spawned Warp/WT instances). Key APIs: `FindWindowW`, `EnumWindows`, `GetWindowRect`, `SetWindowPos`, `MonitorFromWindow`, `GetMonitorInfoW`. Cannot be done through Tauri's own window APIs since those only manage Tauri-owned webview windows. | HIGH |
-| `serde` | 1.x | Serialization | Foundation for all data interchange: JSONL parsing, IPC between Rust/JS, store data. | HIGH |
-| `serde_json` | 1.x | JSON parsing | Parse Claude Code session JSONL files and general JSON handling. | HIGH |
-| `serde-jsonlines` | 0.7.x | JSONL streaming | Purpose-built for JSON Lines format. Provides `BufReadExt` for streaming line-by-line parsing of session files without loading entire files into memory. Async support available via feature flag. | HIGH |
-| `tokio` | 1.x | Async runtime | Tauri 2 uses tokio internally. Needed for async file watching, periodic position polling, and non-blocking IPC commands. | HIGH |
-| `notify` | 6.x | File system watcher | Watch `~/.claude/projects/` for new session files. Triggers auto-discovery without polling. Cross-platform but we only need Windows support. | MEDIUM |
-| `glob` | 0.3.x | Path pattern matching | Enumerate session directories matching the Claude Code naming convention (`C--Users-USERNAME-...`). | HIGH |
-### Frontend Libraries
-| Library | Version | Purpose | Why | Confidence |
-|---------|---------|---------|-----|------------|
-| `@neodrag/solid` | 2.3.x | Free-position dragging for project cards | Lightweight directive-based dragging. Provides `position` prop for controlled dragging with absolute positioning. Supports bounds constraints and grid snapping. Better fit than `@dnd-kit/solid` for free-arrange canvas (dnd-kit is optimized for sortable lists, not free positioning). | HIGH |
-| `@tauri-apps/api` | 2.x | Tauri IPC bridge | Core Tauri JavaScript API for invoking Rust commands, listening to events, and managing windows. Installed automatically with Tauri setup. | HIGH |
-## Why SolidJS Over Alternatives
-| Criterion | SolidJS | React | Svelte |
-|-----------|---------|-------|--------|
-| **Runtime perf** | Best-in-class (no VDOM, signals) | Good but VDOM overhead | Very good (compiled) |
-| **Bundle size** | ~7KB | ~40KB (React+ReactDOM) | ~5KB |
-| **DX familiarity** | JSX (React-like) | JSX (most popular) | Custom syntax |
-| **Tauri template** | Official support | Official support | Official support |
-| **Drag-drop libs** | @neodrag/solid, @dnd-kit/solid | Massive ecosystem | @neodrag/svelte |
-| **Learning curve** | Low if you know React | Baseline | Moderate (new paradigm) |
-| **Ecosystem size** | Small but growing | Massive | Medium |
-## Why NOT These Alternatives
-| Category | Rejected | Why Not |
-|----------|----------|---------|
-| Framework | Electron | 5-10x more RAM, larger binary, slower startup. Tauri is a hard constraint anyway. |
-| Framework | React | VDOM overhead is unnecessary for a small dashboard. Larger bundle. SolidJS provides the same JSX DX with better perf. |
-| Framework | Svelte | Good option but custom syntax adds learning curve. SolidJS's JSX is more transferable knowledge. Svelte 5's runes are a paradigm shift that's still stabilizing. |
-| Framework | Angular | Overkill. Massive framework for a single-screen dashboard. |
-| Build tool | Vite 8 | Released March 12, 2026 (2 weeks ago). Rolldown integration is exciting but too new. Plugin ecosystem hasn't caught up. `vite-plugin-solid` peer deps list up to Vite 6. Use Vite 6 now, upgrade later when ecosystem stabilizes. |
-| Build tool | Webpack | Slower, more configuration. Vite is the standard for Tauri projects. |
-| Styling | CSS Modules | Fine but verbose for utility layouts. Tailwind's utility classes are faster to iterate on for spatial positioning. |
-| Styling | styled-components | Runtime CSS-in-JS has performance cost. No SolidJS port. |
-| Drag library | @dnd-kit/solid | Designed for sortable lists and drop zones, not free-position canvas layout. @neodrag is purpose-built for absolute positioning with coordinate tracking. |
-| Drag library | solid-dnd | Focused on drag-and-drop between containers (sortable). Not ideal for free canvas positioning. |
-| State | SQLite / sql.js | Overkill for key-value settings. The Store plugin covers our needs (card positions, pinned projects, display names). |
-| State | IndexedDB | Not available in Tauri's webview in the same way as browsers. Store plugin is the blessed path. |
-| Win32 | `winapi` crate | Older, unmaintained alternative to the `windows` crate. Microsoft's `windows` crate is the official successor with generated bindings directly from Windows metadata. |
-## Claude Code Session File Format
-- `C:\Users\USERNAME\Documents\project` becomes `C--Users-USERNAME-Documents-project`
-- `type` field (message type: user, assistant, system)
-- `sessionId` (groups messages into sessions)
-- `timestamp` (ISO 8601)
-- `uuid` / `parentUuid` (linked list chain)
-- `content` (array of blocks for assistant messages)
-- Each message is written to disk immediately (crash-resilient by design)
-- Compaction creates `compact_boundary` records when context window fills up
-- Session continuation files may reference parent sessions
-## Terminal Launcher Architecture
-- Executable: `%LOCALAPPDATA%\Programs\Warp\warp.exe` or `%PROGRAMFILES%\Warp\warp.exe`
-- No documented CLI args for directory or command execution (as of March 2026)
-- Workaround: Use Launch Configurations (YAML files with `cwd` and initial commands)
-- Alternative: Spawn via shell command: `warp.exe` then send keystrokes/use Warp's URL scheme
-- Executable: `wt.exe` (on PATH by default on Windows 11)
-- CLI args: `wt.exe -d "C:\path\to\project" cmd /k "claude -r"`
-- Much better CLI support than Warp for programmatic launching
-- `powershell.exe -NoExit -Command "cd 'C:\path'; claude -r"`
-## External Window Position Tracking
-- Use `MonitorFromWindow` to determine which monitor a window is on
-- Store position as (monitor_id, x, y, width, height) not just absolute coordinates
-- On monitor config change, validate stored positions and fall back to primary monitor if the target monitor is gone
-## Installation
-# Create project
-# Frontend dependencies
-# Tauri plugins (run from project root)
-# Additional Rust dependencies (add to src-tauri/Cargo.toml)
-# windows = { version = "0.62", features = [
-#   "Win32_UI_WindowsAndMessaging",
-#   "Win32_Graphics_Gdi",
-#   "Win32_System_Threading",
-#   "Win32_Foundation",
-# ]}
-# serde-jsonlines = "0.7"
-# notify = "6"
-# glob = "0.3"
-## Project Structure
-## Permission Configuration
-## Sources
-- [Tauri 2.0 Stable Release](https://v2.tauri.app/blog/tauri-20/) - HIGH confidence
-- [Tauri GitHub Releases (v2.10.3)](https://github.com/tauri-apps/tauri/releases) - HIGH confidence
-- [Tauri Shell Plugin](https://v2.tauri.app/plugin/shell/) - HIGH confidence
-- [Tauri File System Plugin](https://v2.tauri.app/plugin/file-system/) - HIGH confidence
-- [Tauri Store Plugin](https://v2.tauri.app/plugin/store/) - HIGH confidence
-- [Tauri Window State Plugin](https://v2.tauri.app/plugin/window-state/) - HIGH confidence
-- [Tauri Autostart Plugin](https://v2.tauri.app/plugin/autostart/) - HIGH confidence
-- [Tauri System Tray](https://v2.tauri.app/learn/system-tray/) - HIGH confidence
-- [Tauri Create Project (official templates)](https://v2.tauri.app/start/create-project/) - HIGH confidence
-- [Tauri Vite Configuration](https://v2.tauri.app/start/frontend/vite/) - HIGH confidence
-- [Tauri Permissions](https://v2.tauri.app/security/permissions/) - HIGH confidence
-- [SolidJS (v1.9.12)](https://github.com/solidjs/solid/releases) - HIGH confidence
-- [vite-plugin-solid](https://github.com/solidjs/vite-plugin-solid) - HIGH confidence
-- [Vite Releases](https://vite.dev/releases) - HIGH confidence
-- [Tailwind CSS v4](https://tailwindcss.com/blog/tailwindcss-v4) - HIGH confidence
-- [Microsoft windows-rs crate (v0.62.x)](https://github.com/microsoft/windows-rs) - HIGH confidence
-- [serde-jsonlines crate](https://crates.io/crates/serde-jsonlines) - HIGH confidence
-- [@neodrag/solid](https://www.neodrag.dev/docs/solid) - HIGH confidence
-- [Claude Code Local Storage Design](https://milvus.io/blog/why-claude-code-feels-so-stable-a-developers-deep-dive-into-its-local-storage-design.md) - MEDIUM confidence
-- [Claude Code Session Continuation](https://blog.fsck.com/releases/2026/02/22/claude-code-session-continuation/) - MEDIUM confidence
-- [claudecodeui reference project](https://github.com/siteboon/claudecodeui) - MEDIUM confidence
-- [Warp Terminal Windows docs](https://docs.warp.dev/terminal/sessions/launch-configurations) - MEDIUM confidence
-- [CrabNebula: Best UI Libraries for Tauri](https://crabnebula.dev/blog/the-best-ui-libraries-for-cross-platform-apps-with-tauri/) - MEDIUM confidence
-- [Win32 SetWindowPos](https://learn.microsoft.com/en-us/windows/win32/api/winuser/nf-winuser-setwindowpos) - HIGH confidence
-<!-- GSD:stack-end -->
-
-<!-- GSD:conventions-start source:CONVENTIONS.md -->
-## Conventions
-
-### Search Effort Calibration
-
-Before researching something, ask the user how much effort to spend. Most lookups need 2-3 WebSearch calls and a WebFetch or two — run them inline, not in sub-agents. Only spin up research agents for genuinely deep, multi-source investigations. Default assumption: the simplest search that answers the question.
-<!-- GSD:conventions-end -->
-
-<!-- GSD:architecture-start source:ARCHITECTURE.md -->
 ## Architecture
 
-Architecture not yet mapped. Follow existing patterns found in the codebase.
-<!-- GSD:architecture-end -->
+```
+┌──── WSL2 Ubuntu ──────────────────────────────────────────┐
+│                                                            │
+│  tmux session "main"                                       │
+│  ├── main:1.1  claude (running)                            │
+│  ├── main:2.1  claude (idle)                               │
+│  └── ...                                                   │
+│                                                            │
+│  Claude Code                                               │
+│  ~/.claude/settings.json  Notification hook →              │
+│     curl http://100.110.47.29:8833/api/v1/hooks/notification
+│                                                            │
+└─────────────────────────▲──────────────────────────────────┘
+                          │ wsl.exe
+┌─────────────────────────┴──── Windows ─────────────────────┐
+│                                                            │
+│  workspace-resume.exe (Tauri)                              │
+│  ├── SolidJS UI: project cards, pane grid, settings        │
+│  └── Rust: companion service bound 0.0.0.0:8833            │
+│      ├── tmux_poller (2s loop)                             │
+│      ├── HTTP /api/v1/* + WS /events + ntfy server         │
+│      └── hook_sink park-and-wait                           │
+│                                                            │
+└─────────────────────────▲──────────────────────────────────┘
+                          │ Tailscale
+┌─────────────────────────┴──── Phone (oneplus-13) ──────────┐
+│  pane-management-mobile (APK)                              │
+│  Kotlin + Compose, Ktor → :8833                            │
+└────────────────────────────────────────────────────────────┘
+```
 
-<!-- GSD:workflow-start source:GSD defaults -->
-## GSD Workflow Enforcement
+## Environment assumptions
 
-Before using Edit, Write, or other file-changing tools, start work through a GSD command so planning artifacts and execution context stay in sync.
+The fork is personalized for Andrea's single machine. Things that are **hardcoded for this environment** but detected at runtime wherever possible:
 
-Use these entry points:
-- `/gsd:quick` for small fixes, doc updates, and ad-hoc tasks
-- `/gsd:debug` for investigation and bug fixing
-- `/gsd:execute-phase` for planned phase work
+- **WSL2 mirrored networking mode** (`/etc/wsl.conf` → `[wsl2] networkingMode=mirrored`). `localhost` from WSL does NOT reach Windows — always use the Tailscale IP for WSL → Windows cross-talk.
+- **WSL distro/user**: detected at runtime via `wsl.exe --status` + `whoami`. Do not hardcode `Ubuntu` or `andrea` — use `services::wsl::wsl_info()` which parses the UTF-16 output and caches in a `OnceLock`.
+- **Tailscale Windows tailnet**: `desktop-ovgmai7` = `100.110.47.29`. Phone `oneplus-13` = `100.83.163.105`. Android build tools at `C:\Users\Andrea\AppData\Local\Android\Sdk\`. JDK 21 at `C:\Program Files\Java\jdk-21\`.
+- **Rust toolchain on Windows**: `stable-x86_64-pc-windows-msvc` at `C:\Users\Andrea\.cargo\bin\`.
+- **Node on Windows**: `C:\Program Files\nodejs\`.
 
-Do not make direct repo edits outside a GSD workflow unless the user explicitly asks to bypass it.
-<!-- GSD:workflow-end -->
+## Code layout
 
+```
+workspace-resume/                        ← Tauri project root
+├── src-tauri/
+│   ├── Cargo.toml                       ← Rust deps (axum, tower-http, tokio full,
+│   │                                       serde, uuid, base64, reqwest, notify,
+│   │                                       qrcode, sha2, chrono, ...)
+│   └── src/
+│       ├── lib.rs                       ← Tauri Builder + companion::spawn() in .setup()
+│       ├── commands/                    ← Tauri IPC commands (invoke targets)
+│       │   ├── discovery.rs             ← list_projects, scans WSL+Windows .claude/projects
+│       │   ├── launcher.rs              ← resume_session + terminal settings
+│       │   ├── tmux.rs                  ← list_tmux_*, create_pane, send_keys,
+│       │   │                              list_active_claude_panes
+│       │   ├── project_meta.rs          ← tier/display_name/pane_assignments store
+│       │   ├── usage.rs                 ← get_project_usage, get_all_usage, summary
+│       │   ├── git.rs                   ← get_git_info, create_worktree
+│       │   └── companion_admin.rs       ← get_companion_config, qr, rotate_token
+│       ├── services/                    ← Logic shared by commands + companion
+│       │   ├── wsl.rs                   ← Distro/user detection (OnceLock cached)
+│       │   ├── scanner.rs               ← Session metadata parser
+│       │   ├── path_decoder.rs          ← Extract cwd from JSONL first record
+│       │   ├── watcher.rs               ← notify-based session-changed events
+│       │   ├── usage.rs                 ← JSONL → tokens + USD cost (Anthropic pricing)
+│       │   ├── git.rs                   ← Batched wsl.exe probe (branches + worktrees)
+│       │   └── terminal/                ← TmuxLauncher / PowerShellLauncher / WarpLauncher
+│       ├── companion/                   ← Embedded HTTP+WS API on :8833
+│       │   ├── mod.rs                   ← spawn() entry, tokio::spawn from Tauri setup
+│       │   ├── http.rs                  ← axum Router + AppState wiring
+│       │   ├── state.rs                 ← PaneRecord, approvals, broadcast channels
+│       │   ├── auth.rs                  ← bearer_mw + hook_secret_mw (subtle::ct_eq)
+│       │   ├── ws.rs                    ← WebSocket event stream
+│       │   ├── hook_sink.rs             ← Notification hook park-and-wait
+│       │   ├── ntfy_server.rs           ← Embedded ntfy wire protocol (POST /:topic, GET /:topic/json)
+│       │   ├── tmux_poller.rs           ← 2s loop scraping pane state via SHA-256 hash diff
+│       │   └── models.rs                ← DTOs (PaneDto, SessionDto, ApprovalDto, EventDto, ...)
+│       └── models/                      ← Shared Serde structs
+│
+├── src/                                 ← SolidJS frontend (Tauri webview)
+│   ├── App.tsx, index.tsx
+│   ├── lib/
+│   │   ├── tauri-commands.ts            ← invoke() wrappers. New commands go here too.
+│   │   ├── types.ts                     ← ProjectInfo, PaneDto, EventDto, ...
+│   │   └── launch.ts                    ← launchToPane / newSessionInPane
+│   ├── contexts/AppContext.tsx          ← Global state, polling, pane assignments
+│   └── components/
+│       ├── layout/
+│       │   ├── TopBar.tsx               ← Session tabs, window tabs, ⚙/✵ buttons
+│       │   ├── Sidebar.tsx, MainArea.tsx
+│       │   └── GlobalActivePanel.tsx    ← "All active Claudes" modal
+│       ├── project/ProjectCard.tsx      ← Cards with usage + git branch + worktree button
+│       ├── pane/PaneSlot.tsx            ← Individual tmux pane UI
+│       └── SettingsPanel.tsx            ← Terminal / Mobile companion / Error log
+│
+└── package.json                         ← vite-solid build → dist/, consumed by Tauri
 
+pane-management-mobile/                  ← Android repo (nested, separate git)
+├── app/src/main/java/com/andreacanes/panemgmt/
+│   ├── MainActivity.kt, PaneMgmtApp.kt (NavHost)
+│   ├── data/
+│   │   ├── CompanionClient.kt           ← Ktor HTTP + WebSocket client
+│   │   ├── AuthStore.kt                 ← DataStore Preferences (URL + bearer)
+│   │   └── models/Dtos.kt                ← Must match Rust companion wire format
+│   ├── ui/
+│   │   ├── setup/SetupScreen.kt          ← URL + bearer, test, save
+│   │   ├── grid/PaneGridScreen.kt        ← LazyColumn of pane cards, live via WS
+│   │   └── detail/PaneDetailScreen.kt    ← Capture + input + mic + approval dialog
+│   └── voice/VoiceInputController.kt     ← SpeechRecognizer wrapper (offline preferred)
+├── gradle/libs.versions.toml             ← Kotlin 2.1, Compose BOM 2025.01.01, Ktor 3
+└── app/build.gradle.kts                  ← compileSdk 36, minSdk 26, JDK 21
+```
 
-<!-- GSD:profile-start -->
-## Developer Profile
+## Build / run / test
 
-> Profile not yet configured. Run `/gsd:profile-user` to generate your developer profile.
-> This section is managed by `generate-claude-profile` -- do not edit manually.
-<!-- GSD:profile-end -->
+All builds happen on the Windows side (MSVC + Android SDK live there). From a WSL shell:
+
+### Desktop (Tauri)
+```bash
+# Full release build — produces workspace-resume.exe + MSI + NSIS
+cmd.exe /c "cd /d C:\Users\Andrea\Desktop\Botting\pane-management-v0.4.0\workspace-resume && npm run tauri build"
+
+# Fast Rust check only (no bundle)
+cmd.exe /c "cd /d C:\Users\Andrea\Desktop\Botting\pane-management-v0.4.0\workspace-resume\src-tauri && cargo check"
+
+# Fast frontend check
+cmd.exe /c "cd /d C:\Users\Andrea\Desktop\Botting\pane-management-v0.4.0\workspace-resume && npm run build"
+
+# Kill a running instance before rebuilding (required — exe is locked while running)
+cmd.exe /c "taskkill /IM workspace-resume.exe /F"
+
+# Run the built exe from WSL
+cd /mnt/c/Users/Andrea && nohup \
+  "/mnt/c/Users/Andrea/Desktop/Botting/pane-management-v0.4.0/workspace-resume/src-tauri/target/x86_64-pc-windows-msvc/release/workspace-resume.exe" \
+  > /tmp/pm.log 2>&1 & disown
+```
+
+### Android app
+```bash
+ADB=/mnt/c/Users/Andrea/AppData/Local/Android/Sdk/platform-tools/adb.exe
+
+# Build debug APK
+cmd.exe /c "cd /d C:\Users\Andrea\Desktop\Botting\pane-management-v0.4.0\pane-management-mobile && gradlew.bat assembleDebug"
+
+# Install + launch
+$ADB install -r 'C:\Users\Andrea\Desktop\Botting\pane-management-v0.4.0\pane-management-mobile\app\build\outputs\apk\debug\app-debug.apk'
+$ADB shell am start -n com.andreacanes.panemgmt/.MainActivity
+
+# App URL options:
+#   Tailscale (no tether needed):  http://100.110.47.29:8833
+#   ADB reverse tunnel (dev):      $ADB reverse tcp:8833 tcp:8833 ; then http://localhost:8833
+```
+
+### Smoke-test the companion from WSL
+```bash
+TOK=$(cat /mnt/c/Users/Andrea/AppData/Roaming/com.pane-management.app/settings.json \
+  | python3 -c "import sys,json; print(json.load(sys.stdin)['companion.bearer_token'])")
+curl -sS http://100.110.47.29:8833/api/v1/health
+curl -sS -H "Authorization: Bearer $TOK" http://100.110.47.29:8833/api/v1/panes
+curl -sS -H "Authorization: Bearer $TOK" http://100.110.47.29:8833/api/v1/usage
+```
+
+`localhost` from WSL does **not** reach the Windows-bound companion because of WSL2 mirrored networking — always use the Tailscale IP or the LAN IP.
+
+## Secrets
+
+**Never hardcode.** They're generated on first companion startup and stored in the Tauri store at:
+```
+C:\Users\Andrea\AppData\Roaming\com.pane-management.app\settings.json
+```
+
+Keys:
+- `companion.bearer_token` — 32 bytes base64url, required on all `/api/v1/*` calls
+- `companion.hook_secret` — separate shared secret for the Claude Code Notification hook (`X-Hook-Secret` header), kept out of `~/.claude/settings.json`'s public-ish config
+- `companion.ntfy_topic` — random topic name for the embedded ntfy server
+
+To surface them in the app, read via the `get_companion_config` Tauri command (used by the Settings panel and QR generator). Do not put them in log lines or commit them.
+
+## Conventions
+
+- **Commit style**: `feat:` / `fix:` / `refactor:` / `chore:` / `test:` with a single-sentence subject and a body that explains *why*. Bundle related changes into one commit; don't split for split's sake. Always co-author trailer:
+  ```
+  Co-Authored-By: Claude Opus 4.6 (1M context) <noreply@anthropic.com>
+  ```
+- **Tauri commands**: one file per domain under `src-tauri/src/commands/`. Register in `lib.rs` inside `invoke_handler![...]`. Expose via `src/lib/tauri-commands.ts` wrapper **and** a matching TypeScript interface in `src/lib/types.ts`.
+- **Companion endpoints**: add to `companion/http.rs` under `api_auth` (bearer-protected), `api_public` (no auth), or `api_hooks` (shared-secret). If the endpoint needs state, put it in `AppState` (`state.rs`). Mirror the DTO in the Android app's `data/models/Dtos.kt`.
+- **Android DTOs**: any change to `companion/models.rs` needs a matching `@Serializable` update in `pane-management-mobile/app/src/main/java/com/andreacanes/panemgmt/data/models/Dtos.kt`. Serde is permissive (`ignoreUnknownKeys = true`) so adding fields is non-breaking, but renames are not.
+- **Logging**: Rust side uses `tracing::{info, debug, warn}`. Frontend uses `console.log` sparingly — there are ~40 leftover from upstream we want to prune, not add to.
+- **Don't** add dead tests or speculative abstractions. Don't add comments that restate code.
+- **Don't** run `git push --force` or `--no-verify`. Always create new commits.
+
+## Gotchas (don't re-learn)
+
+1. **WSL2 mirrored networking**: `localhost` from WSL binds IPv6 loopback and is **invisible** to the Windows interface stack. Always use `100.110.47.29:8833` (Tailscale IP) for WSL → Windows calls. The Claude Code Notification hook **must** use the Tailscale IP, not `127.0.0.1`.
+2. **Tailscale Windows service can silently stop**. Symptom: app times out, `adb shell curl` also times out. Check: `sc query Tailscale`. Fix: `net start Tailscale` (no admin needed for start; AUTO_START is set but failure-recovery policy needs admin).
+3. **Android `run-as` drops network caps**. `adb shell run-as com.andreacanes.panemgmt curl ...` will fail network calls even though the real app works fine. Don't use `run-as` to debug connectivity — test via the actual app or `adb shell curl`.
+4. **`input text` typing into the wrong field**. When the Android soft keyboard opens, layout compresses and button coordinates shift. If you `adb shell input tap` immediately after typing, you may hit the wrong button. Always dismiss the keyboard first (tap a non-input area), re-dump the UI to get current bounds, then tap.
+5. **OnePlus "Writing Tools" popup** hijacks taps on input fields that look like AI-augmentable text. Dismiss with BACK before interacting.
+6. **Tauri button bounds include neither icon nor label text** — they're an invisible `<View clickable=true>` at a different Y range from the `<Text>` inside. When finding button centers via `uiautomator dump`, filter `clickable=true` elements.
+7. **Keyboard dismissal via BACK can also navigate back**. On the Setup screen, pressing BACK with no keyboard visible exits the activity. Prefer tapping a non-input area over BACK.
+8. **ADB can drop the phone** mid-session (screen lock, USB power blip). Restart with `adb kill-server && adb start-server` and re-authorize on the phone if needed.
+9. **SurfaceFlinger "out of order buffers" noise in logcat** is harmless. Filter by our PID: `adb logcat --pid=$(adb shell pidof com.andreacanes.panemgmt)`.
+10. **Android `compileSdk 35` fails** on this box — only `android-32` and `android-36` are installed. We target 36. If you see `Platform SDK with path: platforms;android-35`, that's why.
+11. **AGP 8.7.3 warns about compileSdk 36** — version-mismatch warning, not an error. Suppress with `android.suppressUnsupportedCompileSdk=36` in `gradle.properties` if it gets noisy.
+12. **Pre-existing test failures** in the Rust side: `test_extract_cwd_from_valid_jsonl` and `test_build_uri_simple_path` hardcode `Sky` (upstream's username). These are **not ours** — don't "fix" them without user approval.
+13. **Tauri store writes lose unrelated keys** if you overwrite the whole object. Always read-modify-write with `StoreExt::get` → mutate → `StoreExt::set` → `save`.
+
+## Current state (April 2026)
+
+**Working end-to-end**:
+- Discovery, project cards with usage + git branch, pane grid, session resume
+- Companion HTTP/WS API on `0.0.0.0:8833`, state machine via tmux_poller
+- Android app grid + detail + voice + approval overlay, connected over Tailscale
+- Claude Code Notification hook wired, park-and-wait tested with curl
+- Barkeep status line in both `~/.claude` configs
+
+**Partially wired**:
+- Android app doesn't show usage or git branch yet (DTOs + UI additions needed)
+- ntfy F-Droid app not installed on phone → lock-screen approval push path exists but untested
+- JSONL-based state transitions (`tool_use` / `stop_reason`) — currently only the output-hash path is used
+
+**Explicitly deferred** (on the roadmap, not in scope unless requested):
+- B5: pre-resume compaction (needs `claude --compact` flag verification)
+- B6: destructive-command safety gate (needs pattern matcher)
+- Scored Claude-session-id resolver (PID + cwd fallback)
+- ANSI color preservation in Android pane capture view
+- Release signing + APK distribution
+
+## Primary references
+
+- **Plan file** (session roadmap): `~/.claude-b/plans/fluttering-jumping-kahn.md`
+- **Research reports** (background context): `~/.claude-b/plans/fluttering-jumping-kahn-agent-*.md`
+- **Auto-memory** for this workspace: `~/.claude-b/projects/-home-andrea-pane-management/memory/`
+- **Upstream design docs** (kept for reference): `BACKLOG.md`, `DEPENDENCIES.md`, `SETUP-GUIDE.md`, `PORTABILITY-AUDIT.md`
