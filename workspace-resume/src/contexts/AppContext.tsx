@@ -151,7 +151,14 @@ export function AppProvider(props: { children: JSX.Element }) {
         ...p,
         meta: metaMap[p.encoded_name] ?? { ...DEFAULT_META },
       }));
-      setState("projects", merged);
+      // Use `reconcile` with `encoded_name` as the identity key so SolidJS
+      // diffs the new list against existing store entries. Without this,
+      // every poll replaced the array reference, causing <For> in the
+      // sidebar to unmount/remount every ProjectCard — which re-triggered
+      // getProjectUsage for every project each cycle and re-parsed the
+      // JSONL session files from scratch (visible to the user as the
+      // cost/tokens/msgs counters flickering on every refresh).
+      setState("projects", reconcile(merged, { key: "encoded_name" }));
     } catch (e) {
       console.error("[AppContext] loadProjectsWithMeta error:", e);
     }
@@ -175,7 +182,6 @@ export function AppProvider(props: { children: JSX.Element }) {
           const inode = await getInode(project.actual_path);
           if (inode) {
             await updateProjectInode(project.encoded_name, inode, null);
-            console.log(`[F-61] Backfilled inode for ${project.encoded_name}: ${inode}`);
           }
           // If inode is null, path truly doesn't exist — but we don't mark as
           // unlinked until we have a PREVIOUS inode to compare against
@@ -195,7 +201,6 @@ export function AppProvider(props: { children: JSX.Element }) {
       } catch (_) {}
 
       // Path no longer resolves — this is a genuine orphan. Run escalating scan.
-      console.log(`[F-61] Orphan detected: ${project.encoded_name} (inode ${meta.inode})`);
       try {
         const parentPath = project.actual_path.replace(/\/[^/]+\/?$/, "");
         let found = await findInodeInTree(parentPath, meta.inode, 1);
@@ -217,14 +222,12 @@ export function AppProvider(props: { children: JSX.Element }) {
         }
 
         if (found) {
-          console.log(`[F-61] Found relocated project: ${project.encoded_name} → ${found}`);
           const existingDirs = meta.claude_project_dirs ?? [];
           if (!existingDirs.includes(project.encoded_name)) {
             existingDirs.push(project.encoded_name);
           }
           await updateProjectInode(project.encoded_name, meta.inode, existingDirs);
         } else {
-          console.log(`[F-61] Could not relocate: ${project.encoded_name} — marking as unlinked`);
           // Mark as confirmed unlinked by setting claude_project_dirs to empty
           // (distinct from null/undefined which means "never checked")
           await updateProjectInode(project.encoded_name, meta.inode, []);
@@ -667,18 +670,27 @@ export function AppProvider(props: { children: JSX.Element }) {
     // F-61: Backfill inodes + scan for orphaned projects (runs in background)
     reconcileProjectInodes();
 
-    // Start tmux state polling (active detection is derived from tmux pane state)
-    // Also refresh projects so new projects are discovered within one poll cycle.
-    // When F-54 (tmux hooks) lands, bump this to 5s as a fallback-only safety net.
-    tmuxPollInterval = setInterval(() => {
+    // Main tmux poll — combines refresh + status check + project reload in
+    // one interval. Cadence bumped from 3s to 10s after observing that
+    // triple-polling every 3s saturated the Rust backend with wsl.exe
+    // invocations (each ~150-200ms of CPU on Windows) and starved the
+    // companion's HTTP runtime under concurrent mobile load. Live updates
+    // on the desktop come primarily from tmux-poller's WebSocket broadcast;
+    // this interval is now a 10s fallback.
+    const runPollCycle = () => {
       refreshTmuxState();
       loadProjectsWithMeta();
-    }, 3000);
+      pollPaneStatuses();
+    };
+    runPollCycle();
+    tmuxPollInterval = setInterval(runPollCycle, 10000);
 
-    // Approval status polling — captures pane content to detect selection prompts.
-    // Matches main poll cadence for responsive amber glow clear on approval.
-    pollPaneStatuses();
-    statusPollInterval = setInterval(pollPaneStatuses, 3000);
+    // Fast status poll — pane active/waiting detection runs every 1.5s so
+    // running/waiting chips update near-instantly. The heavy project/tmux
+    // reload still happens on the 10s cycle above.
+    statusPollInterval = setInterval(() => {
+      pollPaneStatuses();
+    }, 1500);
 
     // Listen for session file changes from Tauri file watcher
     unlistenSessionChanged = await listen<string[]>("session-changed", () => {

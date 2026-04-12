@@ -26,6 +26,21 @@ pub struct TmuxPane {
     pub active: bool,
     pub current_command: String,
     pub current_path: String,
+    /// Original command the pane was started with (e.g. "claude -r <uuid>").
+    /// Survives even while Claude spawns child processes that briefly
+    /// override `current_command`. Empty if tmux doesn't report one.
+    #[serde(default)]
+    pub start_command: String,
+    /// The pane's top-level process PID (usually the shell), used for
+    /// /proc/<pid>/environ walks to detect which Claude profile is
+    /// running under it. Empty if tmux didn't report one.
+    #[serde(default)]
+    pub pane_pid: String,
+    /// `"andrea"` or `"bravura"` — detected from the child process's
+    /// `CLAUDE_CONFIG_DIR` env var. `None` if the pane isn't running
+    /// Claude or detection hasn't completed yet.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub claude_account: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -95,6 +110,9 @@ mod tests {
             active: true,
             current_command: "bash".to_string(),
             current_path: "/home/user".to_string(),
+            start_command: String::new(),
+            pane_pid: String::new(),
+            claude_account: None,
         };
         let json = serde_json::to_string(&pane).unwrap();
         assert!(json.contains("\"pane_id\":\"%5\""));
@@ -128,6 +146,9 @@ mod tests {
                 active: true,
                 current_command: "zsh".to_string(),
                 current_path: "/tmp".to_string(),
+                start_command: String::new(),
+                pane_pid: String::new(),
+                claude_account: None,
             }],
         };
         let json = serde_json::to_string(&state).unwrap();

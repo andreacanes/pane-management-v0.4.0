@@ -40,9 +40,20 @@ pub struct PaneDto {
     /// `-home-andrea-pane-management` etc.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub project_encoded_name: Option<String>,
+    /// Friendly name derived from the matched project's actual_path
+    /// basename. Mobile/desktop render this as the card title instead
+    /// of falling back to the tmux session_name (which is just "main").
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub project_display_name: Option<String>,
     /// Claude Code JSONL UUID if we've bound one to this pane.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub claude_session_id: Option<String>,
+    /// Which Claude account the pane is running under, detected from
+    /// the child process's `CLAUDE_CONFIG_DIR` env var. `"andrea"` or
+    /// `"bravura"` — `None` when the pane isn't a Claude session or we
+    /// haven't detected yet.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub claude_account: Option<String>,
     /// Epoch milliseconds of last state/output change.
     pub updated_at: i64,
 }
@@ -74,6 +85,10 @@ pub struct ApprovalDto {
     pub tool_input: Option<serde_json::Value>,
     pub created_at: i64,
     pub expires_at: i64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub project_display_name: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub claude_account: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
@@ -114,6 +129,16 @@ pub struct VoiceRequest {
     pub locale: Option<String>,
 }
 
+/// Send a single named key (or sequence) to a pane via `tmux send-keys`
+/// without the `-l` literal flag, so tmux interprets symbolic names like
+/// `S-Tab`, `Enter`, `Up`, `C-c`, etc. Used for mode switching (`S-Tab`),
+/// arrow navigation, and any other special-key need that the literal
+/// `/input` endpoint can't express.
+#[derive(Debug, Deserialize)]
+pub struct KeyRequest {
+    pub key: String,
+}
+
 #[derive(Debug, Clone, Serialize)]
 pub struct CaptureResponse {
     pub lines: Vec<String>,
@@ -137,6 +162,13 @@ pub enum EventDto {
         new: PaneState,
         at: i64,
     },
+    /// Fired when a pane's metadata changes out-of-band from state
+    /// transitions — e.g. the poller just detected the pane's Claude
+    /// account via `/proc/<pid>/environ`. Carries the full updated DTO
+    /// so clients can drop their cached copy wholesale.
+    PaneUpdated {
+        pane: PaneDto,
+    },
     PaneOutputChanged {
         pane_id: String,
         tail: Vec<String>,
@@ -150,6 +182,21 @@ pub enum EventDto {
         id: Uuid,
         decision: Decision,
         at: i64,
+    },
+    /// Claude went idle or needs user input — no allow/deny, just a
+    /// notification so clients can surface the right level of urgency.
+    AttentionNeeded {
+        pane_id: String,
+        title: String,
+        message: String,
+        at: i64,
+        /// `"input"` when Claude is waiting for user input,
+        /// `"info"` for status updates like "Claude finished".
+        kind: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        project_display_name: Option<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        claude_account: Option<String>,
     },
     SessionStarted {
         name: String,
@@ -170,6 +217,41 @@ pub struct HealthDto {
     pub version: &'static str,
     pub bind: String,
     pub uptime_s: u64,
+}
+
+// ---------------------------------------------------------------------------
+// Project list (for mobile launcher sheet)
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Clone, Serialize)]
+pub struct ProjectDto {
+    pub encoded_name: String,
+    pub display_name: String,
+    pub actual_path: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub git_branch: Option<String>,
+    pub session_count: u32,
+    pub active_pane_count: u32,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tier: Option<String>,
+}
+
+// ---------------------------------------------------------------------------
+// Window lifecycle (create + kill)
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Deserialize)]
+pub struct CreateWindowRequest {
+    pub session_name: String,
+    pub project_path: String,
+    pub project_display_name: String,
+    pub account: String, // "andrea" | "bravura"
+}
+
+#[derive(Debug, Serialize)]
+pub struct CreateWindowResponse {
+    pub window_index: u32,
+    pub pane_id: String,
 }
 
 /// Helper: current epoch milliseconds.

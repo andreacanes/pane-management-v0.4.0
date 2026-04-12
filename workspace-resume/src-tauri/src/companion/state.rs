@@ -1,7 +1,7 @@
 //! Shared companion state: pane store, approvals registry, broadcast channel,
 //! bearer token, hook secret, and the embedded ntfy message buffer.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::time::Instant;
 
@@ -24,6 +24,11 @@ pub struct PaneRecord {
     pub last_output_change: Option<Instant>,
     /// How confident we are in the claude_session_id binding.
     pub binding_confidence: BindingConfidence,
+    /// Cached Claude account detection: `None` means "not yet detected
+    /// or not a Claude pane", `Some("andrea")` / `Some("bravura")` once
+    /// we've read `/proc/<child_pid>/environ`. Caches forever per pane
+    /// record — re-detection only happens on a fresh pane record.
+    pub claude_account: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
@@ -60,6 +65,17 @@ pub struct NtfyMessage {
     pub actions: Option<String>,
 }
 
+/// Cached project lookup table used by the tmux poller to attach a
+/// `project_encoded_name` / `project_display_name` to each pane DTO.
+/// `list_projects` scans WSL via `wsl.exe` and is too expensive to run
+/// every 2 s, so the poller refreshes this at most every 30 s.
+#[derive(Default)]
+pub struct ProjectCache {
+    pub fetched_at: Option<Instant>,
+    /// Map from a normalized lowercase POSIX path to (encoded_name, display_name).
+    pub by_path: HashMap<String, (String, String)>,
+}
+
 #[derive(Clone)]
 pub struct AppState {
     pub bearer: Arc<RwLock<String>>,
@@ -74,6 +90,12 @@ pub struct AppState {
     pub ntfy_events: broadcast::Sender<NtfyMessage>,
     pub started_at: Instant,
     pub bind_addr: String,
+    pub project_cache: Arc<RwLock<ProjectCache>>,
+    /// Panes flagged as needing user attention via a Claude Code
+    /// `idle_prompt` hook. Unlike approvals there is nothing to allow or
+    /// deny — the flag sticks until the pane produces fresh output (user
+    /// responded) or Claude exits. Cleared by the tmux poller.
+    pub attention_panes: Arc<RwLock<HashSet<String>>>,
 }
 
 impl AppState {
@@ -129,6 +151,8 @@ impl AppState {
             ntfy_events: ntfy_tx,
             started_at: Instant::now(),
             bind_addr: format!("{}:{}", super::BIND_ADDR, super::COMPANION_PORT),
+            project_cache: Arc::new(RwLock::new(ProjectCache::default())),
+            attention_panes: Arc::new(RwLock::new(HashSet::new())),
         })
     }
 

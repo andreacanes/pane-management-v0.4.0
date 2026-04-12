@@ -55,6 +55,9 @@ export interface ActivePane {
   pane_index: number;
   current_command: string;
   current_path: string;
+  start_command: string;
+  pane_pid?: string;
+  claude_account?: "andrea" | "bravura" | null;
 }
 
 export interface SessionInfo {
@@ -133,6 +136,11 @@ export interface TmuxPane {
   active: boolean;
   current_command: string;
   current_path: string;
+  start_command?: string;
+  /** Top-level process PID for this pane (usually the shell). */
+  pane_pid?: string;
+  /** Server-detected Claude profile ("andrea" | "bravura"). */
+  claude_account?: "andrea" | "bravura" | null;
 }
 
 export interface TmuxState {

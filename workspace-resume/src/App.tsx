@@ -1,17 +1,5 @@
 import { createSignal, Show, onMount, onCleanup } from "solid-js";
-import { LazyStore } from "@tauri-apps/plugin-store";
 import { AppProvider, useApp } from "./contexts/AppContext";
-
-// Load saved theme immediately on app startup — before any render
-(async () => {
-  try {
-    const store = new LazyStore("settings.json");
-    const theme = await store.get<string>("theme");
-    if (theme) {
-      document.documentElement.setAttribute("data-theme", theme);
-    }
-  } catch (_) {}
-})();
 import {
   DragDropProvider,
   DragDropSensors,
@@ -32,10 +20,7 @@ import { PANE_SLOT_PREFIX } from "./components/pane/PaneSlot";
 import { NEW_PROJECT_PREFIX, NEW_PROJECT_CONTINUITY_PREFIX } from "./components/project/NewProjectFlow";
 import { swapTmuxPane, setPaneAssignment, sendToPane } from "./lib/tauri-commands";
 import { toWslPath } from "./lib/path";
-import { FaeParticles } from "./components/theme/FaeParticles";
-import { FaeSigils } from "./components/theme/FaeSigils";
-import { FaeVines } from "./components/theme/FaeVines";
-import { NeonSigns } from "./components/theme/NeonSigns";
+import { ToastHost } from "./components/ui/Toast";
 
 /**
  * Inner component that consumes AppContext (must be rendered inside AppProvider).
@@ -44,19 +29,6 @@ import { NeonSigns } from "./components/theme/NeonSigns";
 function AppInner() {
   const { state, refreshTmuxState, refreshProjects, reorderSessions, reorderWindows, reorderPinned, settingsProject, closeProjectSettings } = useApp();
 
-  // Theme detection — reactively tracks data-theme attribute changes
-  const [activeTheme, setActiveTheme] = createSignal(
-    document.documentElement.getAttribute("data-theme") || "default"
-  );
-  onMount(() => {
-    const observer = new MutationObserver(() => {
-      setActiveTheme(document.documentElement.getAttribute("data-theme") || "default");
-    });
-    observer.observe(document.documentElement, { attributes: true, attributeFilter: ["data-theme"] });
-    onCleanup(() => observer.disconnect());
-  });
-  const isWitchingHour = () => activeTheme() === "witching-hour";
-  const isNeonShinjuku = () => activeTheme() === "neon-shinjuku";
   const [sidebarWidth, setSidebarWidth] = createSignal(280);
   const [pendingPaneDrop, setPendingPaneDrop] = createSignal<{
     encodedProject: string;
@@ -154,7 +126,6 @@ function AppInner() {
       const paneIndex = parseInt(dropId, 10);
       if (!isNaN(paneIndex) && state.selectedTmuxSession && state.selectedTmuxWindow != null) {
         const wslPath = toWslPath(winPath);
-        console.log("[App] New project drop →", { winPath, wslPath, paneIndex, continuity: isContinuity });
         try {
           await sendToPane(state.selectedTmuxSession, state.selectedTmuxWindow, paneIndex, `cd '${wslPath}' && claude`);
           if (isContinuity) {
@@ -373,15 +344,8 @@ function AppInner() {
         />
       </Show>
 
-      {/* Theme-specific decorative elements */}
-      <Show when={isWitchingHour()}>
-        <FaeParticles />
-        <FaeSigils />
-        <FaeVines />
-      </Show>
-      <Show when={isNeonShinjuku()}>
-        <NeonSigns />
-      </Show>
+      {/* Toast stack — globally accessible via showToast()/toastError() */}
+      <ToastHost />
     </DragDropProvider>
   );
 }

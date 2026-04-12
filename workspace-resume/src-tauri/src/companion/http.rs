@@ -4,7 +4,7 @@ use axum::{
     extract::{Path, Query, State},
     http::StatusCode,
     response::Json,
-    routing::{get, post},
+    routing::{delete, get, post},
     Router,
 };
 use serde::Deserialize;
@@ -13,11 +13,13 @@ use super::{
     error::AppError,
     hook_sink,
     models::{
-        now_ms, ApprovalDto, ApprovalResponse, CaptureResponse, HealthDto, InputRequest, PaneDto,
+        now_ms, ApprovalDto, ApprovalResponse, CaptureResponse, CreateWindowRequest,
+        CreateWindowResponse, HealthDto, InputRequest, KeyRequest, PaneDto, ProjectDto,
         SessionDto, VoiceRequest,
     },
     ntfy_server,
     state::AppState,
+    tmux_poller::normalize_path,
     ws,
 };
 
@@ -29,11 +31,15 @@ pub fn router(state: AppState) -> Router {
         .route("/panes/{id}/capture", get(capture_pane))
         .route("/panes/{id}/input", post(send_input))
         .route("/panes/{id}/voice", post(send_voice))
+        .route("/panes/{id}/key", post(send_key))
         .route("/panes/{id}/cancel", post(cancel_pane))
         .route("/approvals", get(list_approvals))
         .route("/approvals/{id}", post(resolve_approval))
         .route("/usage", get(usage_summary))
         .route("/usage/projects/{encoded_name}", get(project_usage))
+        .route("/projects", get(list_projects))
+        .route("/windows", post(create_window))
+        .route("/windows/{session}/{index}", delete(kill_window))
         .route("/events", get(ws::upgrade))
         .route_layer(axum::middleware::from_fn_with_state(
             state.clone(),
@@ -79,7 +85,9 @@ async fn health(State(state): State<AppState>) -> Json<HealthDto> {
 
 async fn list_sessions(State(_state): State<AppState>) -> Result<Json<Vec<SessionDto>>, AppError> {
     let script = "tmux list-sessions -F '#{session_name}|#{session_windows}|#{?session_attached,1,0}' 2>/dev/null || true";
-    let out = crate::commands::tmux::run_tmux_command(script).map_err(AppError::Tmux)?;
+    let out = crate::commands::tmux::run_tmux_command_async(script.to_string())
+        .await
+        .map_err(AppError::Tmux)?;
     let sessions: Vec<SessionDto> = out
         .lines()
         .filter(|l| !l.trim().is_empty())
@@ -128,7 +136,7 @@ pub struct CaptureQuery {
     pub lines: u32,
 }
 fn default_capture_lines() -> u32 {
-    200
+    1000
 }
 
 async fn capture_pane(
@@ -138,8 +146,10 @@ async fn capture_pane(
 ) -> Result<Json<CaptureResponse>, AppError> {
     // pane id format: "<session>:<window>.<pane>" — the same as tmux target syntax
     let start = -(q.lines as i64);
-    let script = format!("tmux capture-pane -p -t {} -S {} 2>&1 || true", id, start);
-    let out = crate::commands::tmux::run_tmux_command(&script).map_err(AppError::Tmux)?;
+    let script = format!("tmux capture-pane -p -e -t {} -S {} 2>&1 || true", id, start);
+    let out = crate::commands::tmux::run_tmux_command_async(script)
+        .await
+        .map_err(AppError::Tmux)?;
     let lines: Vec<String> = out.lines().map(|s| s.to_string()).collect();
     // Update the pane record's seq so clients can detect changes
     let seq = {
@@ -153,21 +163,50 @@ async fn capture_pane(
 }
 
 async fn send_input(
-    State(_state): State<AppState>,
+    State(state): State<AppState>,
     Path(id): Path<String>,
     Json(req): Json<InputRequest>,
 ) -> Result<StatusCode, AppError> {
-    send_text_to_pane(&id, &req.text, req.submit)?;
+    send_text_to_pane(&id, &req.text, req.submit).await?;
+    // User has answered a Claude prompt (or typed anything). Drop the
+    // attention flag so the pane can leave Waiting on the next poll tick.
+    state.attention_panes.write().await.remove(&id);
     Ok(StatusCode::NO_CONTENT)
 }
 
 async fn send_voice(
-    State(_state): State<AppState>,
+    State(state): State<AppState>,
     Path(id): Path<String>,
     Json(req): Json<VoiceRequest>,
 ) -> Result<StatusCode, AppError> {
     tracing::info!(pane = %id, locale = ?req.locale, "voice input");
-    send_text_to_pane(&id, &req.transcript, req.submit)?;
+    send_text_to_pane(&id, &req.transcript, req.submit).await?;
+    state.attention_panes.write().await.remove(&id);
+    Ok(StatusCode::NO_CONTENT)
+}
+
+async fn send_key(
+    State(_state): State<AppState>,
+    Path(id): Path<String>,
+    Json(req): Json<KeyRequest>,
+) -> Result<StatusCode, AppError> {
+    // Whitelist the key names we accept so an attacker who somehow has
+    // the bearer token can't use this endpoint to inject arbitrary shell
+    // strings via tmux send-keys. Cycling claude modes only needs S-Tab
+    // for now; widen the list when a real client needs more.
+    const ALLOWED_KEYS: &[&str] = &[
+        "S-Tab", "BTab", "Tab", "Enter", "Escape", "Up", "Down", "Left", "Right",
+    ];
+    if !ALLOWED_KEYS.contains(&req.key.as_str()) {
+        return Err(AppError::BadRequest(format!(
+            "key '{}' not in allow-list",
+            req.key
+        )));
+    }
+    let script = format!("tmux send-keys -t {} {}", id, req.key);
+    crate::commands::tmux::run_tmux_command_async(script)
+        .await
+        .map_err(AppError::Tmux)?;
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -176,7 +215,9 @@ async fn cancel_pane(
     Path(id): Path<String>,
 ) -> Result<StatusCode, AppError> {
     let script = format!("tmux send-keys -t {} C-c C-c 2>&1", id);
-    crate::commands::tmux::run_tmux_command(&script).map_err(AppError::Tmux)?;
+    crate::commands::tmux::run_tmux_command_async(script)
+        .await
+        .map_err(AppError::Tmux)?;
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -239,12 +280,146 @@ async fn project_usage(
 }
 
 // ---------------------------------------------------------------------------
+// Window lifecycle + project picker (for mobile new-window sheet)
+// ---------------------------------------------------------------------------
+
+async fn list_projects(State(state): State<AppState>) -> Result<Json<Vec<ProjectDto>>, AppError> {
+    let projects = crate::commands::discovery::list_projects()
+        .await
+        .map_err(AppError::BadRequest)?;
+
+    // Build a snapshot of pane cwds so we can attach an
+    // active_pane_count to each project without holding the read lock
+    // across the whole loop.
+    let cwds: Vec<String> = {
+        let panes = state.panes.read().await;
+        panes
+            .values()
+            .map(|r| normalize_path(&r.dto.current_path))
+            .collect()
+    };
+
+    let mut dtos: Vec<ProjectDto> = projects
+        .into_iter()
+        .filter(|p| p.path_exists && !p.actual_path.starts_with("[unresolved]"))
+        .map(|p| {
+            let norm = normalize_path(&p.actual_path);
+            let display_name = norm
+                .rsplit('/')
+                .find(|s| !s.is_empty())
+                .unwrap_or(&norm)
+                .to_string();
+            let active_pane_count = cwds
+                .iter()
+                .filter(|c| c == &&norm || c.starts_with(&format!("{}/", norm)))
+                .count() as u32;
+            ProjectDto {
+                encoded_name: p.encoded_name,
+                display_name,
+                actual_path: p.actual_path,
+                git_branch: p.git_branch,
+                session_count: p.session_count as u32,
+                active_pane_count,
+                tier: None, // tier lives in project_meta store on the desktop — deferred
+            }
+        })
+        .collect();
+
+    // Sort: panes-open first, then alphabetical by display_name.
+    dtos.sort_by(|a, b| {
+        b.active_pane_count
+            .cmp(&a.active_pane_count)
+            .then_with(|| a.display_name.to_lowercase().cmp(&b.display_name.to_lowercase()))
+    });
+
+    Ok(Json(dtos))
+}
+
+async fn create_window(
+    State(_state): State<AppState>,
+    Json(req): Json<CreateWindowRequest>,
+) -> Result<Json<CreateWindowResponse>, AppError> {
+    // Andrea = ncld, Bravura = ncld2. Both shell functions live in
+    // ~/.bashrc so the command runs inside an interactive shell via
+    // `send-keys`, not as a `new-window "cmd"` argument.
+    let cmd = match req.account.as_str() {
+        "bravura" => "ncld2",
+        "andrea" | "" => "ncld",
+        other => {
+            return Err(AppError::BadRequest(format!(
+                "unknown account '{}': expected andrea|bravura",
+                other
+            )))
+        }
+    };
+    if req.session_name.is_empty() || req.project_path.is_empty() {
+        return Err(AppError::BadRequest(
+            "session_name and project_path are required".into(),
+        ));
+    }
+
+    // Single-quote shell escape: a single quote becomes '\''
+    let sess_esc = req.session_name.replace('\'', r"'\''");
+    let path_esc = req.project_path.replace('\'', r"'\''");
+    let name_esc = req.project_display_name.replace('\'', r"'\''");
+
+    let script = format!(
+        "IDX=$(tmux new-window -t '{sess}' -d -c '{path}' -n '{name}' -P -F '#{{window_index}}' 2>&1); \
+         if [ -z \"$IDX\" ]; then echo 'ERR: new-window failed'; exit 1; fi; \
+         tmux send-keys -t '{sess}':\"$IDX\" '{cmd}' Enter; \
+         echo \"IDX=$IDX\"",
+        sess = sess_esc,
+        path = path_esc,
+        name = name_esc,
+        cmd = cmd,
+    );
+
+    let out = crate::commands::tmux::run_tmux_command_async(script)
+        .await
+        .map_err(AppError::Tmux)?;
+
+    // Parse `IDX=<n>` out of the stdout.
+    let idx_str = out
+        .lines()
+        .find_map(|l| l.strip_prefix("IDX="))
+        .ok_or_else(|| AppError::BadRequest(format!("create_window parse failed: {}", out)))?;
+    let window_index: u32 = idx_str
+        .trim()
+        .parse()
+        .map_err(|_| AppError::BadRequest(format!("create_window bad index: {}", idx_str)))?;
+    let pane_id = format!("{}:{}.1", req.session_name, window_index);
+
+    tracing::info!(%pane_id, account = %req.account, "new window created");
+
+    Ok(Json(CreateWindowResponse {
+        window_index,
+        pane_id,
+    }))
+}
+
+async fn kill_window(
+    State(_state): State<AppState>,
+    Path((session, index)): Path<(String, u32)>,
+) -> Result<StatusCode, AppError> {
+    if session.is_empty() {
+        return Err(AppError::BadRequest("session is required".into()));
+    }
+    let sess_esc = session.replace('\'', r"'\''");
+    let script = format!("tmux kill-window -t '{}':{} 2>&1", sess_esc, index);
+    crate::commands::tmux::run_tmux_command_async(script)
+        .await
+        .map_err(AppError::Tmux)?;
+    tracing::info!(%session, index, "window killed");
+    Ok(StatusCode::NO_CONTENT)
+}
+
+// ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
 
 /// Send literal text to a tmux pane via `send-keys -l`, optionally
 /// followed by Enter. Keeps quoting sane by passing via stdin.
-fn send_text_to_pane(id: &str, text: &str, submit: bool) -> Result<(), AppError> {
+async fn send_text_to_pane(id: &str, text: &str, submit: bool) -> Result<(), AppError> {
     // Escape single quotes for bash single-quoted string
     let escaped = text.replace('\'', r"'\''");
     let submit_line = if submit {
@@ -256,6 +431,8 @@ fn send_text_to_pane(id: &str, text: &str, submit: bool) -> Result<(), AppError>
         "tmux send-keys -t {} -l '{}'; {}",
         id, escaped, submit_line
     );
-    crate::commands::tmux::run_tmux_command(&script).map_err(AppError::Tmux)?;
+    crate::commands::tmux::run_tmux_command_async(script)
+        .await
+        .map_err(AppError::Tmux)?;
     Ok(())
 }

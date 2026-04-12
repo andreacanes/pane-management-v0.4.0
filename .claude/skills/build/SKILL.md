@@ -37,6 +37,8 @@ If multiple scopes are touched, build each narrow scope in parallel rather than 
   cmd.exe /c "cd /d C:\Users\Andrea\Desktop\Botting\pane-management-v0.4.0\workspace-resume\src-tauri && cargo check"
 ```
 
+**Do not use `cargo build --release` to produce the launchable exe** even when only Rust changed. Bare cargo skips the Tauri CLI step that switches the asset resolver from `devUrl` (localhost:1420) to the embedded `frontendDist`, so the exe boots in dev mode pointing at a Vite server that isn't running and the WebView shows `ERR_CONNECTION_REFUSED`. For a runnable exe always use the full Tauri release build below.
+
 ## Tauri frontend check (narrow)
 
 ```bash
@@ -88,3 +90,4 @@ $ADB logcat --pid=$($ADB shell pidof com.andreacanes.panemgmt)
 - "taskkill said 'process not found'" → fine, the exe wasn't running, proceed
 - "`compileSdk 35` missing" → only `android-32` and `android-36` are installed; target is 36 intentionally
 - "Tailscale timeout during smoke test" → see the `companion-smoke-test` skill; check `sc query Tailscale` first
+- "WebView shows `ERR_CONNECTION_REFUSED` to localhost when the exe launches" → you ran `cargo build --release` instead of `npm run tauri build`. Bare cargo doesn't flip Tauri's asset resolver to the embedded dist. Re-run the full Tauri release build above

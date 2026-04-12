@@ -1,11 +1,86 @@
 use crate::models::tmux_state::{TmuxPane, TmuxSession, TmuxState, TmuxWindow, WindowPaneStatus};
 use std::collections::HashMap;
+use std::sync::{LazyLock, Mutex};
 
 #[cfg(windows)]
 use std::os::windows::process::CommandExt;
 
+/// Process-wide cache keyed by a pane's shell PID → detected Claude
+/// account (`"andrea"` or `"bravura"`). Both the companion poller and
+/// the Tauri command path read through this helper so detection shells
+/// out at most once per pane lifetime across the whole app.
+static PID_ACCOUNT_CACHE: LazyLock<Mutex<HashMap<String, String>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
+
+/// Walk a pane's shell PID (+ direct and grand-children) and read
+/// each process's `/proc/<pid>/environ`. Returns `"bravura"` if any
+/// descendant has `CLAUDE_CONFIG_DIR=~/.claude-b`, `"andrea"` if a
+/// claude-ish process exists without a Bravura env var, or `None`
+/// when no Claude process is visible under the pane yet.
+///
+/// Results are cached in [`PID_ACCOUNT_CACHE`] for the lifetime of
+/// the process — `wsl.exe` cost is paid exactly once per shell pid.
+pub async fn detect_claude_account(shell_pid: &str) -> Option<String> {
+    if shell_pid.is_empty() {
+        return None;
+    }
+    {
+        let cache = PID_ACCOUNT_CACHE.lock().ok()?;
+        if let Some(v) = cache.get(shell_pid) {
+            return Some(v.clone());
+        }
+    }
+    let script = format!(
+        r#"pid={pid}
+children=$(pgrep -P $pid 2>/dev/null)
+grand=""
+for c in $children; do
+  grand="$grand $(pgrep -P $c 2>/dev/null)"
+done
+candidates="$pid $children $grand"
+
+for p in $candidates; do
+  [ -z "$p" ] && continue
+  env_val=$(tr '\0' '\n' < /proc/$p/environ 2>/dev/null | grep -E '^CLAUDE_CONFIG_DIR=' | head -1 | cut -d= -f2-)
+  if [ -n "$env_val" ]; then
+    case "$env_val" in
+      *claude-b*) echo bravura; exit 0 ;;
+      *)          echo andrea;  exit 0 ;;
+    esac
+  fi
+done
+
+for p in $candidates; do
+  [ -z "$p" ] && continue
+  comm=$(cat /proc/$p/comm 2>/dev/null)
+  case "$comm" in
+    claude|node) echo andrea; exit 0 ;;
+  esac
+done
+"#,
+        pid = shell_pid
+    );
+    let out = run_tmux_command_async(script).await.ok()?;
+    let line = out.lines().find(|l| !l.trim().is_empty())?.trim();
+    let account = match line {
+        "bravura" => Some("bravura".to_string()),
+        "andrea" => Some("andrea".to_string()),
+        _ => None,
+    };
+    if let Some(ref v) = account {
+        if let Ok(mut cache) = PID_ACCOUNT_CACHE.lock() {
+            cache.insert(shell_pid.to_string(), v.clone());
+        }
+    }
+    account
+}
+
 /// Run a tmux command via wsl.exe and return stdout as a String.
 /// Returns Ok(empty string) for "no server running" / "no sessions" (not an error).
+///
+/// This is synchronous and blocks the calling thread on `wsl.exe`. Do NOT call
+/// from async contexts — use [`run_tmux_command_async`] instead so the wait
+/// happens on tokio's blocking pool rather than a runtime worker.
 pub fn run_tmux_command(script: &str) -> Result<String, String> {
     let mut cmd = std::process::Command::new("wsl.exe");
     cmd.args(["-e", "bash", "-c", script]);
@@ -29,6 +104,16 @@ pub fn run_tmux_command(script: &str) -> Result<String, String> {
     }
 
     Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
+}
+
+/// Async wrapper that runs [`run_tmux_command`] on tokio's blocking pool.
+/// Call this from the companion's async handlers and hot polling loop — the
+/// sync variant would park a tokio worker on every `wsl.exe` invocation and
+/// starve the runtime under load.
+pub async fn run_tmux_command_async(script: String) -> Result<String, String> {
+    tokio::task::spawn_blocking(move || run_tmux_command(&script))
+        .await
+        .map_err(|e| format!("tmux join error: {}", e))?
 }
 
 /// Parse a pipe-delimited session line into a TmuxSession.
@@ -61,12 +146,41 @@ pub fn parse_window_line(line: &str) -> Option<TmuxWindow> {
 }
 
 /// Parse a pipe-delimited pane line into a TmuxPane.
-/// Format: `pane_index|pane_id|width|height|top|left|active|current_command|current_path`
+///
+/// Canonical format (11+ fields):
+/// `pane_index|pane_id|width|height|top|left|active|pane_pid|current_command|current_path|...|start_command`
+///
+/// Legacy format (9 fields, no pane_pid, no start_command):
+/// `pane_index|pane_id|width|height|top|left|active|current_command|current_path`
+///
+/// The legacy shape is kept alive for the unit tests but production
+/// callers use the canonical one so they get `pane_pid` + `start_command`
+/// for downstream detection.
 pub fn parse_pane_line(line: &str) -> Option<TmuxPane> {
     let parts: Vec<&str> = line.split('|').collect();
     if parts.len() < 9 {
         return None;
     }
+    // Canonical format starts at 11 parts. `pane_pid` sits at index 7 so
+    // it's in a stable position regardless of how many pipe segments the
+    // `current_path` contributes (paths can contain literal `|`).
+    let (pane_pid, current_command, path_start, start_command) = if parts.len() >= 11 {
+        let pane_pid = parts[7].to_string();
+        let current_command = parts[8].to_string();
+        let start_command = parts[parts.len() - 1].to_string();
+        (pane_pid, current_command, 9, start_command)
+    } else if parts.len() >= 10 {
+        // 10-field legacy with start_command but no pane_pid
+        let current_command = parts[7].to_string();
+        let start_command = parts[parts.len() - 1].to_string();
+        (String::new(), current_command, 8, start_command)
+    } else {
+        // 9-field legacy (pre-pane_pid, pre-start_command)
+        let current_command = parts[7].to_string();
+        (String::new(), current_command, 8, String::new())
+    };
+    let path_end = if parts.len() >= 10 { parts.len() - 1 } else { parts.len() };
+    let current_path = parts[path_start..path_end].join("|");
     Some(TmuxPane {
         pane_index: parts[0].parse().unwrap_or(0),
         pane_id: parts[1].to_string(),
@@ -75,8 +189,11 @@ pub fn parse_pane_line(line: &str) -> Option<TmuxPane> {
         top: parts[4].parse().unwrap_or(0),
         left: parts[5].parse().unwrap_or(0),
         active: parts[6] == "1",
-        current_command: parts[7].to_string(),
-        current_path: parts[8].to_string(),
+        current_command,
+        current_path,
+        start_command,
+        pane_pid,
+        claude_account: None,
     })
 }
 
@@ -98,7 +215,7 @@ where
 
 /// Cross-session "all panes running Claude" query.
 /// Returns a flat list of panes across every tmux session whose
-/// current_command contains "claude".
+/// current_command or start_command identifies them as a Claude session.
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct ActivePane {
     pub id: String,
@@ -108,27 +225,73 @@ pub struct ActivePane {
     pub pane_index: u32,
     pub current_command: String,
     pub current_path: String,
+    pub start_command: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub pane_pid: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub claude_account: Option<String>,
+}
+
+/// Fill in `claude_account` for every claude-alive pane in the slice
+/// by calling [`detect_claude_account`] on its `pane_pid`. The helper
+/// is cached process-wide so this is cheap after the first call per
+/// pane. Panes that aren't running Claude are left with `None`.
+pub async fn populate_claude_accounts(panes: &mut [TmuxPane]) {
+    for pane in panes.iter_mut() {
+        if pane.claude_account.is_some() {
+            continue;
+        }
+        if !pane_is_claude(&pane.current_command, &pane.start_command) {
+            continue;
+        }
+        if pane.pane_pid.is_empty() {
+            continue;
+        }
+        pane.claude_account = detect_claude_account(&pane.pane_pid).await;
+    }
+}
+
+/// Return true if the pane is "running Claude" — either the foreground
+/// command is `claude`/`claude-b` directly, or the pane was started with
+/// the claude binary and the current foreground is not a plain shell
+/// (i.e., Claude is alive and waiting on a child tool invocation).
+pub fn pane_is_claude(current_command: &str, start_command: &str) -> bool {
+    let cur = current_command.to_ascii_lowercase();
+    if cur.contains("claude") {
+        return true;
+    }
+    let start = start_command.to_ascii_lowercase();
+    if !start.contains("claude") {
+        return false;
+    }
+    let is_shell = matches!(
+        cur.as_str(),
+        "bash" | "zsh" | "sh" | "fish" | "dash" | "-" | ""
+    );
+    !is_shell
 }
 
 #[tauri::command]
 pub async fn list_active_claude_panes() -> Result<Vec<ActivePane>, String> {
     let script = "tmux list-panes -a -F \
-        '#{session_name}|#{window_index}|#{window_name}|#{pane_index}|#{pane_current_command}|#{pane_current_path}' 2>/dev/null";
-    let out = run_tmux_command(script)?;
+        '#{session_name}|#{window_index}|#{window_name}|#{pane_index}|#{pane_pid}|#{pane_current_command}|#{pane_current_path}|#{pane_start_command}' 2>/dev/null";
+    let out = run_tmux_command_async(script.to_string()).await?;
     let mut result = Vec::new();
     for line in out.lines() {
         let parts: Vec<&str> = line.split('|').collect();
-        if parts.len() < 6 {
+        if parts.len() < 8 {
             continue;
         }
         let session = parts[0].to_string();
         let window_index: u32 = parts[1].parse().unwrap_or(0);
         let window_name = parts[2].to_string();
         let pane_index: u32 = parts[3].parse().unwrap_or(0);
-        let current_command = parts[4].to_string();
-        let current_path = parts[5..].join("|");
-        // Only include panes that are clearly Claude sessions
-        if !current_command.eq_ignore_ascii_case("claude") {
+        let pane_pid = parts[4].to_string();
+        let current_command = parts[5].to_string();
+        // Path can contain literal '|' — start_command is always last.
+        let start_command = parts[parts.len() - 1].to_string();
+        let current_path = parts[6..parts.len() - 1].join("|");
+        if !pane_is_claude(&current_command, &start_command) {
             continue;
         }
         result.push(ActivePane {
@@ -139,7 +302,18 @@ pub async fn list_active_claude_panes() -> Result<Vec<ActivePane>, String> {
             pane_index,
             current_command,
             current_path,
+            start_command,
+            pane_pid,
+            claude_account: None,
         });
+    }
+    // Populate claude_account for each entry — cached helper so repeat
+    // calls are cheap.
+    for entry in result.iter_mut() {
+        if entry.pane_pid.is_empty() {
+            continue;
+        }
+        entry.claude_account = detect_claude_account(&entry.pane_pid).await;
     }
     Ok(result)
 }
@@ -148,7 +322,7 @@ pub async fn list_active_claude_panes() -> Result<Vec<ActivePane>, String> {
 pub async fn list_tmux_sessions() -> Result<Vec<TmuxSession>, String> {
     let script =
         "tmux list-sessions -F '#{session_name}|#{session_windows}|#{session_attached}' 2>/dev/null";
-    let output = run_tmux_command(script)?;
+    let output = run_tmux_command_async(script.to_string()).await?;
     if output.is_empty() {
         return Ok(vec![]);
     }
@@ -161,7 +335,7 @@ pub async fn list_tmux_windows(session_name: String) -> Result<Vec<TmuxWindow>, 
         "tmux list-windows -t '{}' -F '#{{window_index}}|#{{window_name}}|#{{window_panes}}|#{{window_active}}' 2>/dev/null",
         session_name
     );
-    let output = run_tmux_command(&script)?;
+    let output = run_tmux_command_async(script).await?;
     if output.is_empty() {
         return Ok(vec![]);
     }
@@ -174,14 +348,16 @@ pub async fn list_tmux_panes(
     window_index: u32,
 ) -> Result<Vec<TmuxPane>, String> {
     let script = format!(
-        "tmux list-panes -t '{}:{}' -F '#{{pane_index}}|#{{pane_id}}|#{{pane_width}}|#{{pane_height}}|#{{pane_top}}|#{{pane_left}}|#{{pane_active}}|#{{pane_current_command}}|#{{pane_current_path}}' 2>/dev/null",
+        "tmux list-panes -t '{}:{}' -F '#{{pane_index}}|#{{pane_id}}|#{{pane_width}}|#{{pane_height}}|#{{pane_top}}|#{{pane_left}}|#{{pane_active}}|#{{pane_pid}}|#{{pane_current_command}}|#{{pane_current_path}}|#{{pane_start_command}}' 2>/dev/null",
         session_name, window_index
     );
-    let output = run_tmux_command(&script)?;
+    let output = run_tmux_command_async(script).await?;
     if output.is_empty() {
         return Ok(vec![]);
     }
-    Ok(parse_lines(&output, parse_pane_line))
+    let mut panes = parse_lines(&output, parse_pane_line);
+    populate_claude_accounts(&mut panes).await;
+    Ok(panes)
 }
 
 #[tauri::command]
@@ -197,13 +373,13 @@ pub async fn get_tmux_state(
             "echo '---WINDOWS---'; ",
             "tmux list-windows -t '{}' -F '#{{window_index}}|#{{window_name}}|#{{window_panes}}|#{{window_active}}' 2>/dev/null; ",
             "echo '---PANES---'; ",
-            "tmux list-panes -t '{}:{}' -F '#{{pane_index}}|#{{pane_id}}|#{{pane_width}}|#{{pane_height}}|#{{pane_top}}|#{{pane_left}}|#{{pane_active}}|#{{pane_current_command}}|#{{pane_current_path}}' 2>/dev/null; ",
+            "tmux list-panes -t '{}:{}' -F '#{{pane_index}}|#{{pane_id}}|#{{pane_width}}|#{{pane_height}}|#{{pane_top}}|#{{pane_left}}|#{{pane_active}}|#{{pane_pid}}|#{{pane_current_command}}|#{{pane_current_path}}|#{{pane_start_command}}' 2>/dev/null; ",
             "echo '---END---'"
         ),
         session_name, session_name, window_index
     );
 
-    let output = run_tmux_command(&script)?;
+    let output = run_tmux_command_async(script).await?;
 
     // Parse by splitting on marker lines
     let mut sessions = vec![];
@@ -252,6 +428,8 @@ pub async fn get_tmux_state(
         }
     }
 
+    populate_claude_accounts(&mut panes).await;
+
     Ok(TmuxState {
         sessions,
         windows,
@@ -280,7 +458,7 @@ pub async fn create_pane(
         "tmux split-window {} -t '{}:{}'",
         dir_flag, session_name, window_index
     );
-    run_tmux_command(&script)?;
+    run_tmux_command_async(script).await?;
 
     // Re-query panes and return updated list
     list_tmux_panes(session_name, window_index).await
@@ -311,7 +489,7 @@ pub async fn apply_layout(
         "tmux select-layout -t '{}:{}' '{}'",
         session_name, window_index, layout
     );
-    run_tmux_command(&script)?;
+    run_tmux_command_async(script).await?;
 
     // Re-query panes and return updated list
     list_tmux_panes(session_name, window_index).await
@@ -331,7 +509,7 @@ pub async fn send_to_pane(
         session_name, window_index, pane_index, escaped
     );
     eprintln!("[send_to_pane] target={}:{}.{} command={}", session_name, window_index, pane_index, command);
-    run_tmux_command(&script)?;
+    run_tmux_command_async(script).await?;
     Ok(())
 }
 
@@ -349,7 +527,7 @@ pub async fn cancel_pane_command(
         t = target
     );
     eprintln!("[cancel_pane_command] target={}", target);
-    run_tmux_command(&script)?;
+    run_tmux_command_async(script).await?;
     Ok(())
 }
 
@@ -363,7 +541,7 @@ pub async fn kill_pane(
         "tmux kill-pane -t '{}:{}.{}'",
         session_name, window_index, pane_index
     );
-    run_tmux_command(&script)?;
+    run_tmux_command_async(script).await?;
 
     // Re-query panes and return updated list
     list_tmux_panes(session_name, window_index).await
@@ -375,7 +553,7 @@ pub async fn create_window(session_name: String) -> Result<Vec<TmuxWindow>, Stri
         "tmux new-window -t '{}'",
         session_name
     );
-    run_tmux_command(&script)?;
+    run_tmux_command_async(script).await?;
 
     // Re-query windows and return updated list
     list_tmux_windows(session_name).await
@@ -390,7 +568,7 @@ pub async fn kill_window(
         "tmux kill-window -t '{}:{}'",
         session_name, window_index
     );
-    run_tmux_command(&script)?;
+    run_tmux_command_async(script).await?;
 
     // Re-query windows and return updated list
     list_tmux_windows(session_name).await
@@ -400,7 +578,7 @@ pub async fn kill_window(
 #[tauri::command]
 pub async fn tmux_resurrect_save() -> Result<String, String> {
     let script = "bash ~/.tmux/plugins/tmux-resurrect/scripts/save.sh";
-    let result = run_tmux_command(&format!("tmux run-shell '{}'", script))?;
+    let result = run_tmux_command_async(format!("tmux run-shell '{}'", script)).await?;
     Ok(result)
 }
 
@@ -408,7 +586,7 @@ pub async fn tmux_resurrect_save() -> Result<String, String> {
 #[tauri::command]
 pub async fn tmux_resurrect_restore() -> Result<String, String> {
     let script = "bash ~/.tmux/plugins/tmux-resurrect/scripts/restore.sh";
-    let result = run_tmux_command(&format!("tmux run-shell '{}'", script))?;
+    let result = run_tmux_command_async(format!("tmux run-shell '{}'", script)).await?;
     Ok(result)
 }
 
@@ -425,7 +603,7 @@ pub async fn swap_tmux_pane(
         session_name, window_index, source_pane,
         session_name, window_index, target_pane
     );
-    run_tmux_command(&script)?;
+    run_tmux_command_async(script).await?;
     list_tmux_panes(session_name, window_index).await
 }
 
@@ -440,7 +618,7 @@ pub async fn swap_tmux_window(
         "tmux swap-window -s '{}:{}' -t '{}:{}'",
         session_name, source_index, session_name, target_index
     );
-    run_tmux_command(&script)?;
+    run_tmux_command_async(script).await?;
     list_tmux_windows(session_name).await
 }
 
@@ -453,7 +631,7 @@ pub async fn switch_tmux_session(session_name: String) -> Result<(), String> {
         "tmux switch-client -t '{}' 2>/dev/null || true",
         session_name
     );
-    run_tmux_command(&script)?;
+    run_tmux_command_async(script).await?;
     Ok(())
 }
 
@@ -464,7 +642,7 @@ pub async fn select_tmux_window(session_name: String, window_index: u32) -> Resu
         "tmux select-window -t '{}:{}'",
         session_name, window_index
     );
-    run_tmux_command(&script)?;
+    run_tmux_command_async(script).await?;
     Ok(())
 }
 
@@ -474,7 +652,7 @@ pub async fn rename_session(old_name: String, new_name: String) -> Result<(), St
         "tmux rename-session -t '{}' '{}'",
         old_name, new_name
     );
-    run_tmux_command(&script)?;
+    run_tmux_command_async(script).await?;
     Ok(())
 }
 
@@ -488,7 +666,7 @@ pub async fn rename_window(
         "tmux rename-window -t '{}:{}' '{}'",
         session_name, window_index, new_name
     );
-    run_tmux_command(&script)?;
+    run_tmux_command_async(script).await?;
     Ok(())
 }
 
@@ -499,7 +677,7 @@ pub async fn create_session(session_name: String) -> Result<Vec<TmuxSession>, St
         "tmux new-session -d -s '{}'",
         session_name
     );
-    run_tmux_command(&script)?;
+    run_tmux_command_async(script).await?;
 
     list_tmux_sessions().await
 }
@@ -525,7 +703,7 @@ pub async fn setup_pane_grid(
     if cols == 1 && rows == 1 {
         // Just kill all panes except the active one
         let script = format!("tmux kill-pane -a -t '{}' 2>/dev/null || true", target);
-        run_tmux_command(&script)?;
+        run_tmux_command_async(script).await?;
         return list_tmux_panes(session_name, window_index).await;
     }
 
@@ -564,7 +742,7 @@ pub async fn setup_pane_grid(
         }
     }
 
-    run_tmux_command(&script)?;
+    run_tmux_command_async(script).await?;
 
     list_tmux_panes(session_name, window_index).await
 }
@@ -586,10 +764,10 @@ pub async fn check_pane_statuses(
     let script = format!(
         concat!(
             "echo '---PANES---'; ",
-            "tmux list-panes -s -t '{sess}' -F '#{{window_index}}|#{{pane_index}}|#{{pane_current_command}}|#{{pane_current_path}}' 2>/dev/null; ",
+            "tmux list-panes -s -t '{sess}' -F '#{{window_index}}|#{{pane_index}}|#{{pane_current_command}}|#{{pane_current_path}}|#{{pane_start_command}}' 2>/dev/null; ",
             "echo '---CAPTURES---'; ",
-            "tmux list-panes -s -t '{sess}' -F '#{{window_index}}|#{{pane_index}}|#{{pane_current_command}}' 2>/dev/null | while IFS='|' read -r win idx cmd; do ",
-            "  case \"$cmd\" in *[Cc]laude*|*node*) ",
+            "tmux list-panes -s -t '{sess}' -F '#{{window_index}}|#{{pane_index}}|#{{pane_current_command}}|#{{pane_start_command}}' 2>/dev/null | while IFS='|' read -r win idx cmd scmd; do ",
+            "  case \"$cmd$scmd\" in *[Cc]laude*|*node*) ",
             "    echo \"===W${{win}}P${{idx}}===\"; ",
             "    tmux capture-pane -t '{sess}:'\"$win\".\"$idx\" -p -S -10 2>/dev/null || true; ",
             "    ;; esac; ",
@@ -599,7 +777,7 @@ pub async fn check_pane_statuses(
         sess = session_name
     );
 
-    let output = run_tmux_command(&script)?;
+    let output = run_tmux_command_async(script).await?;
     if output.is_empty() {
         return Ok(HashMap::new());
     }
@@ -633,13 +811,21 @@ pub async fn check_pane_statuses(
         match section {
             "panes" => {
                 if trimmed.is_empty() { continue; }
-                let parts: Vec<&str> = trimmed.splitn(4, '|').collect();
+                let parts: Vec<&str> = trimmed.split('|').collect();
                 if parts.len() >= 3 {
                     let win_idx = parts[0].to_string();
                     let pane_idx: u32 = parts[1].parse().unwrap_or(0);
-                    let cmd = parts[2].to_lowercase();
-                    let path = if parts.len() >= 4 { parts[3].to_string() } else { String::new() };
-                    let is_claude = cmd.contains("claude");
+                    let cur_cmd = parts[2].to_string();
+                    // Path can contain '|'. start_command is always the LAST
+                    // field (added in Phase 3); if absent, fall back to path-only.
+                    let (path, start_cmd) = if parts.len() >= 5 {
+                        (parts[3..parts.len() - 1].join("|"), parts[parts.len() - 1].to_string())
+                    } else if parts.len() == 4 {
+                        (parts[3].to_string(), String::new())
+                    } else {
+                        (String::new(), String::new())
+                    };
+                    let is_claude = pane_is_claude(&cur_cmd, &start_cmd);
                     window_panes.entry(win_idx).or_default().push((pane_idx, is_claude, path));
                 }
             }
@@ -724,7 +910,7 @@ pub async fn kill_session(session_name: String) -> Result<Vec<TmuxSession>, Stri
         "tmux kill-session -t '{}'",
         session_name
     );
-    run_tmux_command(&script)?;
+    run_tmux_command_async(script).await?;
 
     // Re-query sessions and return updated list
     list_tmux_sessions().await

@@ -12,6 +12,7 @@ import {
 import { open } from "@tauri-apps/plugin-dialog";
 import { launchToPane, newSessionInPane } from "../../lib/launch";
 import type { ProjectWithMeta, ProjectTier } from "../../lib/types";
+import { GitBranch, Link, Plus } from "../ui/icons";
 
 /** Format a token count into a short human-readable string. */
 function fmtTokens(n: number): string {
@@ -162,8 +163,7 @@ export function ProjectCard(props: { project: ProjectWithMeta }) {
     if (!slug || !slug.trim()) return;
     setLaunching(true);
     try {
-      const newPath = await createWorktree(props.project.actual_path, slug.trim());
-      console.log("[ProjectCard] created worktree:", newPath);
+      await createWorktree(props.project.actual_path, slug.trim());
       refreshProjects();
     } catch (e) {
       setError(e instanceof Error ? e.message : String(e));
@@ -243,15 +243,14 @@ export function ProjectCard(props: { project: ProjectWithMeta }) {
 
       {/* Branch + worktree badge */}
       <Show when={props.project.git_branch}>
-        <div class="project-card-git" style={{ "font-size": "0.72rem", "opacity": 0.75, "margin-top": "2px" }}>
-          <span title="Git branch">⎇ {props.project.git_branch}</span>
+        <div class="project-card-git" style={{ "font-size": "0.72rem", "opacity": 0.75, "margin-top": "2px", "display": "inline-flex", "align-items": "center", "gap": "4px" }}>
+          <GitBranch size={11} />
+          <span title="Git branch">{props.project.git_branch}</span>
           <Show when={props.project.is_linked_worktree}>
-            <span title="Linked worktree" style={{ "margin-left": "6px" }}>🔗</span>
+            <Link size={11} aria-label="Linked worktree" />
           </Show>
           <Show when={(props.project.worktree_count ?? 1) > 1}>
-            <span title="Worktree count" style={{ "margin-left": "6px" }}>
-              ({props.project.worktree_count})
-            </span>
+            <span title="Worktree count">({props.project.worktree_count})</span>
           </Show>
         </div>
       </Show>
@@ -334,7 +333,7 @@ export function ProjectCard(props: { project: ProjectWithMeta }) {
           onClick={handleNewSession}
           title="Start fresh Claude session"
         >
-          +
+          <Plus size={12} />
         </button>
         <Show when={props.project.git_branch && !props.project.is_linked_worktree}>
           <button
@@ -342,8 +341,10 @@ export function ProjectCard(props: { project: ProjectWithMeta }) {
             disabled={launching()}
             onClick={handleNewWorktree}
             title="Create a new linked worktree + branch"
+            style={{ display: "inline-flex", "align-items": "center", gap: "2px" }}
           >
-            ⎇+
+            <GitBranch size={11} />
+            <Plus size={10} />
           </button>
         </Show>
         <button class="project-settings-btn" onClick={() => openProjectSettings(props.project)}>

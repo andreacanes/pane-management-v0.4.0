@@ -79,8 +79,6 @@ export async function assignToPane(opts: {
   await setPaneAssignment(opts.tmuxSession, opts.tmuxWindow, paneIndex, opts.encodedProject);
 
   const wslPath = toWslPath(opts.projectPath);
-  console.log("[assignToPane]", { paneIndex, encodedProject: opts.encodedProject, wslPath });
-
   await sendToPane(opts.tmuxSession, opts.tmuxWindow, paneIndex, `cd "${wslPath}"`);
 
   return paneIndex;
@@ -132,8 +130,6 @@ export async function launchToPane(opts: {
     ? `claude -r ${resumeId}${yoloFlag}`
     : `claude -r${yoloFlag}`;
 
-  console.log("[launchToPane]", { paneIndex, encodedProject: opts.encodedProject, wslPath, resumeId, claudeCmd, yolo: !!opts.yolo });
-
   // Chain cd + claude as a single command so claude only starts after cd completes
   await sendToPane(opts.tmuxSession, opts.tmuxWindow, paneIndex, `cd "${wslPath}" && ${claudeCmd}`);
 
@@ -163,8 +159,6 @@ export async function newSessionInPane(opts: {
 
   const wslPath = toWslPath(opts.projectPath);
   const yoloFlag = opts.yolo ? " --dangerously-skip-permissions" : "";
-  console.log("[newSessionInPane]", { paneIndex, encodedProject: opts.encodedProject, wslPath, yolo: !!opts.yolo });
-
   await sendToPane(opts.tmuxSession, opts.tmuxWindow, paneIndex, `cd "${wslPath}" && claude${yoloFlag}`);
 
   return paneIndex;

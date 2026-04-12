@@ -14,7 +14,9 @@ import {
   getTerminalSettings,
 } from "../../lib/tauri-commands";
 import type { TmuxSession, TmuxWindow } from "../../lib/types";
-import { NeonTitleSign } from "../theme/NeonSigns";
+import { Activity, Settings as SettingsIcon, Plus } from "../ui/icons";
+import { accountForPane, ACCOUNT_LABELS, ACCOUNT_COLORS } from "../../lib/account";
+import { deriveName, fromWslPath } from "../../lib/path";
 
 // Sortable session/window tab ID prefixes
 export const SESSION_TAB_PREFIX = "session-tab:";
@@ -87,6 +89,7 @@ function SortableSessionTab(props: {
 
 function SortableWindowTab(props: {
   win: TmuxWindow;
+  displayName: string;
   isSelected: boolean;
   isEditing: boolean;
   editValue: string;
@@ -139,7 +142,7 @@ function SortableWindowTab(props: {
           />
         }
       >
-        <span class="tab-label">{props.win.name}</span>
+        <span class="tab-label">{props.displayName}</span>
       </Show>
       <span
         class="tab-badge-close"
@@ -164,17 +167,48 @@ export function TopBar() {
   const [alwaysOnTop, setAlwaysOnTop] = createSignal(true);
   const [appFocused, setAppFocused] = createSignal(true);
   const [blurFlash, setBlurFlash] = createSignal(false);
-  const [activeTheme, setActiveTheme] = createSignal(
-    document.documentElement.getAttribute("data-theme") || "default"
-  );
-  onMount(() => {
-    const obs = new MutationObserver(() => {
-      setActiveTheme(document.documentElement.getAttribute("data-theme") || "default");
-    });
-    obs.observe(document.documentElement, { attributes: true, attributeFilter: ["data-theme"] });
-    onCleanup(() => obs.disconnect());
+
+  const SHELL_WINDOW_NAMES = new Set(["claude", "claude-b", "bash", "zsh", "sh", "fish", "node", "-"]);
+
+  /**
+   * Replace auto-assigned window names like "claude" with the project
+   * name (if the window has a pane running a known project) or the
+   * basename of an active pane path. Falls back to the real window_name
+   * if the user has manually renamed it.
+   */
+  function windowDisplayName(win: TmuxWindow): string {
+    const rawName = win.name || "";
+    const isGenericName = SHELL_WINDOW_NAMES.has(rawName.toLowerCase());
+    if (!isGenericName) return rawName;
+
+    const status = state.windowStatuses[String(win.index)];
+    const paths = status?.active_paths ?? [];
+    for (const panePath of paths) {
+      if (!panePath) continue;
+      // Match to a known project by path (WSL or Windows form)
+      const asWsl = panePath.toLowerCase().replace(/\/+$/, "");
+      const asWin = fromWslPath(panePath).toLowerCase().replace(/[\\/]+$/, "");
+      const project = state.projects.find((p) => {
+        const actual = p.actual_path.toLowerCase().replace(/[\\/]+$/, "");
+        return actual === asWsl || actual === asWin;
+      });
+      if (project) return project.meta.display_name || deriveName(project.actual_path);
+      return deriveName(panePath);
+    }
+    return rawName || `window ${win.index}`;
+  }
+
+  /** Aggregate account usage across panes in the currently selected window. */
+  const accountSummary = createMemo(() => {
+    let andrea = 0;
+    let bravura = 0;
+    for (const pane of state.tmuxPanes) {
+      const acct = accountForPane(pane);
+      if (acct === "andrea") andrea++;
+      else if (acct === "bravura") bravura++;
+    }
+    return { andrea, bravura };
   });
-  const isNeonShinjuku = () => activeTheme() === "neon-shinjuku";
 
   // Set always-on-top on mount + track focus via Tauri window events
   onMount(async () => {
@@ -421,8 +455,27 @@ export function TopBar() {
         <span class="top-bar-stats">
           {totalProjects()} projects | {activeProjectCount()} active
         </span>
-        <Show when={isNeonShinjuku()}>
-          <NeonTitleSign />
+        <Show when={accountSummary().andrea + accountSummary().bravura > 0}>
+          <div class="top-bar-accounts" title="Claude accounts in this window">
+            <Show when={accountSummary().andrea > 0}>
+              <span class="top-bar-account" style={{ "--account-color": ACCOUNT_COLORS.andrea }}>
+                <span class="ui-account-dot" />
+                <span>{ACCOUNT_LABELS.andrea}</span>
+                <Show when={accountSummary().andrea > 1}>
+                  <span class="top-bar-account-count">{accountSummary().andrea}</span>
+                </Show>
+              </span>
+            </Show>
+            <Show when={accountSummary().bravura > 0}>
+              <span class="top-bar-account" style={{ "--account-color": ACCOUNT_COLORS.bravura }}>
+                <span class="ui-account-dot" />
+                <span>{ACCOUNT_LABELS.bravura}</span>
+                <Show when={accountSummary().bravura > 1}>
+                  <span class="top-bar-account-count">{accountSummary().bravura}</span>
+                </Show>
+              </span>
+            </Show>
+          </div>
         </Show>
         <div class="on-top-area">
           <Show when={alwaysOnTop() && showHotkeyHint()}>
@@ -442,14 +495,14 @@ export function TopBar() {
           onClick={() => setShowGlobalActive((v) => !v)}
           title="All active Claude sessions"
         >
-          {"\u2735"}
+          <Activity size={16} />
         </button>
         <button
           class="settings-gear-btn"
           onClick={() => setShowSettings((v) => !v)}
           title="Settings"
         >
-          {"\u2699"}
+          <SettingsIcon size={16} />
         </button>
       </div>
 
@@ -514,7 +567,7 @@ export function TopBar() {
           onClick={handleCreateSession}
           title="New session"
         >
-          +
+          <Plus size={14} />
         </button>
       </div>
 
@@ -528,6 +581,7 @@ export function TopBar() {
                 return (
                   <SortableWindowTab
                     win={win}
+                    displayName={windowDisplayName(win)}
                     isSelected={state.selectedTmuxWindow === win.index}
                     isEditing={editingWindow() === win.index}
                     editValue={editValue()}
@@ -554,7 +608,7 @@ export function TopBar() {
             onClick={handleCreateWindow}
             title="New window"
           >
-            +
+            <Plus size={14} />
           </button>
         </div>
       </Show>

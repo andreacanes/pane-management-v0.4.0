@@ -18,7 +18,7 @@ use uuid::Uuid;
 
 use super::{
     error::AppError,
-    models::{now_ms, ApprovalDto, Decision, EventDto},
+    models::{now_ms, ApprovalDto, Decision, EventDto, PaneState},
     state::{AppState, NtfyMessage, PendingApproval},
 };
 
@@ -42,6 +42,21 @@ pub struct HookPayload {
     pub tool_input: Option<serde_json::Value>,
     #[serde(default)]
     pub message: Option<String>,
+    #[serde(default)]
+    pub title: Option<String>,
+}
+
+/// Matchers that signal "Claude wants user attention but there's
+/// nothing to allow/deny" — any of these funnels into the attention
+/// broadcast path and fires a medium-priority `pm_attention`
+/// notification on the phone. `idle_prompt` is also routed through
+/// here via its own dedicated wrapper that sets a different default
+/// title.
+fn is_attention_matcher(m: &str) -> bool {
+    matches!(
+        m,
+        "elicitation_dialog" | "user_prompt" | "ask_user_question"
+    )
 }
 
 #[derive(Debug, Serialize)]
@@ -55,23 +70,79 @@ pub async fn notification(
     State(state): State<AppState>,
     Json(payload): Json<HookPayload>,
 ) -> Result<Json<HookReply>, AppError> {
-    // Only intercept permission prompts; pass everything else through.
-    let is_permission = payload
-        .matcher
-        .as_deref()
-        .map(|m| m == "permission_prompt")
-        .unwrap_or(false);
-    if !is_permission {
-        return Ok(Json(HookReply {
+    tracing::debug!(?payload, "hook_sink notification received");
+
+    // Route by (hook_event_name, matcher) — different Claude Code hook
+    // events land here through the same endpoint:
+    //
+    //   Notification + permission_prompt  → park-and-wait approval flow
+    //   Notification + idle_prompt        → attention (soft waiting)
+    //   Notification + elicitation_dialog → attention
+    //   Stop                             → attention ("Claude finished")
+    //   PreToolUse + AskUserQuestion     → attention ("Claude question")
+    //
+    // Everything else returns approve immediately.
+    let event = payload.hook_event_name.as_deref().unwrap_or("");
+    let matcher = payload.matcher.as_deref().unwrap_or("");
+
+    match (event, matcher) {
+        // Notification hook: permission prompt → full approval flow
+        (_, "permission_prompt") => handle_permission_prompt(state, payload).await,
+        // Notification hook: idle / elicitation / unknown-attention matchers
+        (_, "idle_prompt") => {
+            handle_attention_prompt_inner(
+                state, payload, "Claude idle", "Claude is waiting for you", "input",
+            ).await
+        }
+        (_, m) if is_attention_matcher(m) => {
+            handle_attention_prompt_inner(
+                state, payload, "Claude question", "Claude needs your attention", "input",
+            ).await
+        }
+        // Stop hook: Claude finished its turn, instant push
+        ("Stop" | "stop", _) => {
+            handle_attention_prompt_inner(
+                state, payload, "Claude finished", "Claude is done — tap to continue", "info",
+            ).await
+        }
+        // PreToolUse hook: AskUserQuestion about to render
+        ("PreToolUse" | "pre_tool_use", _)
+            if payload.tool_name.as_deref() == Some("AskUserQuestion") =>
+        {
+            handle_attention_prompt_inner(
+                state, payload, "Claude question", "Claude is asking you a question", "input",
+            ).await
+        }
+        // Elicitation hook: Claude Code asking user a question (AskUserQuestion
+        // may route here instead of PreToolUse for some Claude Code versions)
+        ("Elicitation" | "elicitation", _) => {
+            handle_attention_prompt_inner(
+                state, payload, "Claude question", "Claude is asking you a question", "input",
+            ).await
+        }
+        // Anything else — approve and move on
+        _ => Ok(Json(HookReply {
             decision: "approve",
             reason: None,
-        }));
+        })),
     }
+}
 
-    // Try to resolve a pane from cwd / session_id.
-    let pane_id = resolve_pane(&state, &payload)
-        .await
-        .unwrap_or_else(|| "unknown".to_string());
+async fn handle_permission_prompt(
+    state: AppState,
+    payload: HookPayload,
+) -> Result<Json<HookReply>, AppError> {
+    let pane_id = match resolve_pane(&state, &payload).await {
+        Some(id) => id,
+        None => {
+            return Ok(Json(HookReply {
+                decision: "approve",
+                reason: None,
+            }))
+        }
+    };
+
+    let (project_name, account) = pane_context(&state, &pane_id).await;
 
     let id = Uuid::new_v4();
     let now = now_ms();
@@ -91,6 +162,8 @@ pub async fn notification(
         tool_input: payload.tool_input.clone(),
         created_at: now,
         expires_at: now + APPROVAL_TTL_MS,
+        project_display_name: project_name,
+        claude_account: account,
     };
 
     let (tx, rx) = oneshot::channel::<super::models::ApprovalResponse>();
@@ -103,6 +176,11 @@ pub async fn notification(
             responder: tx,
         },
     );
+
+    // Flip the pane to Waiting so the grid card turns amber immediately.
+    // Must happen BEFORE we park on the oneshot so the state flip races the
+    // notification rather than the user's response.
+    state.transition(&pane_id, PaneState::Waiting).await;
 
     // Broadcast to WebSocket clients (the pane-management app)
     let _ = state.events.send(EventDto::ApprovalCreated {
@@ -148,7 +226,86 @@ pub async fn notification(
         at: now_ms(),
     });
 
+    // If this was the last pending approval for this pane, demote from
+    // Waiting. The next tmux_poller tick (within 2s) will correct to Idle
+    // if Claude actually exited.
+    clear_pane_waiting_if_no_pending(&state, &pane_id).await;
+
     Ok(Json(reply))
+}
+
+async fn handle_attention_prompt_inner(
+    state: AppState,
+    payload: HookPayload,
+    default_title: &str,
+    default_message: &str,
+    kind: &str,
+) -> Result<Json<HookReply>, AppError> {
+    let pane_id = match resolve_pane(&state, &payload).await {
+        Some(id) => id,
+        None => {
+            return Ok(Json(HookReply {
+                decision: "approve",
+                reason: None,
+            }))
+        }
+    };
+
+    let (project_name, account) = pane_context(&state, &pane_id).await;
+
+    state.attention_panes.write().await.insert(pane_id.clone());
+    state.transition(&pane_id, PaneState::Waiting).await;
+
+    // Title precedence: explicit payload.title > tool_name > default.
+    let base_title = payload
+        .title
+        .clone()
+        .or_else(|| payload.tool_name.clone())
+        .unwrap_or_else(|| default_title.to_string());
+    // Enrich with project name: "[project] Claude idle"
+    let title = match &project_name {
+        Some(name) => format!("[{}] {}", name, base_title),
+        None => base_title,
+    };
+    let message = payload
+        .message
+        .clone()
+        .unwrap_or_else(|| default_message.to_string());
+    let _ = state.events.send(EventDto::AttentionNeeded {
+        pane_id,
+        title,
+        message,
+        at: now_ms(),
+        kind: kind.to_string(),
+        project_display_name: project_name,
+        claude_account: account,
+    });
+
+    Ok(Json(HookReply {
+        decision: "approve",
+        reason: None,
+    }))
+}
+
+/// If no other approvals are still pending for this pane and the pane
+/// isn't flagged for idle-attention, transition it out of Waiting. We
+/// pick Running optimistically; the 2 s tmux_poller tick will demote to
+/// Idle next cycle if Claude actually exited.
+async fn clear_pane_waiting_if_no_pending(state: &AppState, pane_id: &str) {
+    let still_pending = state
+        .approvals
+        .read()
+        .await
+        .values()
+        .any(|p| p.dto.pane_id == pane_id);
+    if still_pending {
+        return;
+    }
+    let in_attention = state.attention_panes.read().await.contains(pane_id);
+    if in_attention {
+        return;
+    }
+    state.transition(pane_id, PaneState::Running).await;
 }
 
 // ---------------------------------------------------------------------------
@@ -157,15 +314,8 @@ pub async fn notification(
 
 async fn resolve_pane(state: &AppState, payload: &HookPayload) -> Option<String> {
     let panes = state.panes.read().await;
-    // Prefer cwd match
-    if let Some(cwd) = payload.cwd.as_ref() {
-        for rec in panes.values() {
-            if rec.dto.current_path == *cwd {
-                return Some(rec.dto.id.clone());
-            }
-        }
-    }
-    // Fall back to claude_session_id match
+
+    // 1. Prefer session_id match — unique per Claude instance, most reliable.
     if let Some(sid) = payload.session_id.as_ref() {
         for rec in panes.values() {
             if rec.dto.claude_session_id.as_deref() == Some(sid.as_str()) {
@@ -173,7 +323,42 @@ async fn resolve_pane(state: &AppState, payload: &HookPayload) -> Option<String>
             }
         }
     }
+
+    // 2. Exact cwd match (normalized trailing slash).
+    if let Some(cwd) = payload.cwd.as_ref() {
+        let cwd_norm = cwd.trim_end_matches('/');
+        for rec in panes.values() {
+            let pane_path = rec.dto.current_path.trim_end_matches('/');
+            if pane_path == cwd_norm {
+                return Some(rec.dto.id.clone());
+            }
+        }
+        // 3. Prefix match — Claude may cd into a subdir of the pane's cwd.
+        for rec in panes.values() {
+            let pane_path = rec.dto.current_path.trim_end_matches('/');
+            if !pane_path.is_empty()
+                && (cwd_norm.starts_with(pane_path) || pane_path.starts_with(cwd_norm))
+            {
+                return Some(rec.dto.id.clone());
+            }
+        }
+    }
+
+    tracing::warn!(
+        session_id = ?payload.session_id,
+        cwd = ?payload.cwd,
+        "resolve_pane: no matching pane found"
+    );
     None
+}
+
+/// Look up project display name and Claude account for a resolved pane.
+async fn pane_context(state: &AppState, pane_id: &str) -> (Option<String>, Option<String>) {
+    let panes = state.panes.read().await;
+    panes
+        .get(pane_id)
+        .map(|r| (r.dto.project_display_name.clone(), r.dto.claude_account.clone()))
+        .unwrap_or((None, None))
 }
 
 async fn publish_ntfy_approval(state: &AppState, dto: &ApprovalDto) {
@@ -195,7 +380,10 @@ async fn publish_ntfy_approval(state: &AppState, dto: &ApprovalDto) {
         time: chrono::Utc::now().timestamp(),
         topic: state.ntfy_topic.to_string(),
         event: "message".to_string(),
-        title: Some(format!("Claude: {}", dto.title)),
+        title: Some(match &dto.project_display_name {
+            Some(name) => format!("[{}] Claude: {}", name, dto.title),
+            None => format!("Claude: {}", dto.title),
+        }),
         message: if dto.message.is_empty() {
             "Approval requested".to_string()
         } else {

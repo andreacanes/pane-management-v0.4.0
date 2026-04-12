@@ -51,7 +51,7 @@ See `build` skill for the scoped sync → cargo/npm/gradle → launch sequence.
 
 ## Status
 
-Phase B shipped end-to-end; Android usage/git-branch UI and ntfy lockscreen push still pending; B5 / B6 deferred.
+Phase B shipped end-to-end. UX redesign Phases 1 + 2 + 3 landed: design tokens + Button/Card/Badge/StatusChip/Toast/Skeleton primitives + Lucide icons on desktop, grouped GlobalActivePanel, sidebar tier chips + collapsible tier sections, redesigned PaneSlot with overflow menu, tabbed Android grid with pull-to-refresh and usage summary, mobile detail header + pretty-printed approval JSON. Phase 3 bug fixes: loosened active-Claude detection via pane_start_command (catches Claude even when the foreground is a subprocess), split the desktop poll into a 1.5s status poll + 10s full refresh, stabilised sidebar section identity to stop ProjectCard usage refetches, added Andrea/Bravura account badges throughout (PaneSlot, GlobalActivePanel rows, top bar summary, Android card), replaced literal "claude" window names with project names. ntfy lockscreen push still pending; B5 / B6 deferred.
 
 ## Available Skills
 

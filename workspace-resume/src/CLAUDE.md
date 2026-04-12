@@ -26,9 +26,8 @@ src/
 │   ├── project/
 │   │   ├── ProjectCard.tsx            canonical component idioms
 │   │   ├── ProjectDetailModal.tsx, NewProjectFlow.tsx, SessionList.tsx, SessionItem.tsx
-│   ├── theme/                         FaeParticles, FaeSigils, FaeVines, NeonSigns
+│   ├── ui/                            Button, Card, Badge, StatusChip, icons (Lucide)
 │   └── SettingsPanel.tsx              Terminal / Mobile companion / Error log
-└── themes/
 ```
 
 ## Hard rules (break one = real bug)

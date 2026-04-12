@@ -18,14 +18,7 @@ const uiStore = new LazyStore("settings.json");
 // Module-level signals survive component unmount/remount
 const [showAnimations, setShowAnimations] = createSignal(true);
 const [showHotkeyHint, setShowHotkeyHint] = createSignal(true);
-const [currentTheme, setCurrentTheme] = createSignal("default");
 export { showAnimations, showHotkeyHint };
-
-const THEMES = [
-  { value: "default", label: "Default" },
-  { value: "witching-hour", label: "The Witching Hour" },
-  { value: "neon-shinjuku", label: "Neon Shinjuku" },
-];
 
 // Load prefs once at module init
 (async () => {
@@ -34,11 +27,6 @@ const THEMES = [
     if (anim !== null && anim !== undefined) setShowAnimations(anim);
     const hint = await uiStore.get<boolean>("show_hotkey_hint");
     if (hint !== null && hint !== undefined) setShowHotkeyHint(hint);
-    const theme = await uiStore.get<string>("theme");
-    if (theme) {
-      setCurrentTheme(theme);
-      document.documentElement.setAttribute("data-theme", theme);
-    }
   } catch (_) {}
 })();
 
@@ -178,13 +166,6 @@ export function SettingsPanel() {
     document.dispatchEvent(new CustomEvent("ui-pref-changed", { detail: { showHotkeyHint: next } }));
   }
 
-  async function handleThemeChange(theme: string) {
-    setCurrentTheme(theme);
-    document.documentElement.setAttribute("data-theme", theme);
-    await uiStore.set("theme", theme);
-    await uiStore.save();
-  }
-
   return (
     <div class="settings-panel">
       <div class="settings-header-row">
@@ -207,18 +188,6 @@ export function SettingsPanel() {
             <span class="settings-toggle-pill"><span /></span>
             <span>{showHotkeyHint() ? "On" : "Off"}</span>
           </button>
-        </div>
-        <div class="settings-row">
-          <label>Theme</label>
-          <select
-            class="settings-theme-select"
-            value={currentTheme()}
-            onChange={(e) => handleThemeChange(e.currentTarget.value)}
-          >
-            <For each={THEMES}>
-              {(t) => <option value={t.value}>{t.label}</option>}
-            </For>
-          </select>
         </div>
       </div>
 
