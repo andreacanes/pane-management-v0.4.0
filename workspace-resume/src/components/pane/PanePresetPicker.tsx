@@ -275,8 +275,9 @@ export function PanePresetPicker() {
                           <span class="kill-target-id">{v.pane_id}</span>
                           <span class="kill-target-idx">#{v.pane_index}</span>
                           <span class="kill-target-cmd">{v.current_command}</span>
+                          <span class="kill-target-path">{v.current_path}</span>
                           <Show when={proj}>
-                            <span class="kill-target-project">{proj}</span>
+                            <span class="kill-target-project" title="Stored project assignment — may be stale">{proj} (assigned)</span>
                           </Show>
                         </li>
                       );
