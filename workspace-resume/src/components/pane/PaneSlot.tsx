@@ -55,7 +55,6 @@ export function PaneSlot(props: { pane: TmuxPane; assignment?: string | null }) 
   };
 
   const detectedProject = (): ProjectWithMeta | undefined => {
-    if (assignedProject()) return undefined;
     const panePath = props.pane.current_path?.toLowerCase().replace(/[\\/]+$/, "");
     if (!panePath) return undefined;
     return state.projects.find((p) => {
@@ -65,7 +64,20 @@ export function PaneSlot(props: { pane: TmuxPane; assignment?: string | null }) 
     });
   };
 
-  const effectiveProject = () => assignedProject() || detectedProject();
+  /**
+   * If the live cwd matches a known project different from the stored
+   * assignment, the user cd'd away — prefer what the pane is actually
+   * running in, not the stale label. Fall back to the assignment only
+   * when the cwd doesn't match any project (e.g. pane is at $HOME).
+   */
+  const effectiveProject = () => {
+    const assigned = assignedProject();
+    const detected = detectedProject();
+    if (detected && assigned && detected.encoded_name !== assigned.encoded_name) {
+      return detected;
+    }
+    return assigned || detected;
+  };
   const isRunningClaude = () => props.pane.current_command?.toLowerCase().includes("claude");
   const projectName = () => {
     const p = effectiveProject();
