@@ -2850,6 +2850,40 @@ button:hover {
   margin: 0 6px;
 }
 
+.pane-slot-kill-btn {
+  position: absolute;
+  top: 4px;
+  right: 4px;
+  width: 20px;
+  height: 20px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  padding: 0;
+  border: 1px solid transparent;
+  border-radius: 4px;
+  background: transparent;
+  color: var(--text-muted);
+  cursor: pointer;
+  opacity: 0.55;
+  transition: opacity 120ms, background 120ms, color 120ms, border-color 120ms;
+  z-index: 2;
+}
+
+.pane-slot:hover .pane-slot-kill-btn {
+  opacity: 1;
+}
+
+.pane-slot-kill-btn:hover {
+  color: #ff6b6b;
+  background: rgba(255, 107, 107, 0.12);
+  border-color: rgba(255, 107, 107, 0.4);
+}
+
+.pane-slot {
+  position: relative;
+}
+
 .preset-btn.danger-outline {
   color: #ff6b6b;
   border-color: rgba(255, 107, 107, 0.35);

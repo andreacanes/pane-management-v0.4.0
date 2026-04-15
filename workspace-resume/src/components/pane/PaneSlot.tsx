@@ -38,6 +38,7 @@ export function PaneSlot(props: { pane: TmuxPane; assignment?: string | null }) 
 
   const [launching, setLaunching] = createSignal(false);
   const [menuOpen, setMenuOpen] = createSignal(false);
+  const [showKillModal, setShowKillModal] = createSignal(false);
 
   // Drop target only — no longer a drag source
   const droppable = createDroppable(paneIndex().toString());
@@ -138,6 +139,14 @@ export function PaneSlot(props: { pane: TmuxPane; assignment?: string | null }) 
       onClick={() => isPaneSelectMode() && handlePaneSelect()}
       title={`${props.pane.current_path || ""}\n${props.pane.current_command || ""}`}
     >
+      {/* Persistent kill button (top-right, always visible) */}
+      <button
+        class="pane-slot-kill-btn"
+        onClick={(e) => { e.stopPropagation(); setShowKillModal(true); }}
+        title={`Kill pane ${props.pane.pane_id} (tmux ${state.selectedTmuxSession}:${state.selectedTmuxWindow}.${paneIndex()})`}
+      >
+        <Trash2 size={12} />
+      </button>
       {/* Occupied pane */}
       <Show when={isOccupied()}>
         <div class="pane-slot-body">
@@ -217,6 +226,36 @@ export function PaneSlot(props: { pane: TmuxPane; assignment?: string | null }) 
             <Show when={isPaneSelectMode()} fallback="Empty pane">
               Click to assign here
             </Show>
+          </div>
+        </div>
+      </Show>
+
+      {/* Kill pane confirmation */}
+      <Show when={showKillModal()}>
+        <div class="modal-backdrop" onClick={(e) => { e.stopPropagation(); setShowKillModal(false); }}>
+          <div class="confirm-modal" onClick={(e) => e.stopPropagation()}>
+            <p class="confirm-message">
+              <strong>Kill pane {props.pane.pane_id}?</strong>
+            </p>
+            <p class="confirm-warning">
+              tmux target: <code>{state.selectedTmuxSession}:{state.selectedTmuxWindow}.{paneIndex()}</code><br />
+              Running: <code>{props.pane.current_command || "(empty)"}</code><br />
+              In: <code>{props.pane.current_path || "(no cwd)"}</code>
+            </p>
+            <p class="confirm-warning">
+              Any process in this pane will be terminated. Other panes are unaffected.
+            </p>
+            <div class="confirm-actions">
+              <button class="modal-btn" onClick={() => setShowKillModal(false)}>
+                Cancel
+              </button>
+              <button
+                class="modal-btn danger"
+                onClick={() => { setShowKillModal(false); handleKill(); }}
+              >
+                Kill pane
+              </button>
+            </div>
           </div>
         </div>
       </Show>
