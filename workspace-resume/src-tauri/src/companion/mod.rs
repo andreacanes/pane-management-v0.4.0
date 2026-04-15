@@ -5,8 +5,12 @@
 //! a tokio task spawned from the Tauri `setup()` closure.
 //!
 //! Port: 8833 (fixed).
-//! Bind: `0.0.0.0` in dev so ADB reverse-port-forward works from a
-//! USB-connected phone; production can restrict to the Tailscale IP.
+//! Bind: `0.0.0.0` always. The companion needs to accept connections
+//! from (a) WSL via the Tailscale IP, (b) the Android phone via the
+//! Tailscale IP, and (c) `adb reverse` for dev. The security boundary
+//! is the bearer token (256-bit, constant-time compare in `auth.rs`)
+//! plus the Windows Firewall — *not* the bind address. Don't switch
+//! to `127.0.0.1` without confirming Tailscale-side reachability.
 //!
 //! Architecture:
 //! - `http` — axum Router assembly + AppState
@@ -54,7 +58,10 @@ pub async fn spawn(app: AppHandle) -> anyhow::Result<()> {
     // can reach the runtime bearer and ntfy backlog.
     app.manage(state.clone());
     let bind = format!("{}:{}", BIND_ADDR, COMPANION_PORT);
-    tracing::info!(%bind, "starting companion service");
+    tracing::info!(
+        %bind,
+        "starting companion service (bound to all interfaces; bearer + Windows Firewall are the security boundary)"
+    );
 
     // Background workers
     let poller_state = state.clone();

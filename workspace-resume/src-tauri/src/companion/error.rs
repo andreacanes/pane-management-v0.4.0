@@ -24,7 +24,16 @@ impl IntoResponse for AppError {
             AppError::NotFound => (StatusCode::NOT_FOUND, self.to_string()),
             AppError::BadRequest(_) => (StatusCode::BAD_REQUEST, self.to_string()),
             AppError::Tmux(_) => (StatusCode::BAD_GATEWAY, self.to_string()),
-            AppError::Internal(_) => (StatusCode::INTERNAL_SERVER_ERROR, self.to_string()),
+            AppError::Internal(err) => {
+                // Don't leak the anyhow chain to the client — it can expose
+                // file paths, internal types, secret-adjacent context. Log
+                // the full chain server-side; return a generic message.
+                tracing::error!(error = ?err, "companion internal error");
+                (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "internal server error".to_string(),
+                )
+            }
         };
         (code, Json(serde_json::json!({ "error": msg }))).into_response()
     }

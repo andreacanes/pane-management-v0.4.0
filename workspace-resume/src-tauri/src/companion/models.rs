@@ -13,6 +13,12 @@ pub enum PaneState {
     Idle,
     Running,
     Waiting,
+    /// Reserved. Currently never emitted by the poller — `Idle` covers
+    /// "Claude exited cleanly". Kept on the wire because the Tauri
+    /// frontend (`src/components/ui/StatusChip.tsx`) and Android client
+    /// (`Dtos.kt::PaneState.Done`, `StatusColors.Done`, `StatusChip.kt`)
+    /// already render a "Done" state. Removing requires a coordinated
+    /// 3-language change for no functional gain.
     Done,
 }
 
@@ -310,6 +316,10 @@ pub struct CreatePaneRequest {
     /// Target pane id to split from, e.g. "main:3.1"
     pub target_pane_id: String,
     pub account: String, // "andrea" | "bravura"
+    /// Split direction: "horizontal" (default, side-by-side) or "vertical" (stacked below).
+    /// Optional for wire compatibility with older Android builds that omit the field.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub direction: Option<String>,
 }
 
 #[derive(Debug, Serialize)]

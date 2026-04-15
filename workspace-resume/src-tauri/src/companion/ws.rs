@@ -51,7 +51,14 @@ async fn client_loop(mut socket: WebSocket, state: AppState) {
                         }
                     }
                 }
-                Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
+                Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
+                    // Slow client; the broadcast ring buffer (1024) wrapped
+                    // before this socket drained it. We resync on the next
+                    // event but `n` events were dropped — log so a chronic
+                    // lag (e.g. mobile on a flaky link) is visible in ops.
+                    tracing::warn!(dropped = n, "ws subscriber lagged");
+                    continue;
+                }
                 Err(_) => break,
             },
             msg = socket.recv() => match msg {

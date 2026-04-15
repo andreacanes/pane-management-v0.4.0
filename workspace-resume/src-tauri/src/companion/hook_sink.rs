@@ -78,8 +78,10 @@ pub async fn notification(
     State(state): State<AppState>,
     body: String,
 ) -> Result<Json<HookReply>, AppError> {
-    // Log the raw JSON body so we can diagnose payload format changes
-    tracing::info!(raw = %body, "hook_sink raw payload");
+    // Log the raw JSON body so we can diagnose payload format changes.
+    // Demoted to debug because the body contains tool_input / message /
+    // title — Claude prompts and tool arguments that are often sensitive.
+    tracing::debug!(raw = %body, "hook_sink raw payload");
 
     let payload: HookPayload = serde_json::from_str(&body)
         .map_err(|e| AppError::BadRequest(format!("invalid hook payload: {}", e)))?;

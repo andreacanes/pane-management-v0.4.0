@@ -83,6 +83,14 @@ pub fn router(state: AppState) -> Router {
 // Handlers
 // ---------------------------------------------------------------------------
 
+/// Map a tmux command failure into an AppError, logging the underlying
+/// stderr first so an HTTP 502 in the client log can be correlated with
+/// the actual tmux complaint on the desktop side.
+fn tmux_err(e: String) -> AppError {
+    tracing::warn!(error = %e, "tmux command failed");
+    AppError::Tmux(e)
+}
+
 async fn health(State(state): State<AppState>) -> Json<HealthDto> {
     Json(HealthDto {
         version: env!("CARGO_PKG_VERSION"),
@@ -95,7 +103,7 @@ async fn list_sessions(State(_state): State<AppState>) -> Result<Json<Vec<Sessio
     let script = "tmux list-sessions -F '#{session_name}|#{session_windows}|#{?session_attached,1,0}' 2>/dev/null || true";
     let out = crate::commands::tmux::run_tmux_command_async(script.to_string())
         .await
-        .map_err(AppError::Tmux)?;
+        .map_err(tmux_err)?;
     let sessions: Vec<SessionDto> = out
         .lines()
         .filter(|l| !l.trim().is_empty())
@@ -157,7 +165,7 @@ async fn capture_pane(
     let script = format!("tmux capture-pane -p -e -t {} -S {} 2>&1 || true", id, start);
     let out = crate::commands::tmux::run_tmux_command_async(script)
         .await
-        .map_err(AppError::Tmux)?;
+        .map_err(tmux_err)?;
     let lines: Vec<String> = out.lines().map(|s| s.to_string()).collect();
     // Capture is a READ — do not bump `updated_at` on the pane record.
     // That field is reserved for real state changes (transitions, hooks)
@@ -236,7 +244,7 @@ async fn pane_conversation(
             );
             let listing = crate::commands::tmux::run_tmux_command_async(script)
                 .await
-                .map_err(AppError::Tmux)?;
+                .map_err(tmux_err)?;
             let pick = listing.lines().map(|l| l.trim()).find(|path| {
                 if path.is_empty() {
                     return false;
@@ -271,7 +279,7 @@ async fn pane_conversation(
     );
     let raw = crate::commands::tmux::run_tmux_command_async(script)
         .await
-        .map_err(AppError::Tmux)?;
+        .map_err(tmux_err)?;
 
     if raw.trim() == "__FILE_NOT_FOUND__" || raw.is_empty() {
         return Err(AppError::NotFound);
@@ -460,7 +468,7 @@ async fn send_image(
         let wsl_path = format!("/tmp/pane-mgmt/img_{}_{}.{}", base_ts, idx, ext);
         crate::commands::tmux::write_file_to_wsl_async(wsl_path.clone(), bytes)
             .await
-            .map_err(AppError::Tmux)?;
+            .map_err(tmux_err)?;
         wsl_paths.push(wsl_path);
     }
 
@@ -504,7 +512,7 @@ async fn send_key(
     let script = format!("tmux send-keys -t {} {}", id, req.key);
     crate::commands::tmux::run_tmux_command_async(script)
         .await
-        .map_err(AppError::Tmux)?;
+        .map_err(tmux_err)?;
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -515,7 +523,7 @@ async fn cancel_pane(
     let script = format!("tmux send-keys -t {} C-c C-c 2>&1", id);
     crate::commands::tmux::run_tmux_command_async(script)
         .await
-        .map_err(AppError::Tmux)?;
+        .map_err(tmux_err)?;
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -674,7 +682,7 @@ async fn create_window(
 
     let out = crate::commands::tmux::run_tmux_command_async(script)
         .await
-        .map_err(AppError::Tmux)?;
+        .map_err(tmux_err)?;
 
     // Parse `IDX=<n>` out of the stdout.
     let idx_str = out
@@ -706,7 +714,7 @@ async fn kill_window(
     let script = format!("tmux kill-window -t '{}':{} 2>&1", sess_esc, index);
     crate::commands::tmux::run_tmux_command_async(script)
         .await
-        .map_err(AppError::Tmux)?;
+        .map_err(tmux_err)?;
     tracing::info!(%session, index, "window killed");
     Ok(StatusCode::NO_CONTENT)
 }
@@ -723,7 +731,7 @@ async fn kill_pane(
     let script = format!("tmux kill-pane -t '{}' 2>&1", id_esc);
     crate::commands::tmux::run_tmux_command_async(script)
         .await
-        .map_err(AppError::Tmux)?;
+        .map_err(tmux_err)?;
     tracing::info!(%id, "pane killed");
     Ok(StatusCode::NO_CONTENT)
 }
@@ -732,9 +740,9 @@ async fn create_pane(
     State(_state): State<AppState>,
     Json(req): Json<CreatePaneRequest>,
 ) -> Result<Json<CreatePaneResponse>, AppError> {
-    // Split the current window vertically (new pane below the target),
-    // inheriting the target pane's working directory, then launch the
-    // account-specific Claude launcher inside it.
+    // Split the current window (horizontally / side-by-side by default; vertical
+    // when the caller opts in), inheriting the target pane's working directory,
+    // then launch the account-specific Claude launcher inside it.
     let cmd = match req.account.as_str() {
         "bravura" => "ncld2",
         "andrea" | "" => "ncld",
@@ -748,24 +756,35 @@ async fn create_pane(
     if req.target_pane_id.is_empty() {
         return Err(AppError::BadRequest("target_pane_id is required".into()));
     }
+    let flag = match req.direction.as_deref() {
+        Some("vertical") => "-v",
+        Some("horizontal") | None => "-h",
+        Some(other) => {
+            return Err(AppError::BadRequest(format!(
+                "unknown direction '{}': expected horizontal|vertical",
+                other
+            )))
+        }
+    };
     let target_esc = req.target_pane_id.replace('\'', r"'\''");
 
     // Query the target pane's cwd first — #{pane_current_path} in split-window's
     // -c arg expands relative to the *active* pane, not the -t target.
     let script = format!(
         "CWD=$(tmux display-message -p -t '{target}' '#{{pane_current_path}}'); \
-         NEW=$(tmux split-window -v -t '{target}' -c \"$CWD\" -d \
+         NEW=$(tmux split-window {flag} -t '{target}' -c \"$CWD\" -d \
          -P -F '#{{session_name}}:#{{window_index}}.#{{pane_index}}' 2>&1); \
          if [ -z \"$NEW\" ]; then echo 'ERR: split-window failed'; exit 1; fi; \
          tmux send-keys -t \"$NEW\" '{cmd}' Enter; \
          echo \"NEW=$NEW\"",
         target = target_esc,
+        flag = flag,
         cmd = cmd,
     );
 
     let out = crate::commands::tmux::run_tmux_command_async(script)
         .await
-        .map_err(AppError::Tmux)?;
+        .map_err(tmux_err)?;
 
     let new_pane_id = out
         .lines()
@@ -774,7 +793,7 @@ async fn create_pane(
         .trim()
         .to_string();
 
-    tracing::info!(%new_pane_id, target = %req.target_pane_id, account = %req.account, "pane split created");
+    tracing::info!(%new_pane_id, target = %req.target_pane_id, account = %req.account, flag = %flag, "pane split created");
 
     Ok(Json(CreatePaneResponse {
         pane_id: new_pane_id,
@@ -807,6 +826,6 @@ async fn send_text_to_pane(id: &str, text: &str, submit: bool) -> Result<(), App
     );
     crate::commands::tmux::run_tmux_command_async(script)
         .await
-        .map_err(AppError::Tmux)?;
+        .map_err(tmux_err)?;
     Ok(())
 }

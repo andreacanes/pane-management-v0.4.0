@@ -209,7 +209,11 @@ fn generate_token() -> String {
 }
 
 fn short_id() -> String {
-    let mut buf = [0u8; 6];
+    // 9 bytes = 72 bits of entropy. The ntfy topic is the *only* secret
+    // protecting the unauthenticated `/{topic}` endpoints, so 48 bits
+    // (the previous `[u8; 6]`) was below the recommended minimum even
+    // with the Tailscale boundary. Existing stored topics are preserved.
+    let mut buf = [0u8; 9];
     rand::thread_rng().fill_bytes(&mut buf);
     base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(buf)
 }
