@@ -881,11 +881,13 @@ pub async fn list_kill_targets(
     window_index: u32,
     keep_count: u32,
 ) -> Result<Vec<TmuxPane>, String> {
-    let panes = list_tmux_panes(session_name, window_index).await?;
-    Ok(panes
-        .into_iter()
-        .filter(|p| p.pane_index >= keep_count)
-        .collect())
+    // tmux `pane-base-index` is user-configurable (0 or 1), so we can't
+    // compare pane_index against keep_count directly. Sort by pane_index
+    // and take everything past the first `keep_count` entries.
+    let mut panes = list_tmux_panes(session_name, window_index).await?;
+    panes.sort_by_key(|p| p.pane_index);
+    let keep = keep_count as usize;
+    Ok(panes.into_iter().skip(keep).collect())
 }
 
 /// Reduce the pane grid by killing only the excess panes (indices >= `cols*rows`),
@@ -914,10 +916,14 @@ pub async fn reduce_pane_grid(
         ));
     }
 
-    let victims: Vec<String> = current
-        .iter()
-        .filter(|p| p.pane_index >= t)
-        .map(|p| p.pane_id.clone())
+    // Robust against non-zero `pane-base-index` — sort by pane_index and
+    // slice off the first `t` survivors, kill the rest.
+    let mut sorted = current.clone();
+    sorted.sort_by_key(|p| p.pane_index);
+    let victims: Vec<String> = sorted
+        .into_iter()
+        .skip(t as usize)
+        .map(|p| p.pane_id)
         .collect();
     if victims.is_empty() {
         return list_tmux_panes(session_name, window_index).await;

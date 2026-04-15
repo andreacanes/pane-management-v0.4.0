@@ -2,6 +2,8 @@
 
 Andrea's personal fork of `sky-salsa/pane-management-v0.4.0`. A Tauri 2 desktop app (Windows) plus a nested Android companion that control Claude Code sessions across tmux on WSL2, routed over Tailscale with no cloud APIs.
 
+**Terminology (Andrea's convention):** "**app**" = Tauri desktop app (`workspace-resume/`). "**apk**" = Android mobile companion (`pane-management-mobile/`). Do not use "app" to mean the mobile client.
+
 ## Tech Stack
 
 | Tool | Version |
