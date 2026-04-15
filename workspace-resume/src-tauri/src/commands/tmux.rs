@@ -803,6 +803,139 @@ pub async fn setup_pane_grid(
     list_tmux_panes(session_name, window_index).await
 }
 
+/// Pick a tmux `select-layout` preset name for a given (cols, rows) shape.
+fn layout_preset_for(cols: u32, rows: u32) -> &'static str {
+    match (cols, rows) {
+        (_, 1) => "even-horizontal",
+        (1, _) => "even-vertical",
+        _ => "tiled",
+    }
+}
+
+/// Reflow the pane grid to match the target shape **without killing any panes**.
+/// Same count → `select-layout <preset>`. Grow → split (`t - n`) times off the
+/// last pane (inheriting its cwd), then `select-layout`. Reduce is rejected —
+/// use `reduce_pane_grid` after explicit kill confirmation.
+#[tauri::command]
+pub async fn reflow_pane_grid(
+    session_name: String,
+    window_index: u32,
+    cols: u32,
+    rows: u32,
+) -> Result<Vec<TmuxPane>, String> {
+    if cols == 0 || rows == 0 {
+        return Err("cols and rows must be > 0".to_string());
+    }
+    let target = format!("{}:{}", session_name, window_index);
+    let current = list_tmux_panes(session_name.clone(), window_index).await?;
+    let n = current.len() as u32;
+    let t = cols * rows;
+
+    if t < n {
+        return Err(format!(
+            "reflow cannot reduce pane count ({} → {}); use reduce_pane_grid",
+            n, t
+        ));
+    }
+
+    let preset = layout_preset_for(cols, rows);
+
+    if t == n {
+        if cols == 1 && rows == 1 {
+            return Ok(current);
+        }
+        let script = format!("tmux select-layout -t '{}' {}", target, preset);
+        run_tmux_command_async(script).await?;
+        return list_tmux_panes(session_name, window_index).await;
+    }
+
+    // Grow: append (t - n) panes off the last pane so the new splits inherit
+    // its working directory, then apply the preset to even out the geometry.
+    let base = current
+        .last()
+        .ok_or_else(|| "cannot grow pane grid: no existing panes to split from".to_string())?;
+    let base_id = base.pane_id.clone();
+    let mut script = String::new();
+    script.push_str(&format!(
+        "CWD=$(tmux display-message -p -t '{}' '#{{pane_current_path}}'); ",
+        base_id
+    ));
+    for _ in 0..(t - n) {
+        script.push_str(&format!(
+            "tmux split-window -h -t '{}' -c \"$CWD\"; ",
+            base_id
+        ));
+    }
+    script.push_str(&format!("tmux select-layout -t '{}' {}; ", target, preset));
+
+    run_tmux_command_async(script).await?;
+    list_tmux_panes(session_name, window_index).await
+}
+
+/// List panes at `pane_index >= keep_count` — the ones that would be killed
+/// by a reduce-to-`keep_count` operation. Frontend uses this to populate a
+/// confirmation modal before calling `reduce_pane_grid`.
+#[tauri::command]
+pub async fn list_kill_targets(
+    session_name: String,
+    window_index: u32,
+    keep_count: u32,
+) -> Result<Vec<TmuxPane>, String> {
+    let panes = list_tmux_panes(session_name, window_index).await?;
+    Ok(panes
+        .into_iter()
+        .filter(|p| p.pane_index >= keep_count)
+        .collect())
+}
+
+/// Reduce the pane grid by killing only the excess panes (indices >= `cols*rows`),
+/// then reflowing survivors to the target preset. Low-index panes and their
+/// running processes are preserved — the opposite of `setup_pane_grid`'s
+/// `kill-pane -a` behavior.
+#[tauri::command]
+pub async fn reduce_pane_grid(
+    session_name: String,
+    window_index: u32,
+    cols: u32,
+    rows: u32,
+) -> Result<Vec<TmuxPane>, String> {
+    if cols == 0 || rows == 0 {
+        return Err("cols and rows must be > 0".to_string());
+    }
+    let target = format!("{}:{}", session_name, window_index);
+    let current = list_tmux_panes(session_name.clone(), window_index).await?;
+    let n = current.len() as u32;
+    let t = cols * rows;
+
+    if t >= n {
+        return Err(format!(
+            "reduce_pane_grid requires a smaller target ({} → {}); use reflow_pane_grid",
+            n, t
+        ));
+    }
+
+    let victims: Vec<String> = current
+        .iter()
+        .filter(|p| p.pane_index >= t)
+        .map(|p| p.pane_id.clone())
+        .collect();
+    if victims.is_empty() {
+        return list_tmux_panes(session_name, window_index).await;
+    }
+
+    let mut script = String::new();
+    for pid in &victims {
+        script.push_str(&format!("tmux kill-pane -t '{}'; ", pid));
+    }
+    let preset = layout_preset_for(cols, rows);
+    if !(cols == 1 && rows == 1) {
+        script.push_str(&format!("tmux select-layout -t '{}' {}; ", target, preset));
+    }
+
+    run_tmux_command_async(script).await?;
+    list_tmux_panes(session_name, window_index).await
+}
+
 /// Check all panes across all windows in a session for approval prompts.
 /// Returns a map of window_index -> WindowPaneStatus (has_active + waiting_panes).
 /// Designed to run on a slower poll cycle (15s) to avoid excessive capture-pane calls.

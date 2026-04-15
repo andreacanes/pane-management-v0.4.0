@@ -198,6 +198,18 @@ export async function setupPaneGrid(sessionName: string, windowIndex: number, co
   return invoke("setup_pane_grid", { sessionName, windowIndex, cols, rows });
 }
 
+export async function reflowPaneGrid(sessionName: string, windowIndex: number, cols: number, rows: number): Promise<TmuxPane[]> {
+  return invoke("reflow_pane_grid", { sessionName, windowIndex, cols, rows });
+}
+
+export async function reducePaneGrid(sessionName: string, windowIndex: number, cols: number, rows: number): Promise<TmuxPane[]> {
+  return invoke("reduce_pane_grid", { sessionName, windowIndex, cols, rows });
+}
+
+export async function listKillTargets(sessionName: string, windowIndex: number, keepCount: number): Promise<TmuxPane[]> {
+  return invoke("list_kill_targets", { sessionName, windowIndex, keepCount });
+}
+
 export async function swapTmuxPane(sessionName: string, windowIndex: number, sourcePane: number, targetPane: number): Promise<TmuxPane[]> {
   return invoke("swap_tmux_pane", { sessionName, windowIndex, sourcePane, targetPane });
 }

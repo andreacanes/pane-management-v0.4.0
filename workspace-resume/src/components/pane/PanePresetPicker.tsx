@@ -2,10 +2,14 @@ import { createSignal, For, Show } from "solid-js";
 import { useApp } from "../../contexts/AppContext";
 import {
   setupPaneGrid,
+  reflowPaneGrid,
+  reducePaneGrid,
+  listKillTargets,
   setPaneAssignment,
   tmuxResurrectRestore,
   listTmuxPanes,
 } from "../../lib/tauri-commands";
+import type { TmuxPane } from "../../lib/types";
 import { launchToPane } from "../../lib/launch";
 
 /** Fixed layout presets with dot-grid icons. */
@@ -34,64 +38,109 @@ export function PanePresetPicker() {
 
   const [busy, setBusy] = createSignal(false);
   const [showSnapshotModal, setShowSnapshotModal] = createSignal(false);
-  const [pendingGrid, setPendingGrid] = createSignal<{ cols: number; rows: number } | null>(null);
+  const [reduceTarget, setReduceTarget] = createSignal<{
+    cols: number;
+    rows: number;
+    victims: TmuxPane[];
+  } | null>(null);
+  const [showResetModal, setShowResetModal] = createSignal(false);
 
   const session = () => state.selectedTmuxSession;
   const window = () => state.selectedTmuxWindow;
   const currentPaneCount = () => state.tmuxPanes.length;
 
-  /**
-   * Set up a pane grid with the given columns x rows.
-   * Uses a single tmux script that creates columns first, then splits
-   * each column vertically — producing the correct widescreen layout.
-   */
-  async function setGrid(cols: number, rows: number) {
+  /** Look up the encoded-project name assigned to a pane index in the current window. */
+  function projectForIndex(idx: number): string | null {
+    return state.paneAssignments[String(idx)] ?? null;
+  }
+
+  /** Non-destructive path: same count or growth. Reflows or appends without killing. */
+  async function reflow(cols: number, rows: number) {
     const sess = session();
     const win = window();
     if (sess == null || win == null) return;
-
     setBusy(true);
     try {
-      const newPaneCount = cols * rows;
-      await setupPaneGrid(sess, win, cols, rows);
-      // Only clear assignments for pane indices beyond the new grid size.
-      // New grids get sequential indices starting from 0, so any old
-      // assignment with index >= newPaneCount is stale.
-      const staleKeys = Object.keys(state.paneAssignments).filter(
-        (idx) => Number(idx) >= newPaneCount,
-      );
-      if (staleKeys.length > 0) {
-        await Promise.all(staleKeys.map((idx) => setPaneAssignment(sess, win, Number(idx), null)));
-      }
+      await reflowPaneGrid(sess, win, cols, rows);
       refreshTmuxState();
     } catch (e) {
-      console.error("[PanePresetPicker] setGrid error:", e);
+      console.error("[PanePresetPicker] reflow error:", e);
     } finally {
       setBusy(false);
     }
   }
 
-  /** Gate layout changes that reduce pane count while Claude sessions are active. */
-  function handleLayoutClick(cols: number, rows: number) {
-    const newCount = cols * rows;
-    if (newCount < currentPaneCount()) {
-      // Check if any pane has an active Claude session
-      const hasActiveClaude = state.tmuxPanes.some(
-        (p) => p.current_command.toLowerCase().includes("claude"),
+  /** Destructive reduce: kills only indices >= newCount, reflows survivors. */
+  async function reduce(cols: number, rows: number) {
+    const sess = session();
+    const win = window();
+    if (sess == null || win == null) return;
+    setBusy(true);
+    try {
+      const newCount = cols * rows;
+      await reducePaneGrid(sess, win, cols, rows);
+      const staleKeys = Object.keys(state.paneAssignments).filter(
+        (idx) => Number(idx) >= newCount,
       );
-      if (hasActiveClaude) {
-        setPendingGrid({ cols, rows });
-        return;
+      if (staleKeys.length > 0) {
+        await Promise.all(
+          staleKeys.map((idx) => setPaneAssignment(sess, win, Number(idx), null)),
+        );
       }
+      refreshTmuxState();
+    } catch (e) {
+      console.error("[PanePresetPicker] reduce error:", e);
+    } finally {
+      setBusy(false);
     }
-    setGrid(cols, rows);
+  }
+
+  /** Full destructive reset: kills every pane but one, wipes every assignment for (sess, win). */
+  async function resetGrid() {
+    const sess = session();
+    const win = window();
+    if (sess == null || win == null) return;
+    setBusy(true);
+    try {
+      await setupPaneGrid(sess, win, 1, 1);
+      const allKeys = Object.keys(state.paneAssignments);
+      if (allKeys.length > 0) {
+        await Promise.all(
+          allKeys.map((idx) => setPaneAssignment(sess, win, Number(idx), null)),
+        );
+      }
+      refreshTmuxState();
+    } catch (e) {
+      console.error("[PanePresetPicker] reset error:", e);
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function handleLayoutClick(cols: number, rows: number) {
+    const sess = session();
+    const win = window();
+    if (sess == null || win == null) return;
+    const newCount = cols * rows;
+    const current = currentPaneCount();
+    if (newCount >= current) {
+      await reflow(cols, rows);
+      return;
+    }
+    // Reduce path — fetch exact kill targets and open the confirmation modal.
+    try {
+      const victims = await listKillTargets(sess, win, newCount);
+      setReduceTarget({ cols, rows, victims });
+    } catch (e) {
+      console.error("[PanePresetPicker] listKillTargets error:", e);
+    }
   }
 
   return (
     <div class="preset-picker">
       {/* Fixed layout buttons */}
       <div class="preset-picker-row">
-        <span class="preset-picker-label">Layout:</span>
+        <span class="preset-picker-label">Arrange:</span>
         <For each={FIXED_LAYOUTS}>
           {(item) => (
             <button
@@ -106,7 +155,7 @@ export function PanePresetPicker() {
         </For>
       </div>
 
-      {/* Resurrect + snapshot */}
+      {/* Resurrect + snapshot + reset */}
       <div class="preset-picker-row">
         <button
           class="preset-btn resurrect"
@@ -189,31 +238,93 @@ export function PanePresetPicker() {
         >
           Snapshot
         </button>
+
+        <span class="preset-picker-divider" />
+
+        <button
+          class="preset-btn danger-outline"
+          disabled={busy()}
+          onClick={() => setShowResetModal(true)}
+          title="Kill every pane in this window and return to a single empty shell"
+        >
+          Reset grid
+        </button>
       </div>
 
-      {/* Confirm reduce panes modal */}
-      <Show when={pendingGrid()}>
-        <div class="modal-backdrop" onClick={() => setPendingGrid(null)}>
+      {/* Confirm reduce panes modal — lists exactly which panes will die */}
+      <Show when={reduceTarget()}>
+        {(target) => {
+          const t = target();
+          return (
+            <div class="modal-backdrop" onClick={() => setReduceTarget(null)}>
+              <div class="confirm-modal" onClick={(e) => e.stopPropagation()}>
+                <p class="confirm-message">
+                  <strong>
+                    Kill {t.victims.length} pane{t.victims.length === 1 ? "" : "s"} to shrink to {t.cols}×{t.rows}?
+                  </strong>
+                </p>
+                <p class="confirm-warning">
+                  Surviving panes (indices 0–{t.cols * t.rows - 1}) keep their running processes. Only the panes listed below will be killed.
+                </p>
+                <ul class="kill-target-list">
+                  <For each={t.victims}>
+                    {(v) => {
+                      const proj = projectForIndex(v.pane_index);
+                      return (
+                        <li class="kill-target-row">
+                          <span class="kill-target-id">{v.pane_id}</span>
+                          <span class="kill-target-idx">#{v.pane_index}</span>
+                          <span class="kill-target-cmd">{v.current_command}</span>
+                          <Show when={proj}>
+                            <span class="kill-target-project">{proj}</span>
+                          </Show>
+                        </li>
+                      );
+                    }}
+                  </For>
+                </ul>
+                <div class="confirm-actions">
+                  <button class="modal-btn" onClick={() => setReduceTarget(null)}>
+                    Cancel
+                  </button>
+                  <button
+                    class="modal-btn danger"
+                    onClick={() => {
+                      setReduceTarget(null);
+                      reduce(t.cols, t.rows);
+                    }}
+                  >
+                    Kill {t.victims.length} pane{t.victims.length === 1 ? "" : "s"}
+                  </button>
+                </div>
+              </div>
+            </div>
+          );
+        }}
+      </Show>
+
+      {/* Reset grid confirmation — wipes everything in this window */}
+      <Show when={showResetModal()}>
+        <div class="modal-backdrop" onClick={() => setShowResetModal(false)}>
           <div class="confirm-modal" onClick={(e) => e.stopPropagation()}>
             <p class="confirm-message">
-              <strong>Active Claude sessions detected</strong>
+              <strong>Reset this window to a single pane?</strong>
             </p>
             <p class="confirm-warning">
-              Reducing panes will kill active sessions in removed panes. Better handling for this is planned — this is a safety check to prevent accidental loss.
+              Every pane in this window will be killed and all project assignments wiped. Use this when the layout is stuck or panes have gone missing.
             </p>
             <div class="confirm-actions">
-              <button class="modal-btn" onClick={() => setPendingGrid(null)}>
+              <button class="modal-btn" onClick={() => setShowResetModal(false)}>
                 Cancel
               </button>
               <button
                 class="modal-btn danger"
                 onClick={() => {
-                  const grid = pendingGrid()!;
-                  setPendingGrid(null);
-                  setGrid(grid.cols, grid.rows);
+                  setShowResetModal(false);
+                  resetGrid();
                 }}
               >
-                Reduce Anyway
+                Reset grid
               </button>
             </div>
           </div>
