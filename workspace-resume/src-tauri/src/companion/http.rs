@@ -183,23 +183,35 @@ async fn pane_conversation(
     Path(id): Path<String>,
     Query(q): Query<ConversationQuery>,
 ) -> Result<Json<ConversationResponse>, AppError> {
-    // Look up the pane to get session_id and project path
+    // Look up the pane to get session_id, project path, and account.
     let panes = state.panes.read().await;
     let rec = panes.get(&id).ok_or(AppError::NotFound)?;
     let bound_session = rec.dto.claude_session_id.clone();
     let encoded_project = rec.dto.project_encoded_name.clone();
+    let account_key = rec.dto.claude_account.clone();
     drop(panes);
+
+    // Each Claude account keeps its transcripts under its own config
+    // directory (`.claude` for Andrea, `.claude-b` for Bravura). Resolve
+    // against the `accounts` registry instead of hardcoding.
+    let config_dir = account_key
+        .as_deref()
+        .and_then(|k| super::accounts::ACCOUNTS.iter().find(|a| a.key == k))
+        .map(|a| a.config_dir)
+        .unwrap_or(".claude");
 
     // Resolve which JSONL to read:
     // 1. Pane has an explicit session_id (from --resume <uuid> in start cmd or hooks)
-    // 2. Pane has a project — pick the most recently modified .jsonl in that dir
-    //    (handles `ncld` launches without --resume; the active session is whatever
-    //    Claude last wrote to)
+    // 2. Pane has a project but no bound session — pick the most recently
+    //    modified .jsonl in that dir that is NOT already claimed by a
+    //    sibling pane. Without that filter two panes sharing a project
+    //    (e.g. `ncld` + split) would briefly swap transcripts while the
+    //    poller's /proc walk catches up.
     // 3. Otherwise, no way to find a transcript
     let (session_id, jsonl_path) = match (bound_session, encoded_project) {
         (Some(sid), Some(proj)) => (
             sid.clone(),
-            format!("$HOME/.claude/projects/{}/{}.jsonl", proj, sid),
+            format!("$HOME/{}/projects/{}/{}.jsonl", config_dir, proj, sid),
         ),
         (Some(sid), None) => {
             return Err(AppError::BadRequest(format!(
@@ -208,19 +220,37 @@ async fn pane_conversation(
             )));
         }
         (None, Some(proj)) => {
-            // Find most recent JSONL in the project directory
+            // Collect session ids already claimed by other panes so we
+            // don't hand the same JSONL to two detail screens.
+            let sibling_sids: std::collections::HashSet<String> = {
+                let panes = state.panes.read().await;
+                panes
+                    .iter()
+                    .filter(|(pid, _)| *pid != &id)
+                    .filter_map(|(_, r)| r.dto.claude_session_id.clone())
+                    .collect()
+            };
             let script = format!(
-                "ls -t \"$HOME/.claude/projects/{}\"/*.jsonl 2>/dev/null | head -1",
-                proj
+                "ls -t \"$HOME/{}/projects/{}\"/*.jsonl 2>/dev/null",
+                config_dir, proj
             );
-            let recent = crate::commands::tmux::run_tmux_command_async(script)
+            let listing = crate::commands::tmux::run_tmux_command_async(script)
                 .await
                 .map_err(AppError::Tmux)?;
-            let path = recent.lines().next().unwrap_or("").trim().to_string();
-            if path.is_empty() {
-                return Err(AppError::NotFound);
-            }
-            // Extract UUID from filename for the response
+            let pick = listing.lines().map(|l| l.trim()).find(|path| {
+                if path.is_empty() {
+                    return false;
+                }
+                let sid = std::path::Path::new(path)
+                    .file_stem()
+                    .and_then(|s| s.to_str())
+                    .unwrap_or("");
+                !sibling_sids.contains(sid)
+            });
+            let path = match pick {
+                Some(p) => p.to_string(),
+                None => return Err(AppError::NotFound),
+            };
             let sid = std::path::Path::new(&path)
                 .file_stem()
                 .and_then(|s| s.to_str())

@@ -408,9 +408,26 @@ async fn poll_once(state: &AppState) -> anyhow::Result<()> {
     // so it finds the JSONL Claude is actually writing — beats the MRU
     // heuristic when multiple Claude sessions share a project.
     for (pane_id, shell_pid) in session_detect_queue {
-        if let Some((session_id, encoded_project)) = detect_claude_session(&shell_pid).await {
+        if let Some((session_id, encoded_project, is_mru)) =
+            detect_claude_session(&shell_pid).await
+        {
             let updated_dto = {
                 let mut panes = state.panes.write().await;
+                // Low-confidence MRU hits collide when two Claude
+                // instances share a project dir. If any *other* pane is
+                // already bound to this session_id, refuse to bind — let
+                // the next poll's fd-catch or an incoming hook settle it
+                // rather than swap transcripts between the two detail
+                // screens.
+                if is_mru {
+                    let claimed_elsewhere = panes.iter().any(|(other_id, other_rec)| {
+                        other_id != &pane_id
+                            && other_rec.dto.claude_session_id.as_deref() == Some(&session_id)
+                    });
+                    if claimed_elsewhere {
+                        continue;
+                    }
+                }
                 if let Some(rec) = panes.get_mut(&pane_id) {
                     // Don't downgrade an Explicit binding (from --resume
                     // parsing or a hook event) — those are authoritative.
@@ -620,7 +637,7 @@ fn parse_resume_uuid(cmd: &str) -> Option<String> {
 /// turn. Start-time matching does NOT work — Claude resumes existing
 /// sessions, so the JSONL's first record can predate the Claude PID by
 /// hours or days. The cwd lookup ensures we look in the right project.
-pub(super) async fn detect_claude_session(shell_pid: &str) -> Option<(String, String)> {
+pub(super) async fn detect_claude_session(shell_pid: &str) -> Option<(String, String, bool)> {
     if shell_pid.is_empty() {
         return None;
     }
@@ -632,11 +649,6 @@ walk() {{
   [ -d "/proc/$pid" ] || return 1
   local comm
   comm=$(cat "/proc/$pid/comm" 2>/dev/null)
-  # `comm == claude` is enough — the binary name is set by every
-  # @anthropic-ai/claude-code install, including custom local
-  # launchers that don't go through the standard cli.js path.
-  # For node processes we still require a claude reference in
-  # cmdline/environ to avoid binding random unrelated node procs.
   if [ "$comm" = "claude" ]; then
     echo "$pid"
     return 0
@@ -656,30 +668,62 @@ walk() {{
 claude_pid=$(walk {pid} 0)
 [ -z "$claude_pid" ] && exit 1
 
+# First-choice signal: catch a JSONL file descriptor while Claude has
+# it open. Claude reopens the file for each message write, so a short
+# burst of fd scans is usually enough for an actively-used pane. This
+# disambiguates two Claude instances in the same project dir — MRU
+# alone would map both to the last-written file and swap transcripts.
+# The `read -t 0.1 < /dev/null` trick gives us fractional-second
+# sleeps without needing `sleep 0.1` (not portable across shells).
+for i in $(seq 1 15); do
+  for fd in /proc/$claude_pid/fd/*; do
+    target=$(readlink "$fd" 2>/dev/null) || continue
+    case "$target" in
+      "$HOME/.claude/projects/"*/*.jsonl|"$HOME/.claude-b/projects/"*/*.jsonl)
+        echo "$target"
+        exit 0
+        ;;
+    esac
+  done
+  read -t 0.1 </dev/null 2>/dev/null || true
+done
+
+# Fallback: cwd → MRU in project dir. Caller should treat this as
+# low-confidence and skip binding if a sibling pane already claims
+# this session_id. Prefix `MRU:` flags it as the weak path.
 cwd=$(readlink "/proc/$claude_pid/cwd" 2>/dev/null)
 [ -z "$cwd" ] && exit 1
-
-# Claude Code encodes `/`, `.`, and ` ` (space) as `-` in project dir names
 encoded=$(echo "$cwd" | tr '/. ' '-')
-proj_dir="$HOME/.claude/projects/$encoded"
-[ -d "$proj_dir" ] || exit 1
-
-ls -t "$proj_dir"/*.jsonl 2>/dev/null | head -1
+for cfg in ".claude" ".claude-b"; do
+  proj_dir="$HOME/$cfg/projects/$encoded"
+  [ -d "$proj_dir" ] || continue
+  mru=$(ls -t "$proj_dir"/*.jsonl 2>/dev/null | head -1)
+  if [ -n "$mru" ]; then
+    echo "MRU:$mru"
+    exit 0
+  fi
+done
+exit 1
 "#,
         pid = shell_pid
     );
     let out = crate::commands::tmux::run_tmux_command_async(script)
         .await
         .ok()?;
-    let path = out.lines().next()?.trim();
-    if path.is_empty() {
+    let first = out.lines().next()?.trim();
+    if first.is_empty() {
         return None;
     }
-    // Path: /home/<user>/.claude/projects/<encoded_project>/<session_id>.jsonl
+    let (path, is_mru) = if let Some(rest) = first.strip_prefix("MRU:") {
+        (rest, true)
+    } else {
+        (first, false)
+    };
+    // Path: /home/<user>/.claude[-b]/projects/<encoded_project>/<session_id>.jsonl
     let p = std::path::Path::new(path);
     let session_id = p.file_stem()?.to_str()?.to_string();
     let encoded_project = p.parent()?.file_name()?.to_str()?.to_string();
-    Some((session_id, encoded_project))
+    Some((session_id, encoded_project, is_mru))
 }
 
 #[cfg(test)]
