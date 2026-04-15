@@ -28,7 +28,7 @@ use futures_util::stream::{self, StreamExt};
 use rand::RngCore;
 use tokio_stream::wrappers::BroadcastStream;
 
-use super::state::{AppState, NtfyMessage};
+use super::state::{AppState, NtfyAction, NtfyMessage};
 
 const BACKLOG_MAX: usize = 64;
 
@@ -67,11 +67,11 @@ pub async fn publish(
         .map(|s| s.split(',').map(|t| t.trim().to_string()).collect())
         .unwrap_or_default();
 
-    let actions = headers
+    let actions: Option<Vec<NtfyAction>> = headers
         .get("actions")
         .or_else(|| headers.get("x-actions"))
         .and_then(|h| h.to_str().ok())
-        .map(|s| s.to_string());
+        .map(|s| parse_x_actions(s));
 
     let msg = NtfyMessage {
         id: short_id(),
@@ -157,4 +157,44 @@ fn short_id() -> String {
     let mut buf = [0u8; 9];
     rand::thread_rng().fill_bytes(&mut buf);
     base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(buf)
+}
+
+/// Parse the ntfy `X-Actions` header value into structured action objects.
+/// Format: `"http, <label>, <url>[, key=value]*"` with entries separated by `;`.
+/// See https://docs.ntfy.sh/publish/#action-buttons
+fn parse_x_actions(raw: &str) -> Vec<NtfyAction> {
+    raw.split(';')
+        .filter_map(|entry| {
+            let parts: Vec<&str> = entry.split(',').map(|s| s.trim()).collect();
+            if parts.len() < 3 {
+                return None;
+            }
+            let mut action = NtfyAction {
+                action: parts[0].to_string(),
+                label: parts[1].to_string(),
+                url: parts[2].to_string(),
+                method: None,
+                headers: None,
+                body: None,
+            };
+            let mut headers = std::collections::HashMap::new();
+            for kv in &parts[3..] {
+                if let Some((k, v)) = kv.split_once('=') {
+                    let k = k.trim();
+                    let v = v.trim();
+                    if k == "method" {
+                        action.method = Some(v.to_string());
+                    } else if k == "body" {
+                        action.body = Some(v.to_string());
+                    } else if let Some(header_name) = k.strip_prefix("headers.") {
+                        headers.insert(header_name.to_string(), v.to_string());
+                    }
+                }
+            }
+            if !headers.is_empty() {
+                action.headers = Some(headers);
+            }
+            Some(action)
+        })
+        .collect()
 }

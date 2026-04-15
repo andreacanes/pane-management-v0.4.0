@@ -1,21 +1,23 @@
 //! axum Router assembly and HTTP handlers for the companion API.
 
 use axum::{
-    extract::{Path, Query, State},
+    extract::{DefaultBodyLimit, Path, Query, State},
     http::StatusCode,
     response::Json,
     routing::{delete, get, post},
     Router,
 };
+use base64::Engine;
 use serde::Deserialize;
 
 use super::{
     error::AppError,
     hook_sink,
     models::{
-        now_ms, ApprovalDto, ApprovalResponse, CaptureResponse, CreateWindowRequest,
-        CreateWindowResponse, HealthDto, InputRequest, KeyRequest, PaneDto, ProjectDto,
-        SessionDto, VoiceRequest,
+        now_ms, AccountRateLimit, ApprovalDto, ApprovalResponse, CaptureResponse,
+        ConversationMessage, ConversationResponse, CreatePaneRequest, CreatePaneResponse,
+        CreateWindowRequest, CreateWindowResponse, HealthDto, ImageRequest, InputRequest,
+        KeyRequest, PaneDto, ProjectDto, SessionDto, VoiceRequest,
     },
     ntfy_server,
     state::AppState,
@@ -27,10 +29,12 @@ pub fn router(state: AppState) -> Router {
     // Protected API — bearer auth
     let api_auth = Router::new()
         .route("/sessions", get(list_sessions))
-        .route("/panes", get(list_panes))
+        .route("/panes", get(list_panes).post(create_pane))
         .route("/panes/{id}/capture", get(capture_pane))
+        .route("/panes/{id}/conversation", get(pane_conversation))
         .route("/panes/{id}/input", post(send_input))
         .route("/panes/{id}/voice", post(send_voice))
+        .route("/panes/{id}/image", post(send_image))
         .route("/panes/{id}/key", post(send_key))
         .route("/panes/{id}/cancel", post(cancel_pane))
         .route("/approvals", get(list_approvals))
@@ -40,6 +44,8 @@ pub fn router(state: AppState) -> Router {
         .route("/projects", get(list_projects))
         .route("/windows", post(create_window))
         .route("/windows/{session}/{index}", delete(kill_window))
+        .route("/panes/{id}", delete(kill_pane))
+        .route("/rate-limits", get(rate_limits))
         .route("/events", get(ws::upgrade))
         .route_layer(axum::middleware::from_fn_with_state(
             state.clone(),
@@ -52,6 +58,7 @@ pub fn router(state: AppState) -> Router {
     // Hook sink — shared-secret auth
     let api_hooks = Router::new()
         .route("/hooks/notification", post(hook_sink::notification))
+        .route("/hooks/session-start", post(hook_sink::session_start))
         .route_layer(axum::middleware::from_fn_with_state(
             state.clone(),
             super::auth::hook_secret_mw,
@@ -67,6 +74,7 @@ pub fn router(state: AppState) -> Router {
         .nest("/api/v1", api_auth.merge(api_public).merge(api_hooks))
         .merge(ntfy)
         .with_state(state)
+        .layer(DefaultBodyLimit::max(32 * 1024 * 1024)) // 32 MB for multi-image uploads
         .layer(tower_http::cors::CorsLayer::permissive())
         .layer(tower_http::trace::TraceLayer::new_for_http())
 }
@@ -140,7 +148,7 @@ fn default_capture_lines() -> u32 {
 }
 
 async fn capture_pane(
-    State(state): State<AppState>,
+    State(_state): State<AppState>,
     Path(id): Path<String>,
     Query(q): Query<CaptureQuery>,
 ) -> Result<Json<CaptureResponse>, AppError> {
@@ -151,16 +159,227 @@ async fn capture_pane(
         .await
         .map_err(AppError::Tmux)?;
     let lines: Vec<String> = out.lines().map(|s| s.to_string()).collect();
-    // Update the pane record's seq so clients can detect changes
-    let seq = {
-        let mut panes = state.panes.write().await;
-        if let Some(rec) = panes.get_mut(&id) {
-            rec.dto.updated_at = now_ms();
-        }
-        now_ms() as u64
-    };
+    // Capture is a READ — do not bump `updated_at` on the pane record.
+    // That field is reserved for real state changes (transitions, hooks)
+    // so clients like the Stashed filter can rely on it not being polluted
+    // by phone views. `seq` is still derived from now() for cache busting.
+    let seq = now_ms() as u64;
     Ok(Json(CaptureResponse { lines, seq }))
 }
+
+// ---------------------------------------------------------------------------
+// Conversation (JSONL session transcript)
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Deserialize)]
+pub struct ConversationQuery {
+    /// Return only messages after this UUID (for incremental fetches).
+    #[serde(default)]
+    pub after: Option<String>,
+}
+
+async fn pane_conversation(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+    Query(q): Query<ConversationQuery>,
+) -> Result<Json<ConversationResponse>, AppError> {
+    // Look up the pane to get session_id and project path
+    let panes = state.panes.read().await;
+    let rec = panes.get(&id).ok_or(AppError::NotFound)?;
+    let bound_session = rec.dto.claude_session_id.clone();
+    let encoded_project = rec.dto.project_encoded_name.clone();
+    drop(panes);
+
+    // Resolve which JSONL to read:
+    // 1. Pane has an explicit session_id (from --resume <uuid> in start cmd or hooks)
+    // 2. Pane has a project — pick the most recently modified .jsonl in that dir
+    //    (handles `ncld` launches without --resume; the active session is whatever
+    //    Claude last wrote to)
+    // 3. Otherwise, no way to find a transcript
+    let (session_id, jsonl_path) = match (bound_session, encoded_project) {
+        (Some(sid), Some(proj)) => (
+            sid.clone(),
+            format!("$HOME/.claude/projects/{}/{}.jsonl", proj, sid),
+        ),
+        (Some(sid), None) => {
+            return Err(AppError::BadRequest(format!(
+                "pane has session {} but no project binding",
+                sid
+            )));
+        }
+        (None, Some(proj)) => {
+            // Find most recent JSONL in the project directory
+            let script = format!(
+                "ls -t \"$HOME/.claude/projects/{}\"/*.jsonl 2>/dev/null | head -1",
+                proj
+            );
+            let recent = crate::commands::tmux::run_tmux_command_async(script)
+                .await
+                .map_err(AppError::Tmux)?;
+            let path = recent.lines().next().unwrap_or("").trim().to_string();
+            if path.is_empty() {
+                return Err(AppError::NotFound);
+            }
+            // Extract UUID from filename for the response
+            let sid = std::path::Path::new(&path)
+                .file_stem()
+                .and_then(|s| s.to_str())
+                .unwrap_or("")
+                .to_string();
+            (sid, path)
+        }
+        (None, None) => {
+            return Err(AppError::BadRequest(
+                "pane has no Claude session or project binding".into(),
+            ));
+        }
+    };
+
+    let script = format!(
+        "cat \"{}\" 2>/dev/null || echo '__FILE_NOT_FOUND__'",
+        jsonl_path
+    );
+    let raw = crate::commands::tmux::run_tmux_command_async(script)
+        .await
+        .map_err(AppError::Tmux)?;
+
+    if raw.trim() == "__FILE_NOT_FOUND__" || raw.is_empty() {
+        return Err(AppError::NotFound);
+    }
+
+    let messages = parse_jsonl_conversation(&raw, q.after.as_deref());
+
+    Ok(Json(ConversationResponse {
+        session_id,
+        messages,
+    }))
+}
+
+/// Parse Claude Code JSONL into conversation messages.
+///
+/// Extracts `type: "user"` and `type: "assistant"` records, skipping
+/// system/attachment/permission-mode/file-history-snapshot records.
+/// For user records whose `message.content` starts with `[{` (tool
+/// results), the record is skipped — tool results are internal plumbing.
+/// For assistant records, only `text` content blocks are included;
+/// `thinking` and `tool_use` blocks are excluded.
+fn parse_jsonl_conversation(raw: &str, after: Option<&str>) -> Vec<ConversationMessage> {
+    let mut messages = Vec::new();
+    let mut past_cursor = after.is_none();
+
+    for line in raw.lines() {
+        if line.trim().is_empty() {
+            continue;
+        }
+        let val: serde_json::Value = match serde_json::from_str(line) {
+            Ok(v) => v,
+            Err(_) => continue,
+        };
+
+        let record_type = val.get("type").and_then(|v| v.as_str()).unwrap_or("");
+        if record_type != "user" && record_type != "assistant" {
+            continue;
+        }
+
+        let uuid = val
+            .get("uuid")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string();
+        let timestamp = val
+            .get("timestamp")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string();
+
+        // Skip until we pass the cursor
+        if !past_cursor {
+            if uuid == after.unwrap_or("") {
+                past_cursor = true;
+            }
+            continue;
+        }
+
+        // Skip tool-result user messages (these are internal plumbing)
+        if record_type == "user" && val.get("toolUseResult").is_some() {
+            continue;
+        }
+
+        let message = match val.get("message") {
+            Some(m) => m,
+            None => continue,
+        };
+
+        if record_type == "user" {
+            // User message: message.content is a string
+            let text = message
+                .get("content")
+                .and_then(|c| c.as_str())
+                .unwrap_or("")
+                .to_string();
+            if text.is_empty() {
+                continue;
+            }
+            messages.push(ConversationMessage {
+                uuid,
+                role: "user".into(),
+                text,
+                timestamp,
+                tool_name: None,
+                tool_input: None,
+            });
+        } else {
+            // Assistant message: message.content is an array of blocks
+            let content = match message.get("content").and_then(|c| c.as_array()) {
+                Some(arr) => arr,
+                None => continue,
+            };
+
+            let mut text_parts = Vec::new();
+            let mut tool_name = None;
+            let mut tool_input: Option<serde_json::Value> = None;
+
+            for block in content {
+                let block_type = block.get("type").and_then(|v| v.as_str()).unwrap_or("");
+                match block_type {
+                    "text" => {
+                        if let Some(t) = block.get("text").and_then(|v| v.as_str()) {
+                            text_parts.push(t);
+                        }
+                    }
+                    "tool_use" => {
+                        if let Some(name) = block.get("name").and_then(|v| v.as_str()) {
+                            tool_name = Some(name.to_string());
+                        }
+                        if let Some(input) = block.get("input") {
+                            tool_input = Some(input.clone());
+                        }
+                    }
+                    _ => {} // skip thinking, etc.
+                }
+            }
+
+            let text = text_parts.join("\n");
+            if text.is_empty() && tool_name.is_none() {
+                continue;
+            }
+            messages.push(ConversationMessage {
+                uuid,
+                role: "assistant".into(),
+                text,
+                timestamp,
+                tool_name,
+                tool_input,
+            });
+        }
+    }
+
+    messages
+}
+
+// ---------------------------------------------------------------------------
+// Pane I/O
+// ---------------------------------------------------------------------------
 
 async fn send_input(
     State(state): State<AppState>,
@@ -185,6 +404,54 @@ async fn send_voice(
     Ok(StatusCode::NO_CONTENT)
 }
 
+async fn send_image(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+    Json(req): Json<ImageRequest>,
+) -> Result<StatusCode, AppError> {
+    if req.images.is_empty() {
+        return Err(AppError::BadRequest("no images provided".into()));
+    }
+
+    // Decode + write each image. Timestamp + index produces unique filenames
+    // so multiple attachments in one request don't collide.
+    let base_ts = chrono::Utc::now().timestamp_millis();
+    let mut wsl_paths: Vec<String> = Vec::with_capacity(req.images.len());
+    for (idx, item) in req.images.iter().enumerate() {
+        let bytes = base64::engine::general_purpose::STANDARD
+            .decode(&item.image_base64)
+            .map_err(|e| AppError::BadRequest(format!("invalid base64 (image {}): {}", idx, e)))?;
+        let ext = match item.media_type.as_str() {
+            "image/jpeg" | "image/jpg" => "jpg",
+            "image/webp" => "webp",
+            "image/gif" => "gif",
+            _ => "png",
+        };
+        let wsl_path = format!("/tmp/pane-mgmt/img_{}_{}.{}", base_ts, idx, ext);
+        crate::commands::tmux::write_file_to_wsl_async(wsl_path.clone(), bytes)
+            .await
+            .map_err(AppError::Tmux)?;
+        wsl_paths.push(wsl_path);
+    }
+
+    // Build one message that references every image path inline so Claude
+    // reads them all with the Read tool on the same turn.
+    let paths_joined = wsl_paths.join(", ");
+    let prompt = req.prompt.as_deref().unwrap_or("").trim();
+    let label = if wsl_paths.len() == 1 { "screenshot" } else { "screenshots" };
+    let message = if prompt.is_empty() {
+        format!("Look at this {}: {}", label, paths_joined)
+    } else {
+        format!("{} ({}: {})", prompt, label, paths_joined)
+    };
+
+    tracing::info!(pane = %id, count = wsl_paths.len(), "images uploaded");
+    send_text_to_pane(&id, &message, true).await?;
+    state.attention_panes.write().await.remove(&id);
+
+    Ok(StatusCode::NO_CONTENT)
+}
+
 async fn send_key(
     State(_state): State<AppState>,
     Path(id): Path<String>,
@@ -196,6 +463,7 @@ async fn send_key(
     // for now; widen the list when a real client needs more.
     const ALLOWED_KEYS: &[&str] = &[
         "S-Tab", "BTab", "Tab", "Enter", "Escape", "Up", "Down", "Left", "Right",
+        "C-u", "C-a", "C-k", "C-c",
     ];
     if !ALLOWED_KEYS.contains(&req.key.as_str()) {
         return Err(AppError::BadRequest(format!(
@@ -411,6 +679,82 @@ async fn kill_window(
         .map_err(AppError::Tmux)?;
     tracing::info!(%session, index, "window killed");
     Ok(StatusCode::NO_CONTENT)
+}
+
+async fn kill_pane(
+    State(_state): State<AppState>,
+    Path(id): Path<String>,
+) -> Result<StatusCode, AppError> {
+    // id is "session:window.pane", e.g. "main:3.1"
+    if id.is_empty() {
+        return Err(AppError::BadRequest("pane id is required".into()));
+    }
+    let id_esc = id.replace('\'', r"'\''");
+    let script = format!("tmux kill-pane -t '{}' 2>&1", id_esc);
+    crate::commands::tmux::run_tmux_command_async(script)
+        .await
+        .map_err(AppError::Tmux)?;
+    tracing::info!(%id, "pane killed");
+    Ok(StatusCode::NO_CONTENT)
+}
+
+async fn create_pane(
+    State(_state): State<AppState>,
+    Json(req): Json<CreatePaneRequest>,
+) -> Result<Json<CreatePaneResponse>, AppError> {
+    // Split the current window vertically (new pane below the target),
+    // inheriting the target pane's working directory, then launch the
+    // account-specific Claude launcher inside it.
+    let cmd = match req.account.as_str() {
+        "bravura" => "ncld2",
+        "andrea" | "" => "ncld",
+        other => {
+            return Err(AppError::BadRequest(format!(
+                "unknown account '{}': expected andrea|bravura",
+                other
+            )))
+        }
+    };
+    if req.target_pane_id.is_empty() {
+        return Err(AppError::BadRequest("target_pane_id is required".into()));
+    }
+    let target_esc = req.target_pane_id.replace('\'', r"'\''");
+
+    // Query the target pane's cwd first — #{pane_current_path} in split-window's
+    // -c arg expands relative to the *active* pane, not the -t target.
+    let script = format!(
+        "CWD=$(tmux display-message -p -t '{target}' '#{{pane_current_path}}'); \
+         NEW=$(tmux split-window -v -t '{target}' -c \"$CWD\" -d \
+         -P -F '#{{session_name}}:#{{window_index}}.#{{pane_index}}' 2>&1); \
+         if [ -z \"$NEW\" ]; then echo 'ERR: split-window failed'; exit 1; fi; \
+         tmux send-keys -t \"$NEW\" '{cmd}' Enter; \
+         echo \"NEW=$NEW\"",
+        target = target_esc,
+        cmd = cmd,
+    );
+
+    let out = crate::commands::tmux::run_tmux_command_async(script)
+        .await
+        .map_err(AppError::Tmux)?;
+
+    let new_pane_id = out
+        .lines()
+        .find_map(|l| l.strip_prefix("NEW="))
+        .ok_or_else(|| AppError::BadRequest(format!("create_pane parse failed: {}", out)))?
+        .trim()
+        .to_string();
+
+    tracing::info!(%new_pane_id, target = %req.target_pane_id, account = %req.account, "pane split created");
+
+    Ok(Json(CreatePaneResponse {
+        pane_id: new_pane_id,
+    }))
+}
+
+async fn rate_limits(
+    State(state): State<AppState>,
+) -> Json<Vec<AccountRateLimit>> {
+    Json(state.rate_limits.read().await.clone())
 }
 
 // ---------------------------------------------------------------------------

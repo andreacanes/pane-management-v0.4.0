@@ -192,6 +192,9 @@ async fn poll_once(state: &AppState) -> anyhow::Result<()> {
     // /proc/<pid>/environ. Collected during the main loop, resolved
     // after the lock is released.
     let mut detect_queue: Vec<(String, String)> = Vec::new();
+    // Panes that need Claude session detection — proc-walk for an open
+    // .jsonl file descriptor. Resolved after the main loop the same way.
+    let mut session_detect_queue: Vec<(String, String)> = Vec::new();
 
     // Apply updates + detect new panes
     for (id, (session, window_index, window_name, pane_index, cur_cmd, cur_path, pane_pid, start_cmd))
@@ -240,6 +243,7 @@ async fn poll_once(state: &AppState) -> anyhow::Result<()> {
                 claude_session_id: claude_session_id.clone(),
                 claude_account: None,
                 updated_at: now,
+                last_activity_at: None,
             },
             output_hash: [0u8; 32],
             last_output_change: None,
@@ -285,12 +289,38 @@ async fn poll_once(state: &AppState) -> anyhow::Result<()> {
         if claude_alive && rec.claude_account.is_none() && !pane_pid.is_empty() {
             detect_queue.push((id.clone(), pane_pid.clone()));
         }
+        // Queue session detection (proc-walk for open .jsonl) when Claude
+        // is alive but we haven't explicitly bound a session_id yet.
+        // Skips panes already bound via --resume parsing or hook events.
+        if claude_alive
+            && rec.binding_confidence == BindingConfidence::None
+            && !pane_pid.is_empty()
+        {
+            session_detect_queue.push((id.clone(), pane_pid.clone()));
+        }
+        // When Claude exits from a pane, clear the cached account so that
+        // if a different account's Claude is launched in the same shell,
+        // detection re-runs instead of returning the stale cached result.
+        if !claude_alive && rec.claude_account.is_some() {
+            if !pane_pid.is_empty() {
+                crate::commands::tmux::invalidate_account_cache(&pane_pid);
+            }
+            rec.claude_account = None;
+            rec.dto.claude_account = None;
+        }
+        // Same for the session binding — when Claude exits, the bound
+        // session_id is no longer authoritative for the pane.
+        if !claude_alive && rec.binding_confidence != BindingConfidence::None {
+            rec.dto.claude_session_id = None;
+            rec.binding_confidence = BindingConfidence::None;
+        }
         let has_pending = pending_approval_panes.contains(&id);
-        let in_attention = attention_snapshot.contains(&id);
+        let mut in_attention = attention_snapshot.contains(&id);
         // If Claude has exited but the pane is still in the attention
         // set, drop the flag — no one is there to respond any more.
         if !claude_alive && in_attention {
             cleared_attention.push(id.clone());
+            in_attention = false;
         }
         // Output-stale detection: if Claude is alive but the pane's output
         // hash hasn't changed for IDLE_TIMEOUT, Claude is sitting at its
@@ -304,6 +334,15 @@ async fn poll_once(state: &AppState) -> anyhow::Result<()> {
             .last_output_change
             .map(|t| t.elapsed() > IDLE_TIMEOUT)
             .unwrap_or(true); // never had output → treat as stale
+
+        // Clear attention only when Claude resumes working (output is
+        // actively changing). Do NOT clear when Claude is idle at the
+        // prompt — that's exactly when we want "waiting for input" to
+        // persist and the phone notification to stay visible.
+        if claude_alive && in_attention && !has_pending && output_changed && !output_stale {
+            cleared_attention.push(id.clone());
+            in_attention = false;
+        }
 
         let desired = if !claude_alive {
             PaneState::Idle
@@ -364,19 +403,126 @@ async fn poll_once(state: &AppState) -> anyhow::Result<()> {
         }
     }
 
-    // Drop panes that disappeared from tmux output (session ended)
+    // Resolve session bindings: walk /proc for each pane that runs claude
+    // but has no explicit binding. The proc-walk reads file descriptors,
+    // so it finds the JSONL Claude is actually writing — beats the MRU
+    // heuristic when multiple Claude sessions share a project.
+    for (pane_id, shell_pid) in session_detect_queue {
+        if let Some((session_id, encoded_project)) = detect_claude_session(&shell_pid).await {
+            let updated_dto = {
+                let mut panes = state.panes.write().await;
+                if let Some(rec) = panes.get_mut(&pane_id) {
+                    // Don't downgrade an Explicit binding (from --resume
+                    // parsing or a hook event) — those are authoritative.
+                    if rec.binding_confidence != BindingConfidence::Explicit {
+                        rec.dto.claude_session_id = Some(session_id);
+                        rec.binding_confidence = BindingConfidence::Heuristic;
+                        // Backfill project_encoded_name if the cwd-based
+                        // lookup missed it (e.g., Claude cd'd somewhere
+                        // outside any known project root).
+                        if rec.dto.project_encoded_name.is_none() {
+                            rec.dto.project_encoded_name = Some(encoded_project);
+                        }
+                        rec.dto.updated_at = now_ms();
+                        Some(rec.dto.clone())
+                    } else {
+                        None
+                    }
+                } else {
+                    None
+                }
+            };
+            if let Some(pane) = updated_dto {
+                let _ = state.events.send(EventDto::PaneUpdated { pane });
+            }
+        }
+    }
+
+    // Refresh `last_activity_at` from JSONL file mtime. This is the
+    // honest "last conversation activity" signal — it advances when
+    // Claude writes a turn (assistant/user/tool) and is NOT bumped by
+    // phone capture views or state-only transitions like updated_at.
+    // One batched wsl.exe call per tick stats every bound pane's JSONL.
+    let stat_targets: Vec<(String, String)> = {
+        let panes_r = state.panes.read().await;
+        panes_r
+            .values()
+            .filter_map(|rec| {
+                let sid = rec.dto.claude_session_id.as_ref()?;
+                let proj = rec.dto.project_encoded_name.as_ref()?;
+                Some((
+                    rec.dto.id.clone(),
+                    format!("$HOME/.claude/projects/{}/{}.jsonl", proj, sid),
+                ))
+            })
+            .collect()
+    };
+    if !stat_targets.is_empty() {
+        let mut script = String::new();
+        for (id, path) in &stat_targets {
+            // Single quote in pane id is impossible (tmux format), so no
+            // escape needed. Path is server-built, also safe.
+            script.push_str(&format!(
+                "printf '%s|' '{}'; stat -c '%Y' \"{}\" 2>/dev/null || echo '0'\n",
+                id, path
+            ));
+        }
+        if let Ok(out) = crate::commands::tmux::run_tmux_command_async(script).await {
+            let mut updates: Vec<(String, i64)> = Vec::new();
+            for line in out.lines() {
+                let mut parts = line.splitn(2, '|');
+                let id = parts.next().unwrap_or("");
+                let mtime_s: i64 = parts
+                    .next()
+                    .unwrap_or("0")
+                    .trim()
+                    .parse()
+                    .unwrap_or(0);
+                if mtime_s > 0 && !id.is_empty() {
+                    updates.push((id.to_string(), mtime_s * 1000));
+                }
+            }
+            if !updates.is_empty() {
+                let mut panes_w = state.panes.write().await;
+                for (id, ms) in updates {
+                    if let Some(rec) = panes_w.get_mut(&id) {
+                        if rec.dto.last_activity_at != Some(ms) {
+                            rec.dto.last_activity_at = Some(ms);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // Drop panes that disappeared from tmux output. Emit PaneRemoved
+    // per pane, then SessionEnded only for sessions with no remaining panes.
     let mut panes = state.panes.write().await;
     let gone: Vec<String> = panes
         .keys()
         .filter(|k| !seen.contains(*k))
         .cloned()
         .collect();
-    for id in gone {
-        panes.remove(&id);
-        let _ = state.events.send(EventDto::SessionEnded {
-            name: id.clone(),
+    let mut affected_sessions: HashSet<String> = HashSet::new();
+    for id in &gone {
+        if let Some(rec) = panes.get(id) {
+            affected_sessions.insert(rec.dto.session_name.clone());
+        }
+        panes.remove(id);
+        let _ = state.events.send(EventDto::PaneRemoved {
+            pane_id: id.clone(),
             at: now_ms(),
         });
+    }
+    // Only emit SessionEnded when the entire session has no remaining panes.
+    for session in affected_sessions {
+        let still_has_panes = panes.values().any(|r| r.dto.session_name == session);
+        if !still_has_panes {
+            let _ = state.events.send(EventDto::SessionEnded {
+                name: session,
+                at: now_ms(),
+            });
+        }
     }
     Ok(())
 }
@@ -458,6 +604,82 @@ fn parse_resume_uuid(cmd: &str) -> Option<String> {
         }
     }
     None
+}
+
+/// Find the Claude session JSONL for a tmux pane.
+///
+/// Strategy:
+///   1. Walk descendants of `shell_pid` to find the running Claude PID
+///   2. Read its `cwd` (authoritative — survives `cd` inside the pane)
+///   3. Encode cwd to the matching `.claude/projects/<encoded>/` dir
+///   4. Pick the most-recently-modified `.jsonl` in that dir
+///
+/// Returns `(session_id, encoded_project)` on success.
+///
+/// MRU works because Claude actively writes the active JSONL on every
+/// turn. Start-time matching does NOT work — Claude resumes existing
+/// sessions, so the JSONL's first record can predate the Claude PID by
+/// hours or days. The cwd lookup ensures we look in the right project.
+pub(super) async fn detect_claude_session(shell_pid: &str) -> Option<(String, String)> {
+    if shell_pid.is_empty() {
+        return None;
+    }
+    let script = format!(
+        r#"
+walk() {{
+  local pid=$1 depth=$2
+  [ "$depth" -gt 5 ] && return 1
+  [ -d "/proc/$pid" ] || return 1
+  local comm
+  comm=$(cat "/proc/$pid/comm" 2>/dev/null)
+  # `comm == claude` is enough — the binary name is set by every
+  # @anthropic-ai/claude-code install, including custom local
+  # launchers that don't go through the standard cli.js path.
+  # For node processes we still require a claude reference in
+  # cmdline/environ to avoid binding random unrelated node procs.
+  if [ "$comm" = "claude" ]; then
+    echo "$pid"
+    return 0
+  fi
+  if [ "$comm" = "node" ]; then
+    if grep -aq claude "/proc/$pid/cmdline" 2>/dev/null \
+      || tr '\0' '\n' < "/proc/$pid/environ" 2>/dev/null | grep -q claude; then
+      echo "$pid"
+      return 0
+    fi
+  fi
+  for child in $(pgrep -P "$pid" 2>/dev/null); do
+    if walk "$child" $((depth + 1)); then return 0; fi
+  done
+  return 1
+}}
+claude_pid=$(walk {pid} 0)
+[ -z "$claude_pid" ] && exit 1
+
+cwd=$(readlink "/proc/$claude_pid/cwd" 2>/dev/null)
+[ -z "$cwd" ] && exit 1
+
+# Claude Code encodes `/`, `.`, and ` ` (space) as `-` in project dir names
+encoded=$(echo "$cwd" | tr '/. ' '-')
+proj_dir="$HOME/.claude/projects/$encoded"
+[ -d "$proj_dir" ] || exit 1
+
+ls -t "$proj_dir"/*.jsonl 2>/dev/null | head -1
+"#,
+        pid = shell_pid
+    );
+    let out = crate::commands::tmux::run_tmux_command_async(script)
+        .await
+        .ok()?;
+    let path = out.lines().next()?.trim();
+    if path.is_empty() {
+        return None;
+    }
+    // Path: /home/<user>/.claude/projects/<encoded_project>/<session_id>.jsonl
+    let p = std::path::Path::new(path);
+    let session_id = p.file_stem()?.to_str()?.to_string();
+    let encoded_project = p.parent()?.file_name()?.to_str()?.to_string();
+    Some((session_id, encoded_project))
 }
 
 #[cfg(test)]

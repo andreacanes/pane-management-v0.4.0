@@ -2,6 +2,7 @@
 //! bind addr) + QR code for phone onboarding + token rotation.
 
 use serde::Serialize;
+use tauri::Manager;
 use tauri_plugin_store::StoreExt;
 
 #[derive(Debug, Serialize)]
@@ -78,6 +79,9 @@ pub async fn get_companion_qr(app: tauri::AppHandle) -> Result<String, String> {
 }
 
 /// Rotate the bearer token. In-flight WS clients will start getting 401s.
+/// Also updates the runtime state so the new token takes effect immediately
+/// (without restarting the app) and purges stale ntfy backlog entries whose
+/// embedded X-Actions headers reference the old token.
 #[tauri::command]
 pub async fn rotate_companion_token(app: tauri::AppHandle) -> Result<CompanionConfig, String> {
     use base64::Engine;
@@ -92,6 +96,17 @@ pub async fn rotate_companion_token(app: tauri::AppHandle) -> Result<CompanionCo
         .map_err(|e| format!("store open failed: {}", e))?;
     store.set("companion.bearer_token", serde_json::json!(new_token.clone()));
     let _ = store.save();
+
+    // Update the runtime bearer so auth middleware uses the new token
+    // immediately, and purge ntfy backlog entries that embed the old
+    // bearer in their action buttons. Attention notifications (no
+    // actions) are kept; only approval notifications are purged.
+    if let Some(state) = app.try_state::<crate::companion::state::AppState>() {
+        let state: &crate::companion::state::AppState = &state;
+        *state.bearer.write().await = new_token;
+        let mut backlog = state.ntfy_backlog.write().await;
+        backlog.retain(|m| m.actions.is_none());
+    }
 
     get_companion_config(app).await
 }

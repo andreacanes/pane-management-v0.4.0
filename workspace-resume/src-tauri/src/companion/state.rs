@@ -5,6 +5,8 @@ use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::time::Instant;
 
+use serde::Serialize;
+
 use base64::Engine;
 use rand::RngCore;
 use tauri::AppHandle;
@@ -12,7 +14,7 @@ use tauri_plugin_store::StoreExt;
 use tokio::sync::{broadcast, oneshot, RwLock};
 use uuid::Uuid;
 
-use super::models::{ApprovalDto, ApprovalResponse, EventDto, PaneDto, PaneState};
+use super::models::{AccountRateLimit, ApprovalDto, ApprovalResponse, EventDto, PaneDto, PaneState};
 
 /// Stored per pane: the public DTO plus internal bookkeeping.
 #[derive(Debug, Clone)]
@@ -48,9 +50,25 @@ pub struct PendingApproval {
     pub responder: oneshot::Sender<ApprovalResponse>,
 }
 
+/// A single ntfy action button (the JSON form of what the ntfy publish
+/// API accepts via the `X-Actions` header). Serialized as a JSON object
+/// inside the `actions` array on `NtfyMessage`.
+#[derive(Debug, Clone, Serialize)]
+pub struct NtfyAction {
+    pub action: String, // "http"
+    pub label: String,  // "Allow", "Deny"
+    pub url: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub method: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub headers: Option<HashMap<String, String>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub body: Option<String>,
+}
+
 /// An ntfy message we've published to the embedded endpoint. Retained
 /// briefly so late subscribers can catch up.
-#[derive(Debug, Clone, serde::Serialize)]
+#[derive(Debug, Clone, Serialize)]
 pub struct NtfyMessage {
     pub id: String,
     pub time: i64,
@@ -60,9 +78,10 @@ pub struct NtfyMessage {
     pub message: String,
     pub priority: u8,
     pub tags: Vec<String>,
-    /// Raw X-Actions header value, forwarded to clients verbatim.
+    /// Structured action buttons for the ntfy notification (e.g. Allow/Deny).
+    /// Serialized as a JSON array per the ntfy wire spec.
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub actions: Option<String>,
+    pub actions: Option<Vec<NtfyAction>>,
 }
 
 /// Cached project lookup table used by the tmux poller to attach a
@@ -96,6 +115,9 @@ pub struct AppState {
     /// deny — the flag sticks until the pane produces fresh output (user
     /// responded) or Claude exits. Cleared by the tmux poller.
     pub attention_panes: Arc<RwLock<HashSet<String>>>,
+    /// Per-account Anthropic rate limit data, populated by the
+    /// rate_limit_poller background task every 60 s.
+    pub rate_limits: Arc<RwLock<Vec<AccountRateLimit>>>,
 }
 
 impl AppState {
@@ -153,6 +175,7 @@ impl AppState {
             bind_addr: format!("{}:{}", super::BIND_ADDR, super::COMPANION_PORT),
             project_cache: Arc::new(RwLock::new(ProjectCache::default())),
             attention_panes: Arc::new(RwLock::new(HashSet::new())),
+            rate_limits: Arc::new(RwLock::new(Vec::new())),
         })
     }
 

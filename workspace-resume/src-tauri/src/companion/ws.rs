@@ -34,13 +34,12 @@ async fn client_loop(mut socket: WebSocket, state: AppState) {
     }
 
     // Send a synthetic "connected" event with timestamp for latency checks.
-    let _ = socket
-        .send(Message::Text(
-            serde_json::json!({"type":"hello","at": now_ms()})
-                .to_string()
-                .into(),
-        ))
-        .await;
+    {
+        let hello = EventDto::Hello { at: now_ms() };
+        if let Ok(s) = serde_json::to_string(&hello) {
+            let _ = socket.send(Message::Text(s.into())).await;
+        }
+    }
 
     loop {
         tokio::select! {

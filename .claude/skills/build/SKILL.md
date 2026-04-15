@@ -48,34 +48,51 @@ If multiple scopes are touched, build each narrow scope in parallel rather than 
 
 ## Full Tauri release build (produces .exe + MSI + NSIS)
 
-The exe is locked while running. Kill it first:
+**CRITICAL: Minimize companion downtime.** The running exe serves the mobile APK over Tailscale. Killing it before compiling means 3+ minutes of downtime. The strategy: compile everything while the old exe is still running, kill it only when the linker needs to write the output, then re-run to finish.
 
-```bash
-cmd.exe /c "taskkill /IM workspace-resume.exe /F" 2>/dev/null || true
-/home/andrea/pane-management/sync.sh && \
-  cmd.exe /c "cd /d C:\Users\Andrea\Desktop\Botting\pane-management-v0.4.0\workspace-resume && npm run tauri build"
-```
+1. **Sync + cargo check** (catches errors while old exe serves):
+   ```bash
+   /home/andrea/pane-management/sync.sh && \
+     cmd.exe /c "cd /d C:\Users\Andrea\Desktop\Botting\pane-management-v0.4.0\workspace-resume\src-tauri && cargo check"
+   ```
+   If this fails, fix the error — the old exe is still serving. Do NOT proceed.
 
-Launch the built exe from WSL:
+2. **Start the full Tauri build while the exe is still running** (compiles everything in release mode; will fail at the link step because the running exe is locked — that's expected):
+   ```bash
+   cmd.exe /c "cd /d C:\Users\Andrea\Desktop\Botting\pane-management-v0.4.0\workspace-resume && npm run tauri build" 2>&1 || true
+   ```
+   This caches all release-mode compilation. The error at the end (linker can't write locked exe) is expected and harmless.
 
-```bash
-cd /mnt/c/Users/Andrea && nohup \
-  "/mnt/c/Users/Andrea/Desktop/Botting/pane-management-v0.4.0/workspace-resume/src-tauri/target/x86_64-pc-windows-msvc/release/workspace-resume.exe" \
-  > /tmp/pm.log 2>&1 & disown
-```
+3. **Kill the old exe, then re-run the build** (all compilation is cached — only the link + package step runs, ~30s downtime):
+   ```bash
+   cmd.exe /c "taskkill /IM workspace-resume.exe /F" 2>/dev/null || true
+   cmd.exe /c "cd /d C:\Users\Andrea\Desktop\Botting\pane-management-v0.4.0\workspace-resume && npm run tauri build"
+   ```
+
+4. **Launch immediately after build completes:**
+   ```bash
+   cd /mnt/c/Users/Andrea && nohup \
+     "/mnt/c/Users/Andrea/Desktop/Botting/pane-management-v0.4.0/workspace-resume/src-tauri/target/x86_64-pc-windows-msvc/release/workspace-resume.exe" \
+     > /tmp/pm.log 2>&1 & disown
+   ```
+
+**Never kill the exe before step 3.** `cargo check` (step 1) validates code but runs in dev profile — it does NOT cache release artifacts. The real cache warming happens in step 2 where cargo compiles everything in release mode against the locked exe. Step 3's re-run hits all cached objects and only does the link, so downtime is ~30s instead of 3+ minutes.
 
 ## Android debug APK + install + launch
+
+ADB connects to the OnePlus 13 **wirelessly over Tailscale** (IP `100.83.163.105`, port 5555). Always `adb connect` before install — the connection drops when the phone sleeps.
 
 ```bash
 ADB=/mnt/c/Users/Andrea/AppData/Local/Android/Sdk/platform-tools/adb.exe
 
 /home/andrea/pane-management/sync.sh && \
   cmd.exe /c "cd /d C:\Users\Andrea\Desktop\Botting\pane-management-v0.4.0\pane-management-mobile && gradlew.bat assembleDebug" && \
+$ADB connect 100.83.163.105:5555 2>/dev/null && \
 $ADB install -r 'C:\Users\Andrea\Desktop\Botting\pane-management-v0.4.0\pane-management-mobile\app\build\outputs\apk\debug\app-debug.apk' && \
 $ADB shell am start -n com.andreacanes.panemgmt/.MainActivity
 ```
 
-If `adb` says "device not found", restart: `$ADB kill-server && $ADB start-server` and check the phone for the re-authorize prompt.
+If `adb` says "cannot connect", check Tailscale is running (`cmd.exe /c "tailscale status"`) and wireless debugging is enabled on the phone.
 
 Filter logcat by app PID only (SurfaceFlinger spam is noise):
 

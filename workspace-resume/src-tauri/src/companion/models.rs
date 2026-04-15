@@ -56,6 +56,13 @@ pub struct PaneDto {
     pub claude_account: Option<String>,
     /// Epoch milliseconds of last state/output change.
     pub updated_at: i64,
+    /// Epoch milliseconds of the last conversation message — derived from
+    /// the bound JSONL file's mtime, so it advances on real Claude turns
+    /// (assistant tokens, tool results, user input) but NOT on phone
+    /// capture views or state-only transitions. `None` for non-Claude
+    /// panes or when the JSONL doesn't exist yet.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_activity_at: Option<i64>,
 }
 
 // ---------------------------------------------------------------------------
@@ -156,6 +163,11 @@ pub enum EventDto {
         panes: Vec<PaneDto>,
         approvals: Vec<ApprovalDto>,
     },
+    /// Synthetic event sent on WebSocket connect after the snapshot.
+    /// Carries a timestamp so clients can estimate clock skew / latency.
+    Hello {
+        at: i64,
+    },
     PaneStateChanged {
         pane_id: String,
         old: PaneState,
@@ -198,6 +210,12 @@ pub enum EventDto {
         #[serde(skip_serializing_if = "Option::is_none")]
         claude_account: Option<String>,
     },
+    /// A tmux pane disappeared (window killed, session ended, etc.).
+    /// Emitted once per vanished pane so clients can remove cards.
+    PaneRemoved {
+        pane_id: String,
+        at: i64,
+    },
     SessionStarted {
         name: String,
         at: i64,
@@ -206,6 +224,35 @@ pub enum EventDto {
         name: String,
         at: i64,
     },
+}
+
+// ---------------------------------------------------------------------------
+// Conversation (JSONL session transcript)
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Clone, Serialize)]
+pub struct ConversationMessage {
+    pub uuid: String,
+    /// `"user"` or `"assistant"`
+    pub role: String,
+    /// Concatenated text content (tool_use / thinking blocks excluded).
+    pub text: String,
+    /// ISO 8601 timestamp from the JSONL record.
+    pub timestamp: String,
+    /// Tool name when this assistant turn contains a tool_use block.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tool_name: Option<String>,
+    /// Tool input JSON — e.g. Bash `command`, Edit `file_path`/`old_string`/
+    /// `new_string`, Read `file_path`. The client formats a human-readable
+    /// summary per tool. Only set when `tool_name` is set.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tool_input: Option<serde_json::Value>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct ConversationResponse {
+    pub session_id: String,
+    pub messages: Vec<ConversationMessage>,
 }
 
 // ---------------------------------------------------------------------------
@@ -252,6 +299,62 @@ pub struct CreateWindowRequest {
 pub struct CreateWindowResponse {
     pub window_index: u32,
     pub pane_id: String,
+}
+
+// ---------------------------------------------------------------------------
+// Pane lifecycle (split-window)
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Deserialize)]
+pub struct CreatePaneRequest {
+    /// Target pane id to split from, e.g. "main:3.1"
+    pub target_pane_id: String,
+    pub account: String, // "andrea" | "bravura"
+}
+
+#[derive(Debug, Serialize)]
+pub struct CreatePaneResponse {
+    pub pane_id: String,
+}
+
+// ---------------------------------------------------------------------------
+// Rate limits (per-account Anthropic API utilization)
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Clone, Serialize)]
+pub struct AccountRateLimit {
+    pub account: String,
+    pub label: String,
+    pub five_hour_pct: f64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub five_hour_resets_at: Option<i64>,
+    pub seven_day_pct: f64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub seven_day_resets_at: Option<i64>,
+}
+
+// ---------------------------------------------------------------------------
+// Image upload
+// ---------------------------------------------------------------------------
+
+fn default_media_type() -> String {
+    "image/png".to_string()
+}
+
+#[derive(Debug, Deserialize)]
+pub struct ImageItem {
+    pub image_base64: String,
+    #[serde(default = "default_media_type")]
+    pub media_type: String,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct ImageRequest {
+    /// One or more images to write to WSL and reference in the message.
+    pub images: Vec<ImageItem>,
+    /// Optional user prompt to pair with the images.
+    #[serde(default)]
+    pub prompt: Option<String>,
 }
 
 /// Helper: current epoch milliseconds.

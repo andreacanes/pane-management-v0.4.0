@@ -75,6 +75,16 @@ done
     account
 }
 
+/// Remove a shell PID from the account-detection cache so the next
+/// call to [`detect_claude_account`] re-walks `/proc`. Used by the
+/// poller when it notices Claude has exited from a pane — the same
+/// shell PID may later run a different account's Claude.
+pub fn invalidate_account_cache(shell_pid: &str) {
+    if let Ok(mut cache) = PID_ACCOUNT_CACHE.lock() {
+        cache.remove(shell_pid);
+    }
+}
+
 /// Run a tmux command via wsl.exe and return stdout as a String.
 /// Returns Ok(empty string) for "no server running" / "no sessions" (not an error).
 ///
@@ -114,6 +124,52 @@ pub async fn run_tmux_command_async(script: String) -> Result<String, String> {
     tokio::task::spawn_blocking(move || run_tmux_command(&script))
         .await
         .map_err(|e| format!("tmux join error: {}", e))?
+}
+
+/// Write binary data to a file on the WSL filesystem by piping through
+/// `wsl.exe -e bash -c "cat > '<path>'"`. The parent directory is created
+/// automatically. This is synchronous — call [`write_file_to_wsl_async`]
+/// from async contexts.
+pub fn write_file_to_wsl(path: &str, data: &[u8]) -> Result<(), String> {
+    let path_esc = path.replace('\'', r"'\''");
+    let script = format!(
+        "mkdir -p \"$(dirname '{}')\" && cat > '{}'",
+        path_esc, path_esc,
+    );
+    let mut cmd = std::process::Command::new("wsl.exe");
+    cmd.args(["-e", "bash", "-c", &script]);
+    cmd.stdin(std::process::Stdio::piped());
+    cmd.stdout(std::process::Stdio::null());
+    cmd.stderr(std::process::Stdio::null());
+
+    #[cfg(windows)]
+    cmd.creation_flags(0x08000000); // CREATE_NO_WINDOW
+
+    let mut child = cmd.spawn().map_err(|e| format!("spawn wsl: {}", e))?;
+    {
+        use std::io::Write;
+        let stdin = child
+            .stdin
+            .as_mut()
+            .ok_or_else(|| "no stdin handle".to_string())?;
+        stdin
+            .write_all(data)
+            .map_err(|e| format!("stdin write: {}", e))?;
+    }
+    drop(child.stdin.take());
+
+    let status = child.wait().map_err(|e| format!("wait: {}", e))?;
+    if !status.success() {
+        return Err(format!("wsl write_file exited {}", status));
+    }
+    Ok(())
+}
+
+/// Async wrapper for [`write_file_to_wsl`].
+pub async fn write_file_to_wsl_async(path: String, data: Vec<u8>) -> Result<(), String> {
+    tokio::task::spawn_blocking(move || write_file_to_wsl(&path, &data))
+        .await
+        .map_err(|e| format!("join: {}", e))?
 }
 
 /// Parse a pipe-delimited session line into a TmuxSession.

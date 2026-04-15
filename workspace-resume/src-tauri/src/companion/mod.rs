@@ -20,17 +20,19 @@
 //!   app can subscribe for lock-screen push notifications
 //! - `tmux_poller` — 2s loop scraping tmux state into `AppState.panes`
 
+pub mod accounts;
 pub mod auth;
 pub mod error;
 pub mod hook_sink;
 pub mod http;
 pub mod models;
 pub mod ntfy_server;
+pub mod rate_limit_poller;
 pub mod state;
 pub mod tmux_poller;
 pub mod ws;
 
-use tauri::AppHandle;
+use tauri::{AppHandle, Manager};
 
 pub const COMPANION_PORT: u16 = 8833;
 pub const BIND_ADDR: &str = "0.0.0.0";
@@ -48,6 +50,9 @@ pub async fn spawn(app: AppHandle) -> anyhow::Result<()> {
         .try_init();
 
     let state = state::AppState::load_or_init(&app).await?;
+    // Register as Tauri managed state so commands (e.g. rotate_companion_token)
+    // can reach the runtime bearer and ntfy backlog.
+    app.manage(state.clone());
     let bind = format!("{}:{}", BIND_ADDR, COMPANION_PORT);
     tracing::info!(%bind, "starting companion service");
 
@@ -55,6 +60,11 @@ pub async fn spawn(app: AppHandle) -> anyhow::Result<()> {
     let poller_state = state.clone();
     tokio::spawn(async move {
         tmux_poller::run(poller_state).await;
+    });
+
+    let rl_state = state.clone();
+    tokio::spawn(async move {
+        rate_limit_poller::run(rl_state).await;
     });
 
     // Serve HTTP

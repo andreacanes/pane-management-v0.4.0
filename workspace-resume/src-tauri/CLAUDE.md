@@ -86,7 +86,7 @@ Every `std::process::Command` — especially `wsl.exe`, `powershell.exe`, `taskk
 
 `companion/http.rs::router` has three sub-routers plus ntfy. Adding an endpoint is a rule (`.claude/rules/companion-endpoints.md`); pick the right one:
 
-- `api_auth` (bearer via `bearer_mw`) — `/sessions`, `/panes`, `/panes/{id}/{capture,input,voice,cancel}`, `/approvals`, `/approvals/{id}`, `/usage`, `/usage/projects/{encoded_name}`, `/events` (WS)
+- `api_auth` (bearer via `bearer_mw`) — `/sessions`, `/panes`, `/panes/{id}/{capture,input,voice,image,cancel}`, `/approvals`, `/approvals/{id}`, `/usage`, `/usage/projects/{encoded_name}`, `/events` (WS)
 - `api_public` — `/api/v1/health` only
 - `api_hooks` (shared secret via `hook_secret_mw`) — `/api/v1/hooks/notification` only
 - ntfy mounted at root: `/{topic}` (POST) and `/{topic}/json` (GET SSE)
