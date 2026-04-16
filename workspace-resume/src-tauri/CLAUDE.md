@@ -61,7 +61,9 @@ src/
 │   ├── state.rs                  AppState, PaneRecord, PendingApproval, NtfyMessage, load_or_init
 │   ├── auth.rs                   bearer_mw (Authorization header OR ?token= query), hook_secret_mw (X-Hook-Secret)
 │   ├── models.rs                 PaneDto / SessionDto / ApprovalDto / EventDto (tagged union) + PaneState enum
+│   ├── accounts.rs               Andrea/Bravura account registry — canonical source for the account-key mirror
 │   ├── tmux_poller.rs            2s loop; SHA-256 hash diff over capture-pane -p -t <id> -S -5
+│   ├── rate_limit_poller.rs      15s loop; reads %APPDATA%\ClaudeCodeUsageMonitor\usage_cache.json
 │   ├── hook_sink.rs              Claude Code notification hook park-and-wait on oneshot (120s TTL)
 │   ├── ntfy_server.rs            embedded ntfy wire: POST /:topic, GET /:topic/json SSE
 │   ├── ws.rs                     WebSocket upgrade + snapshot-on-connect + broadcast fanout
@@ -127,6 +129,10 @@ Generated on first launch in `companion::state::load_or_init` via `rand::thread_
 ## Known upstream test failures
 
 `src/services/path_decoder.rs:42` `test_extract_cwd_from_valid_jsonl` and `src/services/terminal/warp.rs:216` `test_build_uri_simple_path` hardcode `Sky` (upstream's username). They are not ours — do not "fix" them without explicit approval.
+
+## Accounts
+
+`companion/accounts.rs` is the single source of truth for account keys (`"andrea"` / `"bravura"`) — identity detection, labels, and colours. Any new account requires mirrored updates on the Kotlin side (`Dtos.kt`, `ui/theme/StatusColors.kt`, grid enum) and the TS side (`src/lib/account.ts`). See `.claude/rules/account-key-mirror.md`.
 
 ## DTO serde conventions
 

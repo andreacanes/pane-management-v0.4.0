@@ -12,6 +12,7 @@ src/
 │   ├── tauri-commands.ts              invoke() wrappers (one per Rust command)
 │   ├── types.ts                       DTO interfaces with snake_case fields
 │   ├── launch.ts                      launchToPane / newSessionInPane
+│   ├── account.ts                     Andrea/Bravura label + colour lookup (mirrors src-tauri accounts.rs)
 │   ├── path.ts, store-keys.ts, time.ts
 │   └── solid-dnd.d.ts
 ├── contexts/AppContext.tsx            743 lines — global store, polling, refresh authority
@@ -41,15 +42,23 @@ src/
 
 - `createSignal` for local state — signals are called as functions (`editing()`)
 - `createStore` + `produce` + `reconcile` for global state in `AppContext` — store fields are accessed as properties (`state.projects`)
+- `reconcile` calls for project arrays MUST pass `{ key: "encoded_name" }` (e.g. `AppContext.tsx:161`). Naive `setState` regresses `getProjectUsage` perf because the store loses stable identity and refetches per card
 - `createResource` for async derived data
 - Mutation flow: component → wrapper from `tauri-commands.ts` → refresh via `useApp()` (`refreshProjects`/`refreshTmuxState`). Components never re-fetch directly
 - Error idiom: `catch (e) { setError(e instanceof Error ? e.message : String(e)) }` + `<Show when={error()}>`
+- Error-log convention: `console.error("[<Component>] <action> error:", e)` with the bracketed component prefix (12 call sites)
+- Usage data is expensive — never `await getProjectUsage` on a hot path (poll / render). Let `AppContext` own the cadence
 
 ## Styling
 
 - Plain CSS class strings only. No CSS modules, no styled-components, no `clsx`/`cn` helpers
 - Inline `style={}` only for one-off dynamic values
 - Tailwind v4 config is in-CSS, not `tailwind.config.js`
+- Lucide icons are re-exported through `components/ui/icons.ts` — import from there, never from `lucide-solid` directly
+
+## Account labels
+
+Account-key literals `"andrea"` / `"bravura"` in UI code must read through `lib/account.ts` (label, colour, badge). The canonical registry is Rust-side in `workspace-resume/src-tauri/src/companion/accounts.rs`. See `.claude/rules/account-key-mirror.md`.
 
 ## Logging
 
