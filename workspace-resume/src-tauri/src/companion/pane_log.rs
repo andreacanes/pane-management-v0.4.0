@@ -130,7 +130,21 @@ pub fn replay_to_lines(bytes: &[u8]) -> Vec<String> {
     if bytes.is_empty() {
         return Vec::new();
     }
-    let text = String::from_utf8_lossy(bytes);
+    let mut text = String::from_utf8_lossy(bytes).into_owned();
+    // Strip alternate-screen-buffer toggles BEFORE feeding to avt.
+    // Claude Code uses `\e[?1049h` to switch to a fresh buffer with no
+    // scrollback (vim/less/top do the same). avt honors this and routes
+    // all subsequent writes to the alt-screen, where they get overwritten
+    // in place with no history retained — collapsing 2MB of log into ~40
+    // visible rows of partially-corrupted in-progress redraws.
+    //
+    // tmux on desktop has `setw -g alternate-screen off` and ignores these
+    // sequences. We do the equivalent by stripping the toggle bytes so all
+    // of Claude's output lands on the main screen and scrolls naturally
+    // into avt's scrollback buffer. Also strip the older 1047/47 variants.
+    for seq in &["\x1b[?1049h", "\x1b[?1049l", "\x1b[?1047h", "\x1b[?1047l", "\x1b[?47h", "\x1b[?47l"] {
+        text = text.replace(seq, "");
+    }
     let mut vt = avt::Vt::builder()
         .size(REPLAY_COLS, REPLAY_ROWS)
         .scrollback_limit(REPLAY_SCROLLBACK)
