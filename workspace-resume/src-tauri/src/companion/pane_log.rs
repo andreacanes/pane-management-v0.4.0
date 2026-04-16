@@ -168,16 +168,39 @@ pub fn replay_to_lines(bytes: &[u8]) -> Vec<String> {
     // periodically are left untouched.
     let home_count = text.matches("\x1b[H").count();
     let clear_count = text.matches("\x1b[2J").count() + text.matches("\x1b[3J").count();
-    // Zero clears = the new cell-diff renderer running unattenuated. Any
-    // clears at all (e.g. from `/clear`, session transitions, or older
-    // binaries) let avt recover natural scrollback and we leave the log
-    // alone. Keeps the ncld / older-Claude case unaffected.
-    let is_cell_diff_mode = home_count > 20 && clear_count == 0;
+    // Cell-diff mode emits roughly zero clears per thousand redraws; a
+    // normal older-Claude session or `/clear`-driven log runs closer to 1
+    // clear per few hundred. 500:1 separates them cleanly. Above that ratio
+    // we truncate to the last substantial frame; below it we let avt replay
+    // the full log so natural scrollback is preserved.
+    let is_cell_diff_mode = home_count > 20 && clear_count.saturating_mul(500) < home_count;
     if is_cell_diff_mode {
-        if let Some(last_home) = text.rfind("\x1b[H") {
-            let mut fresh = String::with_capacity(text.len() - last_home + 8);
+        // Claude's spinner animation is its own `\e[H`-prefixed "frame": it
+        // emits ~30-100 bytes (home + cursor-to-row-51 + one glyph + back to
+        // input line) dozens of times per second while thinking. The naive
+        // `text.rfind("\x1b[H")` lands on one of these spinner ticks, and
+        // avt then renders an empty viewport with just the spinner char.
+        //
+        // Walk backward through every `\e[H` and pick the last one whose
+        // frame body (the bytes up to the next `\e[H` or EOF) is large
+        // enough to be an actual content redraw, not a spinner tick.
+        // 1 KB is the empirical threshold — real frames in the wild are
+        // 8-12 KB, spinner frames are < 200 bytes.
+        const MIN_FRAME_BYTES: usize = 1024;
+        let positions: Vec<usize> = text.match_indices("\x1b[H").map(|(i, _)| i).collect();
+        let mut chosen: Option<usize> = None;
+        for i in (0..positions.len()).rev() {
+            let start = positions[i];
+            let end = positions.get(i + 1).copied().unwrap_or(text.len());
+            if end - start >= MIN_FRAME_BYTES {
+                chosen = Some(start);
+                break;
+            }
+        }
+        if let Some(start) = chosen {
+            let mut fresh = String::with_capacity(text.len() - start + 8);
             fresh.push_str("\x1b[2J\x1b[H");
-            fresh.push_str(&text[last_home..]);
+            fresh.push_str(&text[start..]);
             text = fresh;
         }
     }
