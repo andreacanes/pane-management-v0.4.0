@@ -36,10 +36,13 @@ pub const MAX_LOG_SIZE: u64 = 20 * 1024 * 1024; // 20MB
 pub const TRUNCATE_TO: u64 = 10 * 1024 * 1024; // 10MB
 
 /// Default tail size returned by `/capture` when a log file exists.
-/// Raw bytes before VT replay — replay compresses redraws into a final
-/// rendered grid, so the actual line count returned to the client is
-/// typically 10-100× fewer than the raw byte count suggests.
-pub const DEFAULT_TAIL_BYTES: u64 = 2 * 1024 * 1024; // 2MB
+/// In cell-diff mode (Claude 2.1.110+) avt needs to see the log from
+/// Claude's first full-draw frame onward to build correct cell state;
+/// starting mid-conversation leaves cells blank that Claude's diffs
+/// never rewrote, producing sparse/garbled output at the top of the
+/// rendered viewport. Match the log rotation cap so we always feed
+/// avt the full retained history.
+pub const DEFAULT_TAIL_BYTES: u64 = MAX_LOG_SIZE;
 
 /// Virtual terminal grid dimensions used for replay. Must be >= the widest
 /// pane we'll render, or content wraps differently than it did on the real
@@ -147,63 +150,28 @@ pub fn replay_to_lines(bytes: &[u8]) -> Vec<String> {
     }
 
     // Claude Code 2.1.110 rewrote the TUI renderer to emit **cell-diff**
-    // updates on the main screen — it writes only cells whose content has
+    // updates on the main screen: it writes only cells whose content has
     // changed since the previous frame, with no periodic `\e[2J` clears.
-    // (See the 2.1.110 changelog "/tui fullscreen" entry: full-redraw is now
-    // opt-in, default is diff. 2.1.111 then added Ctrl+L as a manual force-
-    // redraw escape hatch — confirming no automatic full clear ever fires.)
+    // (See the 2.1.110 changelog "/tui fullscreen" entry: full-redraw is
+    // opt-in, default is diff. 2.1.111 added Ctrl+L as a manual force-
+    // redraw escape hatch, confirming no automatic full clear ever fires.)
     //
-    // The diff renderer assumes the terminal preserves the previous frame's
-    // state so unwritten cells retain their old glyphs. That's valid on a
-    // real terminal where cells are sticky, but breaks here: avt replays
-    // thousands of partial frames and cells Claude silently skips keep
-    // residue from unrelated earlier frames. "replace" renders as "repl─ce"
-    // because cell 4 was skipped by this frame's diff but held '─' from an
-    // older horizontal bar at that position.
+    // The diff stream is self-consistent from Claude's first full draw
+    // onward — each subsequent frame writes only the cells that differ
+    // from the previous, and those differences land on a terminal whose
+    // cell state already matches Claude's model. Our replay works the
+    // same way: avt starts blank, the first frame in the tail writes its
+    // cells, and subsequent frames' diffs accumulate on top. The only
+    // precondition is that the tail is aligned to a frame boundary; a
+    // mid-frame start leaves avt with a partial escape sequence and
+    // corrupts the first render. `read_tail_bytes` snaps to `\e[H` for
+    // exactly this reason.
     //
-    // Detect cell-diff mode by its fingerprint — many `\e[H` redraws with
-    // zero or near-zero `\e[2J` — and reset avt to a clean viewport right
-    // before the last frame so it renders without accumulated residue. Logs
-    // from older Claude builds (our `ncld` patches) that still emit clears
-    // periodically are left untouched.
-    let home_count = text.matches("\x1b[H").count();
-    let clear_count = text.matches("\x1b[2J").count() + text.matches("\x1b[3J").count();
-    // Cell-diff mode emits roughly zero clears per thousand redraws; a
-    // normal older-Claude session or `/clear`-driven log runs closer to 1
-    // clear per few hundred. 500:1 separates them cleanly. Above that ratio
-    // we truncate to the last substantial frame; below it we let avt replay
-    // the full log so natural scrollback is preserved.
-    let is_cell_diff_mode = home_count > 20 && clear_count.saturating_mul(500) < home_count;
-    if is_cell_diff_mode {
-        // Claude's spinner animation is its own `\e[H`-prefixed "frame": it
-        // emits ~30-100 bytes (home + cursor-to-row-51 + one glyph + back to
-        // input line) dozens of times per second while thinking. The naive
-        // `text.rfind("\x1b[H")` lands on one of these spinner ticks, and
-        // avt then renders an empty viewport with just the spinner char.
-        //
-        // Walk backward through every `\e[H` and pick the last one whose
-        // frame body (the bytes up to the next `\e[H` or EOF) is large
-        // enough to be an actual content redraw, not a spinner tick.
-        // 1 KB is the empirical threshold — real frames in the wild are
-        // 8-12 KB, spinner frames are < 200 bytes.
-        const MIN_FRAME_BYTES: usize = 1024;
-        let positions: Vec<usize> = text.match_indices("\x1b[H").map(|(i, _)| i).collect();
-        let mut chosen: Option<usize> = None;
-        for i in (0..positions.len()).rev() {
-            let start = positions[i];
-            let end = positions.get(i + 1).copied().unwrap_or(text.len());
-            if end - start >= MIN_FRAME_BYTES {
-                chosen = Some(start);
-                break;
-            }
-        }
-        if let Some(start) = chosen {
-            let mut fresh = String::with_capacity(text.len() - start + 8);
-            fresh.push_str("\x1b[2J\x1b[H");
-            fresh.push_str(&text[start..]);
-            text = fresh;
-        }
-    }
+    // Earlier iterations of this function truncated to the last `\e[H`
+    // frame + an injected `\e[2J`. That worked when the whole log was
+    // garbled (feeding less garbage produces less garbage) but masked
+    // the real bug: the tail was mis-aligned. With `\e[H`-aligned tails
+    // avt's full-log replay is clean, so we feed the bytes as-is.
 
     let mut vt = avt::Vt::builder()
         .size(REPLAY_COLS, REPLAY_ROWS)
@@ -211,23 +179,21 @@ pub fn replay_to_lines(bytes: &[u8]) -> Vec<String> {
         .build();
     let _ = vt.feed_str(&text);
 
-    // Merge continuation rows: when a VT row's last meaningful cell is at
-    // column REPLAY_COLS - 1, it's (almost certainly) a wrap from the
-    // previous logical line, not a newline. Join it onto the previous
-    // entry so the Android client's text wrapper can re-wrap at its own
-    // width without producing awkward mid-word breaks like `is a\nctive`.
+    // Merge continuation rows. When Claude writes a line longer than the
+    // viewport width (200 cols here), avt wraps it across two rows — the
+    // first row fills to col 199, the second starts at col 0 with the rest
+    // of the same logical line. Android's text wrapper handles the final
+    // re-wrap at its own width; we just need to rejoin the two rows.
     //
-    // avt 0.17 has a private `wrapped` bit but no public accessor, so we
-    // use the heuristic instead of forking. False positives (a row with a
-    // genuine newline where the last char happens to be at col 199) are
-    // rare in Claude Code output.
+    // Because we feed the full log (including Claude's initial full-draw
+    // frame) the avt state matches Claude's model at the end — cells at
+    // col 199 have content only when Claude actually wrapped there, so
+    // this heuristic no longer fires on residue.
     let mut out: Vec<String> = Vec::new();
     let mut prev_was_full = false;
     for line in vt.lines() {
         let (rendered, is_full) = line_to_ansi_with_fullness(line);
         if prev_was_full && !out.is_empty() {
-            // Append in-place. Both previous and current end with \x1b[0m
-            // (if they had styling) so joining is safe.
             out.last_mut().unwrap().push_str(&rendered);
         } else {
             out.push(rendered);
@@ -379,12 +345,26 @@ pub fn read_tail_bytes(path: &Path, max_bytes: u64) -> std::io::Result<Vec<u8>> 
     file.seek(SeekFrom::Start(start))?;
     let mut buf = Vec::with_capacity(max_bytes.min(total) as usize);
     file.read_to_end(&mut buf)?;
+    // Snap the tail start to a Claude frame boundary (`\e[H`), not a `\n`.
+    // Cell-diff mode rarely emits literal `\n` inside a redraw, so an `\n`
+    // snap lands mid-frame and avt processes a partial escape sequence —
+    // cursor state is indeterminate, cells at the top of the render drift.
+    // `\e[H` is Claude's "begin redraw" marker; snapping there aligns avt
+    // with a natural reset point.
     if start > 0 {
-        if let Some(nl) = buf.iter().position(|&b| b == b'\n') {
+        if let Some(pos) = find_subsequence(&buf, b"\x1b[H") {
+            buf.drain(..pos);
+        } else if let Some(nl) = buf.iter().position(|&b| b == b'\n') {
             buf.drain(..=nl);
         }
     }
     Ok(buf)
+}
+
+fn find_subsequence(haystack: &[u8], needle: &[u8]) -> Option<usize> {
+    haystack
+        .windows(needle.len())
+        .position(|window| window == needle)
 }
 
 /// Rotate the log file if it exceeds MAX_LOG_SIZE. Keeps the last TRUNCATE_TO
