@@ -130,8 +130,12 @@ export function PaneSlot(props: { pane: TmuxPane; assignment?: string | null }) 
     const sess = state.selectedTmuxSession;
     const winIdx = state.selectedTmuxWindow;
     if (!sess || winIdx == null) return;
-    const paneId = `${sess}:${winIdx}.${props.pane.pane_index}`;
-    try { await killPane(paneId); refreshTmuxState(); } catch {}
+    try {
+      await killPane(sess, winIdx, props.pane.pane_index);
+      refreshTmuxState();
+    } catch (e) {
+      console.error("[PaneSlot] killPane error:", e);
+    }
   }
 
   async function handleOpenDir() {
