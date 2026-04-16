@@ -145,6 +145,34 @@ pub fn replay_to_lines(bytes: &[u8]) -> Vec<String> {
     for seq in &["\x1b[?1049h", "\x1b[?1049l", "\x1b[?1047h", "\x1b[?1047l", "\x1b[?47h", "\x1b[?47l"] {
         text = text.replace(seq, "");
     }
+
+    // Some Claude builds (e.g. the patched `cld` in the claude-patching repo)
+    // do diff-based redraws with `\e[H` + cell writes but NEVER emit `\e[2J`
+    // to clear the viewport between frames. Claude's diff logic assumes cells
+    // it doesn't explicitly overwrite still contain the previous frame's
+    // content — which on alt-screen would be true, but we've stripped that.
+    // Result: avt's cells accumulate residue across thousands of redraws,
+    // producing rendered output with smeared-together fragments from multiple
+    // frames ("replace" rendered as "repl─ce" because 'a' was overwritten by
+    // '─' from an earlier horizontal bar at the same cell).
+    //
+    // Detect this pattern — no `\e[2J` anywhere in the log but multiple
+    // `\e[H` redraws — and truncate to just the last frame so it renders on a
+    // clean viewport. We inject `\e[2J\e[H` before the last frame to ensure
+    // avt's viewport is wiped. Logs that DO emit `\e[2J` periodically (our
+    // current-chat pattern) are left untouched.
+    if !text.contains("\x1b[2J") {
+        let home_count = text.matches("\x1b[H").count();
+        if home_count > 3 {
+            if let Some(last_home) = text.rfind("\x1b[H") {
+                let mut fresh = String::with_capacity(text.len() - last_home + 8);
+                fresh.push_str("\x1b[2J\x1b[H");
+                fresh.push_str(&text[last_home..]);
+                text = fresh;
+            }
+        }
+    }
+
     let mut vt = avt::Vt::builder()
         .size(REPLAY_COLS, REPLAY_ROWS)
         .scrollback_limit(REPLAY_SCROLLBACK)
