@@ -33,6 +33,12 @@ pub struct PaneRecord {
     /// we've read `/proc/<child_pid>/environ`. Caches forever per pane
     /// record — re-detection only happens on a fresh pane record.
     pub claude_account: Option<String>,
+    /// tmux's stable pane id from `#{pane_id}` (the `%N` form), `%`-stripped
+    /// so it's filesystem-safe. Stable for the life of the pane within a
+    /// tmux server — survives renumber-windows and pane/window reshuffling.
+    /// Empty when we haven't seen the pane yet. Used as the `pending/` log
+    /// filename before a claude_session_id is detected.
+    pub pane_uid: String,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
@@ -84,6 +90,24 @@ pub struct NtfyMessage {
     /// Serialized as a JSON array per the ntfy wire spec.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub actions: Option<Vec<NtfyAction>>,
+    /// Pane this notification is about (backlog bookkeeping, not on wire).
+    #[serde(skip)]
+    pub pane_id: Option<String>,
+    /// Epoch seconds when this notification was resolved/superseded.
+    /// Backlog replay skips messages where this is set. Not on the wire.
+    #[serde(skip)]
+    pub resolved_at: Option<i64>,
+}
+
+/// Metadata for an active attention event, stored alongside
+/// `attention_panes` so the WebSocket snapshot can replay the
+/// full notification (not just the pane-id) on client reconnect.
+#[derive(Debug, Clone)]
+pub struct AttentionDetail {
+    pub title: String,
+    pub message: String,
+    pub kind: String,
+    pub at: i64,
 }
 
 /// Cached project lookup table used by the tmux poller to attach a
@@ -119,9 +143,20 @@ pub struct AppState {
     /// sticks until the pane produces fresh output (user responded) or
     /// Claude exits. Cleared by the tmux poller.
     pub attention_panes: Arc<RwLock<HashMap<String, WaitingReason>>>,
+    /// Per-pane epoch ms of the last attention notification dispatch.
+    /// Enforces a minimum cooldown between notifications for the same
+    /// pane: 15 s for "input" kind, 60 s for "info" (Stop) kind.
+    pub last_attention_notif: Arc<RwLock<HashMap<String, i64>>>,
+    /// Cached attention event metadata per pane, needed for snapshot
+    /// replay so reconnecting clients can re-fire active notifications.
+    pub attention_details: Arc<RwLock<HashMap<String, AttentionDetail>>>,
     /// Per-account Anthropic rate limit data, populated by the
     /// rate_limit_poller background task every 60 s.
     pub rate_limits: Arc<RwLock<Vec<AccountRateLimit>>>,
+    /// Structured audit log for notification decisions.
+    pub audit: Option<Arc<super::audit_log::AuditLog>>,
+    /// App data directory (Windows), used by the audit endpoint to read logs.
+    pub audit_data_dir: Option<std::path::PathBuf>,
 }
 
 impl AppState {
@@ -179,7 +214,11 @@ impl AppState {
             bind_addr: format!("{}:{}", super::BIND_ADDR, super::COMPANION_PORT),
             project_cache: Arc::new(RwLock::new(ProjectCache::default())),
             attention_panes: Arc::new(RwLock::new(HashMap::new())),
+            last_attention_notif: Arc::new(RwLock::new(HashMap::new())),
+            attention_details: Arc::new(RwLock::new(HashMap::new())),
             rate_limits: Arc::new(RwLock::new(Vec::new())),
+            audit: None,
+            audit_data_dir: None,
         })
     }
 
@@ -225,6 +264,12 @@ impl AppState {
                     });
                 }
             }
+        }
+    }
+
+    pub fn audit_log(&self, event: super::audit_log::AuditEvent) {
+        if let Some(audit) = &self.audit {
+            audit.log(event);
         }
     }
 }

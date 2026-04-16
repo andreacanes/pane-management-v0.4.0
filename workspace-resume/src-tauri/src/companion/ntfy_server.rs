@@ -83,6 +83,8 @@ pub async fn publish(
         priority,
         tags,
         actions,
+        pane_id: None,
+        resolved_at: None,
     };
 
     // Append to backlog + drop oldest past max
@@ -111,7 +113,18 @@ pub async fn subscribe_sse(
     }
 
     let rx = state.ntfy_events.subscribe();
-    let backlog_snapshot: Vec<NtfyMessage> = state.ntfy_backlog.read().await.clone();
+    // Filter backlog: skip resolved messages and anything older than 5 min.
+    // Prevents stale approval/attention notifications from replaying when
+    // the ntfy app reconnects after a network drop.
+    let cutoff = chrono::Utc::now().timestamp() - 300;
+    let backlog_snapshot: Vec<NtfyMessage> = state
+        .ntfy_backlog
+        .read()
+        .await
+        .iter()
+        .filter(|m| m.resolved_at.is_none() && m.time > cutoff)
+        .cloned()
+        .collect();
 
     // First emit an open-event, then the backlog, then live messages.
     let open_evt = serde_json::json!({

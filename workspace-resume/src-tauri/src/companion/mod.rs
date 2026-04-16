@@ -25,17 +25,20 @@
 //! - `tmux_poller` — 2s loop scraping tmux state into `AppState.panes`
 
 pub mod accounts;
+pub mod audit_log;
 pub mod auth;
 pub mod error;
 pub mod hook_sink;
 pub mod http;
 pub mod models;
 pub mod ntfy_server;
+pub mod pane_log;
 pub mod rate_limit_poller;
 pub mod state;
 pub mod tmux_poller;
 pub mod ws;
 
+use std::sync::Arc;
 use tauri::{AppHandle, Manager};
 
 pub const COMPANION_PORT: u16 = 8833;
@@ -53,7 +56,42 @@ pub async fn spawn(app: AppHandle) -> anyhow::Result<()> {
         )
         .try_init();
 
-    let state = state::AppState::load_or_init(&app).await?;
+    let mut state = state::AppState::load_or_init(&app).await?;
+
+    // Ensure the pane-log directory exists. pipe-pane on each Claude pane
+    // will write its raw terminal stream here; `/capture` reads from these
+    // files as an authoritative "full history" source that survives
+    // Claude Code's periodic `\x1b[3J` (erase scrollback) redraws.
+    if let Err(e) = pane_log::ensure_log_dir() {
+        tracing::warn!("failed to create pane-log dir: {e} — falling back to capture-pane only");
+    }
+
+    // Close any pipe-panes that may be attached from a prior companion
+    // process — their target paths may be stale (old naming scheme) and we
+    // want the poll loop to re-attach using the current session-keyed
+    // scheme. Safe no-op if no pipes are currently active.
+    //
+    // We do NOT close pipes that THIS process already set up (first boot
+    // per tmux server), but on every companion restart the pipes set up by
+    // the previous companion need to be redirected.
+    let close_all_pipes = "tmux list-panes -a -F '#{pane_id}' 2>/dev/null \
+        | xargs -I{} tmux pipe-pane -t {} 2>/dev/null; true";
+    if let Err(e) =
+        crate::commands::tmux::run_tmux_command_async(close_all_pipes.to_string()).await
+    {
+        tracing::debug!("pre-boot pipe cleanup failed: {e}");
+    }
+
+    // Spin up the notification audit log writer. Use the Roaming AppData
+    // directory (same as the Tauri store) since app_data_dir() may resolve
+    // to Local or require the path plugin.
+    let audit_dir = std::path::PathBuf::from(r"C:\Users\Andrea\AppData\Roaming\com.pane-management.app");
+    if audit_dir.exists() {
+        let audit = audit_log::AuditLog::spawn(audit_dir.clone());
+        state.audit = Some(Arc::new(audit));
+        state.audit_data_dir = Some(audit_dir);
+    }
+
     // Register as Tauri managed state so commands (e.g. rotate_companion_token)
     // can reach the runtime bearer and ntfy backlog.
     app.manage(state.clone());

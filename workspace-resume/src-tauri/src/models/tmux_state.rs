@@ -41,6 +41,17 @@ pub struct TmuxPane {
     /// Claude or detection hasn't completed yet.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub claude_account: Option<String>,
+    /// Window index this pane belongs to — stamped by the caller since
+    /// the per-window list_tmux_panes format string omits it.
+    #[serde(default)]
+    pub window_index: u32,
+    /// Short git branch name at current_path. Populated via
+    /// services::git::probe_many; None when the cwd isn't a git repo.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub git_branch: Option<String>,
+    /// True when current_path is a linked (non-primary) git worktree.
+    #[serde(default)]
+    pub is_worktree: bool,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -113,6 +124,9 @@ mod tests {
             start_command: String::new(),
             pane_pid: String::new(),
             claude_account: None,
+            window_index: 0,
+            git_branch: None,
+            is_worktree: false,
         };
         let json = serde_json::to_string(&pane).unwrap();
         assert!(json.contains("\"pane_id\":\"%5\""));
@@ -149,6 +163,9 @@ mod tests {
                 start_command: String::new(),
                 pane_pid: String::new(),
                 claude_account: None,
+                window_index: 0,
+                git_branch: None,
+                is_worktree: false,
             }],
         };
         let json = serde_json::to_string(&state).unwrap();

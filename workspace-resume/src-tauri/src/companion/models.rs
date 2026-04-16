@@ -178,6 +178,19 @@ pub struct CaptureResponse {
 }
 
 // ---------------------------------------------------------------------------
+// Attention snapshot (for WebSocket reconnect replay)
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AttentionSnapshotDto {
+    pub pane_id: String,
+    pub title: String,
+    pub message: String,
+    pub kind: String,
+    pub at: i64,
+}
+
+// ---------------------------------------------------------------------------
 // WebSocket / SSE events
 // ---------------------------------------------------------------------------
 
@@ -187,6 +200,8 @@ pub enum EventDto {
     Snapshot {
         panes: Vec<PaneDto>,
         approvals: Vec<ApprovalDto>,
+        #[serde(skip_serializing_if = "Vec::is_empty")]
+        attention: Vec<AttentionSnapshotDto>,
     },
     /// Synthetic event sent on WebSocket connect after the snapshot.
     /// Carries a timestamp so clients can estimate clock skew / latency.
@@ -258,9 +273,9 @@ pub enum EventDto {
 #[derive(Debug, Clone, Serialize)]
 pub struct ConversationMessage {
     pub uuid: String,
-    /// `"user"` or `"assistant"`
+    /// `"user"`, `"assistant"`, or `"tool_result"`
     pub role: String,
-    /// Concatenated text content (tool_use / thinking blocks excluded).
+    /// Concatenated text content (tool_use blocks excluded).
     pub text: String,
     /// ISO 8601 timestamp from the JSONL record.
     pub timestamp: String,
@@ -272,6 +287,19 @@ pub struct ConversationMessage {
     /// summary per tool. Only set when `tool_name` is set.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub tool_input: Option<serde_json::Value>,
+    /// Thinking block text from the assistant turn.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub thinking: Option<String>,
+    /// Tool result content — the actual output of a tool call.
+    /// Truncated server-side to `MAX_TOOL_RESULT_CHARS`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tool_result: Option<String>,
+    /// True when `tool_result` was truncated to fit the wire budget.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tool_result_truncated: Option<bool>,
+    /// True when the tool call errored (`is_error` in the JSONL).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tool_result_error: Option<bool>,
 }
 
 #[derive(Debug, Clone, Serialize)]

@@ -7,11 +7,12 @@ use std::time::{Duration, Instant};
 use sha2::{Digest, Sha256};
 
 use super::{
+    audit_log::AuditEvent,
     models::{now_ms, EventDto, PaneDto, PaneState, WaitingReason},
     state::{AppState, BindingConfidence, PaneRecord},
 };
 
-const POLL_INTERVAL: Duration = Duration::from_secs(2);
+const POLL_INTERVAL: Duration = Duration::from_millis(1000);
 const IDLE_TIMEOUT: Duration = Duration::from_secs(3);
 const PROJECT_CACHE_TTL: Duration = Duration::from_secs(30);
 
@@ -29,6 +30,27 @@ pub(super) fn normalize_path(p: &str) -> String {
 /// Last segment of a normalized path.
 fn path_basename(p: &str) -> String {
     p.rsplit('/').find(|s| !s.is_empty()).unwrap_or(p).to_string()
+}
+
+/// True when the pane is running Claude Code — either the live foreground
+/// command is `claude`/`ncld` or the start_command launched one. Used to
+/// decide which panes get pipe-pane logging.
+fn is_claude_like(current_cmd: &str, start_cmd: &str) -> bool {
+    let cc = current_cmd.trim();
+    if cc == "claude" || cc == "ncld" {
+        return true;
+    }
+    // start_command is the full invocation, e.g. "claude --resume <uuid>"
+    // or "ncld --resume <uuid>". Match on a whole-word basis so `bash` panes
+    // whose history contains "claude" don't match.
+    let sc = start_cmd.trim();
+    for tok in sc.split_whitespace().take(2) {
+        let stripped = tok.rsplit('/').next().unwrap_or(tok);
+        if stripped == "claude" || stripped == "ncld" {
+            return true;
+        }
+    }
+    false
 }
 
 /// Refresh the project cache if older than `PROJECT_CACHE_TTL`. Returns
@@ -97,24 +119,30 @@ pub async fn run(state: AppState) {
 
 async fn poll_once(state: &AppState) -> anyhow::Result<()> {
     // List every pane across every session in one tmux call.
-    // Format: session|window_index|window_name|pane_index|current_command|current_path|pane_pid|pane_start_command
+    // Format: session|window_index|window_name|pane_index|current_command|current_path|pane_pid|pane_pipe|pane_id|pane_start_command
+    // `pane_pipe` (tmux 3.2+) is `1` when pipe-pane is active on the pane.
+    // `pane_id` is tmux's stable `%N` id — stable for the life of the pane
+    // within the tmux server, survives renumber-windows and reshuffling.
+    // pane_start_command stays last because it can legitimately contain `|`.
     let list_cmd = "tmux list-panes -a -F \
-        '#{session_name}|#{window_index}|#{window_name}|#{pane_index}|#{pane_current_command}|#{pane_current_path}|#{pane_pid}|#{pane_start_command}' \
+        '#{session_name}|#{window_index}|#{window_name}|#{pane_index}|#{pane_current_command}|#{pane_current_path}|#{pane_pid}|#{pane_pipe}|#{pane_id}|#{pane_start_command}' \
         2>/dev/null || true";
     let out = crate::commands::tmux::run_tmux_command_async(list_cmd.to_string())
         .await
         .map_err(|e| anyhow::anyhow!(e))?;
 
     let mut seen: HashSet<String> = HashSet::new();
-    let mut fresh: HashMap<String, (String, u32, String, u32, String, String, String, String)> =
-        HashMap::new();
+    let mut fresh: HashMap<
+        String,
+        (String, u32, String, u32, String, String, String, String, String, bool),
+    > = HashMap::new();
 
     for line in out.lines() {
         if line.trim().is_empty() {
             continue;
         }
         let parts: Vec<&str> = line.split('|').collect();
-        if parts.len() < 8 {
+        if parts.len() < 10 {
             continue;
         }
         let session = parts[0].to_string();
@@ -124,8 +152,12 @@ async fn poll_once(state: &AppState) -> anyhow::Result<()> {
         let current_cmd = parts[4].to_string();
         let current_path = parts[5].to_string();
         let pane_pid = parts[6].to_string();
-        let start_cmd = parts[7..].join("|"); // in case start_command contains pipes
+        let pane_pipe_active = parts[7] == "1";
+        // `pane_id` from tmux is `%N` — strip the `%` for filesystem safety.
+        let pane_uid = parts[8].trim_start_matches('%').to_string();
+        let start_cmd = parts[9..].join("|"); // in case start_command contains pipes
         let id = format!("{}:{}.{}", session, window_index, pane_index);
+
         seen.insert(id.clone());
         fresh.insert(
             id,
@@ -138,6 +170,8 @@ async fn poll_once(state: &AppState) -> anyhow::Result<()> {
                 current_path,
                 pane_pid,
                 start_cmd,
+                pane_uid,
+                pane_pipe_active,
             ),
         );
     }
@@ -196,9 +230,18 @@ async fn poll_once(state: &AppState) -> anyhow::Result<()> {
     // .jsonl file descriptor. Resolved after the main loop the same way.
     let mut session_detect_queue: Vec<(String, String)> = Vec::new();
 
+    // Per-pane log actions to fire AFTER we release the panes write lock.
+    // Each entry: (pane_id, pane_uid, old_session, new_target, pipe_active).
+    // pane_uid is the tmux stable id (`%N`, `%`-stripped) used for pending
+    // log lookup during pending→session migration.
+    let mut pipe_actions: Vec<(String, String, Option<String>, super::pane_log::LogTarget, bool)> =
+        Vec::new();
+
     // Apply updates + detect new panes
-    for (id, (session, window_index, window_name, pane_index, cur_cmd, cur_path, pane_pid, start_cmd))
-        in fresh.into_iter()
+    for (
+        id,
+        (session, window_index, window_name, pane_index, cur_cmd, cur_path, pane_pid, start_cmd, pane_uid, pane_pipe_active),
+    ) in fresh.into_iter()
     {
         let project_match = lookup_project(&project_map, &cur_path).cloned();
         let project_encoded = project_match.as_ref().map(|(e, _)| e.clone());
@@ -226,6 +269,13 @@ async fn poll_once(state: &AppState) -> anyhow::Result<()> {
         let mut panes = state.panes.write().await;
         let now = now_ms();
 
+        // Capture OLD session id BEFORE the per-tick update overwrites it —
+        // we use it to detect pending → known transitions so we can migrate
+        // the pending log into the session log.
+        let old_session_id = panes
+            .get(&id)
+            .and_then(|r| r.dto.claude_session_id.clone());
+
         let is_new = !panes.contains_key(&id);
         let rec = panes.entry(id.clone()).or_insert_with(|| PaneRecord {
             dto: PaneDto {
@@ -250,6 +300,7 @@ async fn poll_once(state: &AppState) -> anyhow::Result<()> {
             last_output_change: None,
             binding_confidence: binding,
             claude_account: None,
+            pane_uid: pane_uid.clone(),
         });
 
         // Update mutable fields
@@ -261,9 +312,35 @@ async fn poll_once(state: &AppState) -> anyhow::Result<()> {
         rec.dto.current_path = cur_path.clone();
         rec.dto.project_encoded_name = project_encoded.clone();
         rec.dto.project_display_name = project_display.clone();
+        rec.pane_uid = pane_uid.clone();
         if claude_session_id.is_some() && rec.binding_confidence != BindingConfidence::Explicit {
             rec.dto.claude_session_id = claude_session_id.clone();
             rec.binding_confidence = BindingConfidence::Explicit;
+        }
+
+        // Compute the desired pipe-pane target based on the NEW session id
+        // (post-update) and queue an action if something needs changing.
+        let new_session_id = rec.dto.claude_session_id.clone();
+        let is_claude = is_claude_like(&cur_cmd, &start_cmd);
+        if is_claude {
+            let target = match &new_session_id {
+                Some(sid) => super::pane_log::LogTarget::Session(sid.clone()),
+                None => super::pane_log::LogTarget::Pending(pane_uid.clone()),
+            };
+            let needs_action = if !pane_pipe_active {
+                true // pipe not attached yet
+            } else {
+                old_session_id != new_session_id // session transitioned
+            };
+            if needs_action {
+                pipe_actions.push((
+                    id.clone(),
+                    pane_uid.clone(),
+                    old_session_id.clone(),
+                    target,
+                    pane_pipe_active,
+                ));
+            }
         }
 
         // Output change detection via hash — used for the live preview
@@ -322,6 +399,11 @@ async fn poll_once(state: &AppState) -> anyhow::Result<()> {
         if !claude_alive && in_attention {
             cleared_attention.push(id.clone());
             in_attention = false;
+            state.audit_log(AuditEvent::Cancelled {
+                pane_id: id.clone(),
+                notification_type: "attention".into(),
+                reason: "claude_exited".into(),
+            });
         }
         // Output-stale detection: if Claude is alive but the pane's output
         // hash hasn't changed for IDLE_TIMEOUT, Claude is sitting at its
@@ -343,6 +425,11 @@ async fn poll_once(state: &AppState) -> anyhow::Result<()> {
         if claude_alive && in_attention && !has_pending && output_changed && !output_stale {
             cleared_attention.push(id.clone());
             in_attention = false;
+            state.audit_log(AuditEvent::Cancelled {
+                pane_id: id.clone(),
+                notification_type: "attention".into(),
+                reason: "output_resumed".into(),
+            });
         }
 
         let desired = if !claude_alive {
@@ -396,12 +483,97 @@ async fn poll_once(state: &AppState) -> anyhow::Result<()> {
         }
     }
 
+    // Fire pipe-pane (re-)enablement and session transitions in parallel.
+    // Each spawns its own wsl.exe via run_tmux_command_async — independent
+    // of the rest of the poll flow. Errors log but don't fail the poll.
+    for (pane_id, pane_uid, old_session, target, pipe_active) in pipe_actions {
+        tokio::spawn(async move {
+            // Pending → known transition: migrate the pending log's content
+            // into the new session log so history is preserved contiguously
+            // across the transition.
+            if pipe_active && old_session.is_none() {
+                if let super::pane_log::LogTarget::Session(sid) = &target {
+                    if let Err(e) =
+                        super::pane_log::migrate_pending_to_session(&pane_uid, sid).await
+                    {
+                        tracing::warn!(pane = %pane_id, "migrate pending log failed: {e}");
+                    } else {
+                        tracing::info!(
+                            pane = %pane_id,
+                            uid = %pane_uid,
+                            session = %sid,
+                            "migrated pending log into session log"
+                        );
+                    }
+                }
+            }
+            // If the pipe is active but we're switching targets, close first.
+            if pipe_active {
+                let _ = super::pane_log::disable_pipe_pane(&pane_id).await;
+            }
+            match super::pane_log::enable_pipe_pane(&pane_id, &target).await {
+                Ok(()) => tracing::info!(pane = %pane_id, target = ?target, "pipe-pane configured"),
+                Err(e) => tracing::debug!(pane = %pane_id, "pipe-pane enable failed: {e}"),
+            }
+        });
+    }
+
+    // Log rotation: check every Claude pane with an active pipe. We resolve
+    // the target from the pane's current state (post-update) so we rotate
+    // the CORRECT file when session-switches happen. `rotate_and_reattach`
+    // early-returns if the file is under the size cap, so this is cheap to
+    // fire every tick.
+    let rotation_targets: Vec<(String, super::pane_log::LogTarget)> = {
+        let panes = state.panes.read().await;
+        panes
+            .iter()
+            .filter_map(|(id, rec)| {
+                // Any pane with a derivable log target is a rotation
+                // candidate — even if Claude is no longer alive we still
+                // want to cap the on-disk size.
+                let target = match rec.dto.claude_session_id.as_ref() {
+                    Some(sid) => super::pane_log::LogTarget::Session(sid.clone()),
+                    None if !rec.pane_uid.is_empty() => {
+                        super::pane_log::LogTarget::Pending(rec.pane_uid.clone())
+                    }
+                    None => return None,
+                };
+                Some((id.clone(), target))
+            })
+            .collect()
+    };
+    for (pane_id, target) in rotation_targets {
+        tokio::spawn(async move {
+            match super::pane_log::rotate_and_reattach(&pane_id, &target).await {
+                Ok(true) => tracing::info!(pane = %pane_id, "rotated pane log"),
+                Ok(false) => {}
+                Err(e) => tracing::warn!(pane = %pane_id, "pane log rotation failed: {e}"),
+            }
+        });
+    }
+
     // Flush cleared attention flags in one write. Done after the per-pane
     // loop so we only grab the attention write lock once per tick.
     if !cleared_attention.is_empty() {
         let mut att = state.attention_panes.write().await;
         for pid in &cleared_attention {
             att.remove(pid);
+        }
+        drop(att);
+        let mut det = state.attention_details.write().await;
+        for pid in &cleared_attention {
+            det.remove(pid);
+        }
+        drop(det);
+        let mut lan = state.last_attention_notif.write().await;
+        for pid in &cleared_attention {
+            lan.remove(pid);
+        }
+        drop(lan);
+        // Mark ntfy backlog entries for cleared panes as resolved so they
+        // won't replay on SSE reconnect.
+        for pid in &cleared_attention {
+            super::hook_sink::mark_ntfy_resolved_by_pane(&state, pid).await;
         }
     }
 
@@ -436,14 +608,11 @@ async fn poll_once(state: &AppState) -> anyhow::Result<()> {
         if let Some((session_id, encoded_project, is_mru)) =
             detect_claude_session(&shell_pid).await
         {
+            // Migration info captured while holding the lock, acted on
+            // after we drop it — avoids awaiting inside the write guard.
+            let mut migrate_info: Option<(String, String)> = None; // (pane_uid, session_id)
             let updated_dto = {
                 let mut panes = state.panes.write().await;
-                // Low-confidence MRU hits collide when two Claude
-                // instances share a project dir. If any *other* pane is
-                // already bound to this session_id, refuse to bind — let
-                // the next poll's fd-catch or an incoming hook settle it
-                // rather than swap transcripts between the two detail
-                // screens.
                 if is_mru {
                     let claimed_elsewhere = panes.iter().any(|(other_id, other_rec)| {
                         other_id != &pane_id
@@ -454,14 +623,19 @@ async fn poll_once(state: &AppState) -> anyhow::Result<()> {
                     }
                 }
                 if let Some(rec) = panes.get_mut(&pane_id) {
-                    // Don't downgrade an Explicit binding (from --resume
-                    // parsing or a hook event) — those are authoritative.
                     if rec.binding_confidence != BindingConfidence::Explicit {
-                        rec.dto.claude_session_id = Some(session_id);
+                        // Capture the Pending → Session transition now that
+                        // the session_id is being bound. If the pane's
+                        // session_id was None before this call, we need to
+                        // migrate pending/<pane_uid>.log into
+                        // sessions/<session_id>.log and re-target pipe-pane.
+                        let was_pending = rec.dto.claude_session_id.is_none();
+                        if was_pending && !rec.pane_uid.is_empty() {
+                            migrate_info =
+                                Some((rec.pane_uid.clone(), session_id.clone()));
+                        }
+                        rec.dto.claude_session_id = Some(session_id.clone());
                         rec.binding_confidence = BindingConfidence::Heuristic;
-                        // Backfill project_encoded_name if the cwd-based
-                        // lookup missed it (e.g., Claude cd'd somewhere
-                        // outside any known project root).
                         if rec.dto.project_encoded_name.is_none() {
                             rec.dto.project_encoded_name = Some(encoded_project);
                         }
@@ -476,6 +650,32 @@ async fn poll_once(state: &AppState) -> anyhow::Result<()> {
             };
             if let Some(pane) = updated_dto {
                 let _ = state.events.send(EventDto::PaneUpdated { pane });
+            }
+            // Fire the pipe-pane re-target + pending migration.
+            if let Some((uid, sid)) = migrate_info {
+                let pid_clone = pane_id.clone();
+                tokio::spawn(async move {
+                    // Stop the pending pipe before moving the file.
+                    let _ = super::pane_log::disable_pipe_pane(&pid_clone).await;
+                    if let Err(e) =
+                        super::pane_log::migrate_pending_to_session(&uid, &sid).await
+                    {
+                        tracing::warn!(pane = %pid_clone, "migrate pending failed: {e}");
+                    } else {
+                        tracing::info!(
+                            pane = %pid_clone,
+                            uid = %uid,
+                            session = %sid,
+                            "migrated pending log into session log"
+                        );
+                    }
+                    let target = super::pane_log::LogTarget::Session(sid);
+                    if let Err(e) =
+                        super::pane_log::enable_pipe_pane(&pid_clone, &target).await
+                    {
+                        tracing::debug!(pane = %pid_clone, "pipe re-target failed: {e}");
+                    }
+                });
             }
         }
     }

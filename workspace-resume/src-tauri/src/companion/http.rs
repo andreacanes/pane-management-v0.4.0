@@ -11,6 +11,7 @@ use base64::Engine;
 use serde::Deserialize;
 
 use super::{
+    audit_log::AuditEvent,
     error::AppError,
     hook_sink,
     models::{
@@ -19,7 +20,7 @@ use super::{
         CreateWindowRequest, CreateWindowResponse, HealthDto, ImageRequest, InputRequest,
         KeyRequest, PaneDto, ProjectDto, SessionDto, VoiceRequest,
     },
-    ntfy_server,
+    ntfy_server, pane_log,
     state::AppState,
     tmux_poller::normalize_path,
     ws,
@@ -46,6 +47,7 @@ pub fn router(state: AppState) -> Router {
         .route("/windows/{session}/{index}", delete(kill_window))
         .route("/panes/{id}", delete(kill_pane))
         .route("/rate-limits", get(rate_limits))
+        .route("/audit", get(audit_log))
         .route("/events", get(ws::upgrade))
         .route_layer(axum::middleware::from_fn_with_state(
             state.clone(),
@@ -156,13 +158,73 @@ fn default_capture_lines() -> u32 {
 }
 
 async fn capture_pane(
-    State(_state): State<AppState>,
+    State(state): State<AppState>,
     Path(id): Path<String>,
     Query(q): Query<CaptureQuery>,
 ) -> Result<Json<CaptureResponse>, AppError> {
-    // pane id format: "<session>:<window>.<pane>" — the same as tmux target syntax
-    let start = -(q.lines as i64);
-    let script = format!("tmux capture-pane -p -e -t {} -S {} 2>&1 || true", id, start);
+    // Look up the pane's Claude session id + tmux stable uid so we can find
+    // the right per-session log file. Logs are keyed by session uuid (stable
+    // across tmux renumbers, `/clear`, and companion restarts) or by the
+    // tmux pane uid when no session has been detected yet (pending).
+    let (session_id, pane_uid) = {
+        let panes = state.panes.read().await;
+        match panes.get(&id) {
+            Some(rec) => (rec.dto.claude_session_id.clone(), rec.pane_uid.clone()),
+            None => (None, String::new()),
+        }
+    };
+
+    let log_path = match (session_id.as_ref(), pane_uid.is_empty()) {
+        (Some(sid), _) => Some(pane_log::log_path_for_session(sid)),
+        (None, false) => Some(pane_log::log_path_for_pending(&pane_uid)),
+        (None, true) => None,
+    };
+
+    let tail_bytes = if q.lines == 0 {
+        pane_log::DEFAULT_TAIL_BYTES
+    } else {
+        // When the client asks for a specific line count, size the tail budget
+        // accordingly: 200 bytes/line is a loose over-estimate that covers
+        // long ANSI-decorated lines without pulling the whole log.
+        (q.lines as u64).saturating_mul(200)
+    };
+
+    // Read the tail and replay it through a VT emulator on the blocking
+    // pool. Both the file I/O and the VT replay are CPU/IO-bound and would
+    // block the axum worker if run directly on the async runtime.
+    if let Some(log_path) = log_path {
+        match tokio::task::spawn_blocking(move || {
+            pane_log::read_tail_bytes(&log_path, tail_bytes)
+                .map(|bytes| pane_log::replay_to_lines(&bytes))
+        })
+        .await
+        {
+            Ok(Ok(lines)) if !lines.is_empty() => {
+                let seq = now_ms() as u64;
+                return Ok(Json(CaptureResponse { lines, seq }));
+            }
+            Ok(Err(e)) => {
+                tracing::debug!(pane = %id, "pane-log read failed, falling back to capture-pane: {e}");
+            }
+            Ok(Ok(_)) => {
+                // Empty log file — brand-new pane whose pipe-pane hasn't
+                // produced output yet, or non-Claude pane. Fall through.
+            }
+            Err(e) => {
+                tracing::debug!(pane = %id, "pane-log task join failed: {e}");
+            }
+        }
+    }
+
+    // Fallback: tmux capture-pane. pane id format: "<session>:<window>.<pane>"
+    // — the same as tmux target syntax. lines=0 means "all scrollback"
+    // (tmux `-S -`); any positive value captures the last N lines.
+    let start_flag = if q.lines == 0 {
+        "-".to_string()
+    } else {
+        format!("-{}", q.lines)
+    };
+    let script = format!("tmux capture-pane -p -e -t {} -S {} 2>&1 || true", id, start_flag);
     let out = crate::commands::tmux::run_tmux_command_async(script)
         .await
         .map_err(tmux_err)?;
@@ -293,17 +355,19 @@ async fn pane_conversation(
     }))
 }
 
+const MAX_TOOL_RESULT_CHARS: usize = 2000;
+
 /// Parse Claude Code JSONL into conversation messages.
 ///
 /// Extracts `type: "user"` and `type: "assistant"` records, skipping
 /// system/attachment/permission-mode/file-history-snapshot records.
-/// For user records whose `message.content` starts with `[{` (tool
-/// results), the record is skipped — tool results are internal plumbing.
-/// For assistant records, only `text` content blocks are included;
-/// `thinking` and `tool_use` blocks are excluded.
+/// Tool-result user records are emitted with `role: "tool_result"`.
+/// Assistant records include text, tool_use, and thinking blocks.
 fn parse_jsonl_conversation(raw: &str, after: Option<&str>) -> Vec<ConversationMessage> {
     let mut messages = Vec::new();
     let mut past_cursor = after.is_none();
+    let mut tool_use_names: std::collections::HashMap<String, String> =
+        std::collections::HashMap::new();
 
     for line in raw.lines() {
         if line.trim().is_empty() {
@@ -330,16 +394,30 @@ fn parse_jsonl_conversation(raw: &str, after: Option<&str>) -> Vec<ConversationM
             .unwrap_or("")
             .to_string();
 
-        // Skip until we pass the cursor
         if !past_cursor {
             if uuid == after.unwrap_or("") {
                 past_cursor = true;
             }
-            continue;
-        }
-
-        // Skip tool-result user messages (these are internal plumbing)
-        if record_type == "user" && val.get("toolUseResult").is_some() {
+            // Even before the cursor, track tool_use ids so results
+            // that fall after the cursor can still pair to a tool name.
+            if record_type == "assistant" {
+                if let Some(content) = val
+                    .get("message")
+                    .and_then(|m| m.get("content"))
+                    .and_then(|c| c.as_array())
+                {
+                    for block in content {
+                        if block.get("type").and_then(|v| v.as_str()) == Some("tool_use") {
+                            if let (Some(id), Some(name)) = (
+                                block.get("id").and_then(|v| v.as_str()),
+                                block.get("name").and_then(|v| v.as_str()),
+                            ) {
+                                tool_use_names.insert(id.to_string(), name.to_string());
+                            }
+                        }
+                    }
+                }
+            }
             continue;
         }
 
@@ -349,23 +427,69 @@ fn parse_jsonl_conversation(raw: &str, after: Option<&str>) -> Vec<ConversationM
         };
 
         if record_type == "user" {
-            // User message: message.content is a string
-            let text = message
-                .get("content")
-                .and_then(|c| c.as_str())
-                .unwrap_or("")
-                .to_string();
-            if text.is_empty() {
-                continue;
+            if val.get("toolUseResult").is_some() {
+                // Tool result record — extract the output content.
+                let content = message.get("content").and_then(|c| c.as_array());
+                if let Some(blocks) = content {
+                    for block in blocks {
+                        if block.get("type").and_then(|v| v.as_str()) != Some("tool_result") {
+                            continue;
+                        }
+                        let is_error = block
+                            .get("is_error")
+                            .and_then(|v| v.as_bool())
+                            .unwrap_or(false);
+                        let raw_content = extract_tool_result_content(block);
+                        if raw_content.is_empty() {
+                            continue;
+                        }
+                        let truncated = raw_content.len() > MAX_TOOL_RESULT_CHARS;
+                        let content = if truncated {
+                            let mut end = MAX_TOOL_RESULT_CHARS;
+                            while !raw_content.is_char_boundary(end) && end > 0 {
+                                end -= 1;
+                            }
+                            raw_content[..end].to_string()
+                        } else {
+                            raw_content
+                        };
+                        messages.push(ConversationMessage {
+                            uuid: uuid.clone(),
+                            role: "tool_result".into(),
+                            text: String::new(),
+                            timestamp: timestamp.clone(),
+                            tool_name: None,
+                            tool_input: None,
+                            thinking: None,
+                            tool_result: Some(content),
+                            tool_result_truncated: if truncated { Some(true) } else { None },
+                            tool_result_error: if is_error { Some(true) } else { None },
+                        });
+                    }
+                }
+            } else {
+                // Regular user message: message.content is a string
+                let text = message
+                    .get("content")
+                    .and_then(|c| c.as_str())
+                    .unwrap_or("")
+                    .to_string();
+                if text.is_empty() {
+                    continue;
+                }
+                messages.push(ConversationMessage {
+                    uuid,
+                    role: "user".into(),
+                    text,
+                    timestamp,
+                    tool_name: None,
+                    tool_input: None,
+                    thinking: None,
+                    tool_result: None,
+                    tool_result_truncated: None,
+                    tool_result_error: None,
+                });
             }
-            messages.push(ConversationMessage {
-                uuid,
-                role: "user".into(),
-                text,
-                timestamp,
-                tool_name: None,
-                tool_input: None,
-            });
         } else {
             // Assistant message: message.content is an array of blocks
             let content = match message.get("content").and_then(|c| c.as_array()) {
@@ -376,6 +500,7 @@ fn parse_jsonl_conversation(raw: &str, after: Option<&str>) -> Vec<ConversationM
             let mut text_parts = Vec::new();
             let mut tool_name = None;
             let mut tool_input: Option<serde_json::Value> = None;
+            let mut thinking_text: Option<String> = None;
 
             for block in content {
                 let block_type = block.get("type").and_then(|v| v.as_str()).unwrap_or("");
@@ -386,19 +511,30 @@ fn parse_jsonl_conversation(raw: &str, after: Option<&str>) -> Vec<ConversationM
                         }
                     }
                     "tool_use" => {
-                        if let Some(name) = block.get("name").and_then(|v| v.as_str()) {
+                        if let (Some(id), Some(name)) = (
+                            block.get("id").and_then(|v| v.as_str()),
+                            block.get("name").and_then(|v| v.as_str()),
+                        ) {
+                            tool_use_names.insert(id.to_string(), name.to_string());
                             tool_name = Some(name.to_string());
                         }
                         if let Some(input) = block.get("input") {
                             tool_input = Some(input.clone());
                         }
                     }
-                    _ => {} // skip thinking, etc.
+                    "thinking" => {
+                        if let Some(t) = block.get("thinking").and_then(|v| v.as_str()) {
+                            if !t.is_empty() {
+                                thinking_text = Some(t.to_string());
+                            }
+                        }
+                    }
+                    _ => {}
                 }
             }
 
             let text = text_parts.join("\n");
-            if text.is_empty() && tool_name.is_none() {
+            if text.is_empty() && tool_name.is_none() && thinking_text.is_none() {
                 continue;
             }
             messages.push(ConversationMessage {
@@ -408,11 +544,38 @@ fn parse_jsonl_conversation(raw: &str, after: Option<&str>) -> Vec<ConversationM
                 timestamp,
                 tool_name,
                 tool_input,
+                thinking: thinking_text,
+                tool_result: None,
+                tool_result_truncated: None,
+                tool_result_error: None,
             });
         }
     }
 
     messages
+}
+
+/// Extract the text content from a `tool_result` block.
+///
+/// Content is either a plain string or an array of content blocks.
+/// Array blocks of type `text` are concatenated; `tool_reference`
+/// and other non-text sub-blocks are skipped.
+fn extract_tool_result_content(block: &serde_json::Value) -> String {
+    match block.get("content") {
+        Some(serde_json::Value::String(s)) => s.clone(),
+        Some(serde_json::Value::Array(arr)) => arr
+            .iter()
+            .filter_map(|b| {
+                if b.get("type").and_then(|v| v.as_str()) == Some("text") {
+                    b.get("text").and_then(|v| v.as_str()).map(|s| s.to_string())
+                } else {
+                    None
+                }
+            })
+            .collect::<Vec<_>>()
+            .join("\n"),
+        _ => String::new(),
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -427,7 +590,16 @@ async fn send_input(
     send_text_to_pane(&id, &req.text, req.submit).await?;
     // User has answered a Claude prompt (or typed anything). Drop the
     // attention flag so the pane can leave Waiting on the next poll tick.
-    state.attention_panes.write().await.remove(&id);
+    let was_attention = state.attention_panes.write().await.remove(&id).is_some();
+    state.attention_details.write().await.remove(&id);
+    state.last_attention_notif.write().await.remove(&id);
+    if was_attention {
+        state.audit_log(AuditEvent::Cancelled {
+            pane_id: id.clone(),
+            notification_type: "attention".into(),
+            reason: "user_input".into(),
+        });
+    }
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -438,7 +610,16 @@ async fn send_voice(
 ) -> Result<StatusCode, AppError> {
     tracing::info!(pane = %id, locale = ?req.locale, "voice input");
     send_text_to_pane(&id, &req.transcript, req.submit).await?;
-    state.attention_panes.write().await.remove(&id);
+    let was_attention = state.attention_panes.write().await.remove(&id).is_some();
+    state.attention_details.write().await.remove(&id);
+    state.last_attention_notif.write().await.remove(&id);
+    if was_attention {
+        state.audit_log(AuditEvent::Cancelled {
+            pane_id: id.clone(),
+            notification_type: "attention".into(),
+            reason: "user_voice_input".into(),
+        });
+    }
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -485,7 +666,16 @@ async fn send_image(
 
     tracing::info!(pane = %id, count = wsl_paths.len(), "images uploaded");
     send_text_to_pane(&id, &message, true).await?;
-    state.attention_panes.write().await.remove(&id);
+    let was_attention = state.attention_panes.write().await.remove(&id).is_some();
+    state.attention_details.write().await.remove(&id);
+    state.last_attention_notif.write().await.remove(&id);
+    if was_attention {
+        state.audit_log(AuditEvent::Cancelled {
+            pane_id: id.clone(),
+            notification_type: "attention".into(),
+            reason: "user_image_input".into(),
+        });
+    }
 
     Ok(StatusCode::NO_CONTENT)
 }
@@ -804,6 +994,29 @@ async fn rate_limits(
     State(state): State<AppState>,
 ) -> Json<Vec<AccountRateLimit>> {
     Json(state.rate_limits.read().await.clone())
+}
+
+#[derive(Debug, Deserialize)]
+struct AuditQuery {
+    #[serde(default = "default_audit_limit")]
+    limit: usize,
+    since_ms: Option<i64>,
+}
+fn default_audit_limit() -> usize {
+    100
+}
+
+async fn audit_log(
+    State(state): State<AppState>,
+    Query(q): Query<AuditQuery>,
+) -> Json<Vec<serde_json::Value>> {
+    let entries = match &state.audit_data_dir {
+        Some(dir) => {
+            super::audit_log::read_recent(dir, q.limit, q.since_ms).await
+        }
+        None => Vec::new(),
+    };
+    Json(entries)
 }
 
 // ---------------------------------------------------------------------------

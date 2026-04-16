@@ -141,6 +141,12 @@ export interface TmuxPane {
   pane_pid?: string;
   /** Server-detected Claude profile ("andrea" | "bravura"). */
   claude_account?: "andrea" | "bravura" | null;
+  /** Window index this pane belongs to (stamped by the backend). */
+  window_index: number;
+  /** Short git branch name at current_path, null when not a git repo. */
+  git_branch?: string | null;
+  /** True when current_path is a linked (non-primary) git worktree. */
+  is_worktree?: boolean;
 }
 
 export interface TmuxState {

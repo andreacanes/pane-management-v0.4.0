@@ -24,9 +24,20 @@ async fn client_loop(mut socket: WebSocket, state: AppState) {
     {
         let panes = state.panes.read().await;
         let approvals = state.approvals.read().await;
+        let attention = state.attention_details.read().await;
         let snapshot = EventDto::Snapshot {
             panes: panes.values().map(|r| r.dto.clone()).collect(),
             approvals: approvals.values().map(|a| a.dto.clone()).collect(),
+            attention: attention
+                .iter()
+                .map(|(pid, d)| super::models::AttentionSnapshotDto {
+                    pane_id: pid.clone(),
+                    title: d.title.clone(),
+                    message: d.message.clone(),
+                    kind: d.kind.clone(),
+                    at: d.at,
+                })
+                .collect(),
         };
         if let Ok(s) = serde_json::to_string(&snapshot) {
             let _ = socket.send(Message::Text(s.into())).await;

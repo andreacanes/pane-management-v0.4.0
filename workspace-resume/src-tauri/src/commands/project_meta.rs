@@ -35,6 +35,9 @@ fn save_project_meta(
         .map_err(|e| format!("Failed to serialize project_meta: {}", e))?;
 
     store.set("project_meta", value);
+    store
+        .save()
+        .map_err(|e| format!("Failed to save store: {}", e))?;
     Ok(())
 }
 
@@ -66,6 +69,9 @@ fn save_pane_presets(
         .map_err(|e| format!("Failed to serialize pane_presets: {}", e))?;
 
     store.set("pane_presets", value);
+    store
+        .save()
+        .map_err(|e| format!("Failed to save store: {}", e))?;
     Ok(())
 }
 
@@ -97,6 +103,9 @@ fn save_pane_assignments(
         .map_err(|e| format!("Failed to serialize pane_assignments: {}", e))?;
 
     store.set("pane_assignments", value);
+    store
+        .save()
+        .map_err(|e| format!("Failed to save store: {}", e))?;
     Ok(())
 }
 
@@ -129,6 +138,9 @@ fn save_session_order(app: &tauri::AppHandle, order: &[String]) -> Result<(), St
         .map_err(|e| format!("Failed to serialize session_order: {}", e))?;
 
     store.set("session_order", value);
+    store
+        .save()
+        .map_err(|e| format!("Failed to save store: {}", e))?;
     Ok(())
 }
 
@@ -174,6 +186,9 @@ fn save_pinned_order(app: &tauri::AppHandle, order: &[String]) -> Result<(), Str
         .map_err(|e| format!("Failed to serialize pinned_order: {}", e))?;
 
     store.set("pinned_order", value);
+    store
+        .save()
+        .map_err(|e| format!("Failed to save store: {}", e))?;
     Ok(())
 }
 

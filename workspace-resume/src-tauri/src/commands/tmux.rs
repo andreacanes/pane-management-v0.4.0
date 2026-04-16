@@ -250,6 +250,9 @@ pub fn parse_pane_line(line: &str) -> Option<TmuxPane> {
         start_command,
         pane_pid,
         claude_account: None,
+        window_index: 0,
+        git_branch: None,
+        is_worktree: false,
     })
 }
 
@@ -304,6 +307,39 @@ pub async fn populate_claude_accounts(panes: &mut [TmuxPane]) {
             continue;
         }
         pane.claude_account = detect_claude_account(&pane.pane_pid).await;
+    }
+}
+
+/// Batch-probe git branch + worktree status for each pane's `current_path`.
+/// Uses `services::git::probe_many` (sync, shells wsl.exe) inside
+/// `spawn_blocking` so the async runtime isn't stalled.
+pub async fn populate_git_info(panes: &mut [TmuxPane]) {
+    let unique: Vec<String> = panes
+        .iter()
+        .filter(|p| !p.current_path.is_empty())
+        .map(|p| p.current_path.clone())
+        .collect::<std::collections::HashSet<_>>()
+        .into_iter()
+        .collect();
+    if unique.is_empty() {
+        return;
+    }
+
+    let info_map = match tokio::task::spawn_blocking(move || {
+        let refs: Vec<&str> = unique.iter().map(|s| s.as_str()).collect();
+        crate::services::git::probe_many(&refs)
+    })
+    .await
+    {
+        Ok(map) => map,
+        Err(_) => return,
+    };
+
+    for pane in panes.iter_mut() {
+        if let Some(info) = info_map.get(&pane.current_path) {
+            pane.git_branch = info.branch.clone();
+            pane.is_worktree = info.is_linked_worktree;
+        }
     }
 }
 
@@ -412,7 +448,11 @@ pub async fn list_tmux_panes(
         return Ok(vec![]);
     }
     let mut panes = parse_lines(&output, parse_pane_line);
+    for pane in panes.iter_mut() {
+        pane.window_index = window_index;
+    }
     populate_claude_accounts(&mut panes).await;
+    populate_git_info(&mut panes).await;
     Ok(panes)
 }
 
@@ -484,7 +524,11 @@ pub async fn get_tmux_state(
         }
     }
 
+    for pane in panes.iter_mut() {
+        pane.window_index = window_index;
+    }
     populate_claude_accounts(&mut panes).await;
+    populate_git_info(&mut panes).await;
 
     Ok(TmuxState {
         sessions,

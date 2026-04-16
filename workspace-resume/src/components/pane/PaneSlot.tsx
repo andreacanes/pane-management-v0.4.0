@@ -87,7 +87,7 @@ export function PaneSlot(props: { pane: TmuxPane; assignment?: string | null }) 
   const isWaitingApproval = () => {
     const winIdx = String(props.pane.window_index);
     const ws = state.windowStatuses[winIdx];
-    return ws?.waiting_panes?.includes(String(paneIndex())) ?? false;
+    return ws?.waiting_panes?.includes(paneIndex()) ?? false;
   };
   const isPaneSelectMode = () => pendingLaunch() != null;
   const hasProject = () => effectiveProject() != null;
@@ -109,7 +109,7 @@ export function PaneSlot(props: { pane: TmuxPane; assignment?: string | null }) 
     if (!p || launching()) return;
     setLaunching(true);
     try { await launchToPane(p, state, paneIndex()); }
-    catch {}
+    catch (e) { console.error("[PaneSlot] resume error:", e); }
     finally { setLaunching(false); refreshTmuxState(); }
   }
 
@@ -118,12 +118,20 @@ export function PaneSlot(props: { pane: TmuxPane; assignment?: string | null }) 
     if (!p || launching()) return;
     setLaunching(true);
     try { await newSessionInPane(p, state, paneIndex()); }
-    catch {}
+    catch (e) { console.error("[PaneSlot] newSession error:", e); }
     finally { setLaunching(false); refreshTmuxState(); }
   }
 
   async function handleClear() {
-    try { await setPaneAssignment(paneIndex(), ""); refreshTmuxState(); } catch {}
+    const sess = state.selectedTmuxSession;
+    const winIdx = state.selectedTmuxWindow;
+    if (!sess || winIdx == null) return;
+    try {
+      await setPaneAssignment(sess, winIdx, paneIndex(), null);
+      refreshTmuxState();
+    } catch (e) {
+      console.error("[PaneSlot] clear error:", e);
+    }
   }
 
   async function handleKill() {
@@ -140,7 +148,10 @@ export function PaneSlot(props: { pane: TmuxPane; assignment?: string | null }) 
 
   async function handleOpenDir() {
     const path = props.pane.current_path;
-    if (path) { try { await openDirectory(path); } catch {} }
+    if (path) {
+      try { await openDirectory(path); }
+      catch (e) { console.error("[PaneSlot] openDir error:", e); }
+    }
   }
 
   function handlePaneSelect() {

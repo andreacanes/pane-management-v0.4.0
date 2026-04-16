@@ -22,9 +22,10 @@ use tokio::sync::oneshot;
 use uuid::Uuid;
 
 use super::{
+    audit_log::AuditEvent,
     error::AppError,
     models::{now_ms, ApprovalDto, Decision, EventDto, PaneState, WaitingReason},
-    state::{AppState, BindingConfidence, NtfyAction, NtfyMessage, PendingApproval},
+    state::{AppState, AttentionDetail, BindingConfidence, NtfyAction, NtfyMessage, PendingApproval},
 };
 
 const APPROVAL_TTL_MS: i64 = 120_000;
@@ -128,12 +129,10 @@ pub async fn notification(
             ).await
         }
         // Stop hook: Claude finished its turn — user should nudge it with
-        // the next prompt. Distinct from Request-style attention.
+        // the next prompt. Deduplicated per pane: once a Stop notification
+        // fires, further Stops are silent until user input or Claude restarts.
         ("Stop" | "stop", _) => {
-            handle_attention_prompt_inner(
-                state, payload, "Claude finished", "Claude is done — tap to continue", "info",
-                WaitingReason::Continue,
-            ).await
+            handle_stop_hook(state, payload).await
         }
         // PreToolUse hook: AskUserQuestion about to render
         ("PreToolUse" | "pre_tool_use", _)
@@ -167,6 +166,13 @@ async fn handle_permission_prompt(
     let pane_id = match resolve_pane(&state, &payload).await {
         Some(id) => id,
         None => {
+            state.audit_log(AuditEvent::Suppressed {
+                pane_id: "unknown".into(),
+                session_id: payload.session_id.clone(),
+                hook_event: payload.hook_event_name.clone().unwrap_or_default(),
+                matcher: "permission_prompt".into(),
+                reason: "pane_unresolved".into(),
+            });
             return Ok(Json(HookReply {
                 decision: "approve",
                 reason: None,
@@ -224,6 +230,16 @@ async fn handle_permission_prompt(
     // Fire ntfy push (the F-Droid ntfy app on lock screen)
     publish_ntfy_approval(&state, &dto).await;
 
+    state.audit_log(AuditEvent::Fired {
+        pane_id: pane_id.clone(),
+        session_id: payload.session_id.clone(),
+        hook_event: payload.hook_event_name.clone().unwrap_or_default(),
+        matcher: "permission_prompt".into(),
+        channel: "approval".into(),
+        title: dto.title.clone(),
+        body: dto.message.clone(),
+    });
+
     // Park until the user responds or the ttl expires.
     let reply = match tokio::time::timeout(Duration::from_millis(APPROVAL_TTL_MS as u64), rx).await
     {
@@ -249,6 +265,9 @@ async fn handle_permission_prompt(
 
     // Clean up + broadcast resolution
     state.approvals.write().await.remove(&id);
+    // Mark the ntfy backlog entry resolved so it won't replay on reconnect.
+    mark_ntfy_resolved(&state, &id.to_string()).await;
+
     let decision = if reply.decision == "approve" {
         Decision::Allow
     } else {
@@ -260,12 +279,62 @@ async fn handle_permission_prompt(
         at: now_ms(),
     });
 
+    state.audit_log(AuditEvent::ApprovalResolved {
+        pane_id: pane_id.clone(),
+        approval_id: id.to_string(),
+        decision: reply.decision.to_string(),
+    });
+
     // If this was the last pending approval for this pane, demote from
     // Waiting. The next tmux_poller tick (within 2s) will correct to Idle
     // if Claude actually exited.
     clear_pane_waiting_if_no_pending(&state, &pane_id).await;
 
     Ok(Json(reply))
+}
+
+/// Stop hook handler. Updates pane state to Waiting/Continue so the grid
+/// card turns amber, but does NOT fire a phone notification. The audit
+/// log showed 76% of Stop events are phantom (cancelled within 1-6s when
+/// Claude resumes the next tool call). The genuine "Claude is done" case
+/// is covered by `idle_prompt` which fires ~60s later with a natural
+/// debounce. Permission prompts are unaffected.
+async fn handle_stop_hook(
+    state: AppState,
+    payload: HookPayload,
+) -> Result<Json<HookReply>, AppError> {
+    let pane_id = match resolve_pane(&state, &payload).await {
+        Some(id) => id,
+        None => {
+            return Ok(Json(HookReply {
+                decision: "approve",
+                reason: None,
+            }))
+        }
+    };
+
+    // Update attention state so the grid card reflects Waiting/Continue.
+    state
+        .attention_panes
+        .write()
+        .await
+        .insert(pane_id.clone(), WaitingReason::Continue);
+    state
+        .transition_with_reason(&pane_id, PaneState::Waiting, Some(WaitingReason::Continue))
+        .await;
+
+    state.audit_log(AuditEvent::Suppressed {
+        pane_id,
+        session_id: payload.session_id.clone(),
+        hook_event: "Stop".into(),
+        matcher: String::new(),
+        reason: "stop_no_notify".into(),
+    });
+
+    Ok(Json(HookReply {
+        decision: "approve",
+        reason: None,
+    }))
 }
 
 async fn handle_attention_prompt_inner(
@@ -288,6 +357,7 @@ async fn handle_attention_prompt_inner(
 
     let (project_name, account) = pane_context(&state, &pane_id).await;
 
+    // Always update attention state so the grid card is correct.
     state
         .attention_panes
         .write()
@@ -312,8 +382,63 @@ async fn handle_attention_prompt_inner(
         .message
         .clone()
         .unwrap_or_else(|| default_message.to_string());
+
+    // Rate limiting: enforce minimum cooldown between notifications for
+    // the same pane. 15 s for "input" (idle_prompt, elicitation), 60 s
+    // for "info" (Stop — defense-in-depth, primary dedup is handle_stop_hook).
+    let should_notify = {
+        let now = now_ms();
+        let cooldown = if kind == "info" { 60_000 } else { 15_000 };
+        let mut last = state.last_attention_notif.write().await;
+        let prev = last.get(&pane_id).copied().unwrap_or(0);
+        if now - prev >= cooldown {
+            last.insert(pane_id.clone(), now);
+            true
+        } else {
+            false
+        }
+    };
+
+    let hook_event = payload.hook_event_name.clone().unwrap_or_default();
+    let matcher = payload.matcher.as_deref()
+        .or(payload.notification_type.as_deref())
+        .unwrap_or("")
+        .to_string();
+
+    if !should_notify {
+        tracing::debug!(
+            pane = %pane_id, kind = %kind,
+            "attention notification suppressed (rate limit)"
+        );
+        let cooldown_label = if kind == "info" { "rate_limit_60s" } else { "rate_limit_15s" };
+        state.audit_log(AuditEvent::Suppressed {
+            pane_id: pane_id.clone(),
+            session_id: payload.session_id.clone(),
+            hook_event: hook_event.clone(),
+            matcher: matcher.clone(),
+            reason: cooldown_label.into(),
+        });
+        return Ok(Json(HookReply {
+            decision: "approve",
+            reason: None,
+        }));
+    }
+
+    // Cache detail for snapshot replay on reconnect.
+    state.attention_details.write().await.insert(
+        pane_id.clone(),
+        AttentionDetail {
+            title: title.clone(),
+            message: message.clone(),
+            kind: kind.to_string(),
+            at: now_ms(),
+        },
+    );
+
+    let channel = if kind == "input" { "attention_input" } else { "attention_info" };
+
     let _ = state.events.send(EventDto::AttentionNeeded {
-        pane_id,
+        pane_id: pane_id.clone(),
         title: title.clone(),
         message: message.clone(),
         at: now_ms(),
@@ -325,6 +450,16 @@ async fn handle_attention_prompt_inner(
     // Push to ntfy so the phone gets a lock-screen notification even
     // when the companion app is killed / phone is sleeping.
     publish_ntfy_attention(&state, &title, &message).await;
+
+    state.audit_log(AuditEvent::Fired {
+        pane_id,
+        session_id: payload.session_id.clone(),
+        hook_event,
+        matcher,
+        channel: channel.into(),
+        title,
+        body: message,
+    });
 
     Ok(Json(HookReply {
         decision: "approve",
@@ -488,6 +623,18 @@ async fn resolve_pane(state: &AppState, payload: &HookPayload) -> Option<String>
         for rec in panes.values() {
             let pane_path = rec.dto.current_path.trim_end_matches('/');
             if pane_path == cwd_norm {
+                // Skip panes already bound to a DIFFERENT session — a
+                // split pane sharing the same cwd should not be claimed
+                // by a sibling's hooks via cwd fallback.
+                let bound_to_other = rec
+                    .dto
+                    .claude_session_id
+                    .as_deref()
+                    .map(|bound| hook_sid.map(|h| h != bound).unwrap_or(false))
+                    .unwrap_or(false);
+                if bound_to_other {
+                    continue;
+                }
                 if first_exact.is_none() {
                     first_exact = Some(rec.dto.id.clone());
                 }
@@ -515,6 +662,15 @@ async fn resolve_pane(state: &AppState, payload: &HookPayload) -> Option<String>
             if !pane_path.is_empty()
                 && (cwd_norm.starts_with(pane_path) || pane_path.starts_with(cwd_norm))
             {
+                let bound_to_other = rec
+                    .dto
+                    .claude_session_id
+                    .as_deref()
+                    .map(|bound| hook_sid.map(|h| h != bound).unwrap_or(false))
+                    .unwrap_or(false);
+                if bound_to_other {
+                    continue;
+                }
                 if first_prefix.is_none() {
                     first_prefix = Some(rec.dto.id.clone());
                 }
@@ -609,6 +765,8 @@ async fn publish_ntfy_approval(state: &AppState, dto: &ApprovalDto) {
         priority: 4,
         tags: vec!["robot".to_string(), "question".to_string()],
         actions: Some(actions),
+        pane_id: Some(dto.pane_id.clone()),
+        resolved_at: None,
     };
 
     enqueue_ntfy(state, msg).await;
@@ -642,8 +800,33 @@ async fn publish_ntfy_attention(state: &AppState, title: &str, message: &str) {
         priority: 3,
         tags: vec!["robot".to_string(), "bell".to_string()],
         actions: None,
+        pane_id: None,
+        resolved_at: None,
     };
     enqueue_ntfy(state, msg).await;
+}
+
+/// Mark an ntfy backlog entry as resolved so it won't be replayed on
+/// SSE reconnect. Matches by message id (approval UUID or ntfy msg id).
+pub async fn mark_ntfy_resolved(state: &AppState, msg_id: &str) {
+    let now = chrono::Utc::now().timestamp();
+    let mut backlog = state.ntfy_backlog.write().await;
+    for msg in backlog.iter_mut() {
+        if msg.id == msg_id {
+            msg.resolved_at = Some(now);
+        }
+    }
+}
+
+/// Mark all ntfy backlog entries for a given pane as resolved.
+pub async fn mark_ntfy_resolved_by_pane(state: &AppState, pane_id: &str) {
+    let now = chrono::Utc::now().timestamp();
+    let mut backlog = state.ntfy_backlog.write().await;
+    for msg in backlog.iter_mut() {
+        if msg.pane_id.as_deref() == Some(pane_id) && msg.resolved_at.is_none() {
+            msg.resolved_at = Some(now);
+        }
+    }
 }
 
 // Not used yet but kept for parity with the hook script's "permission_prompt" matcher.
