@@ -146,30 +146,39 @@ pub fn replay_to_lines(bytes: &[u8]) -> Vec<String> {
         text = text.replace(seq, "");
     }
 
-    // Some Claude builds (e.g. the patched `cld` in the claude-patching repo)
-    // do diff-based redraws with `\e[H` + cell writes but NEVER emit `\e[2J`
-    // to clear the viewport between frames. Claude's diff logic assumes cells
-    // it doesn't explicitly overwrite still contain the previous frame's
-    // content — which on alt-screen would be true, but we've stripped that.
-    // Result: avt's cells accumulate residue across thousands of redraws,
-    // producing rendered output with smeared-together fragments from multiple
-    // frames ("replace" rendered as "repl─ce" because 'a' was overwritten by
-    // '─' from an earlier horizontal bar at the same cell).
+    // Claude Code 2.1.110 rewrote the TUI renderer to emit **cell-diff**
+    // updates on the main screen — it writes only cells whose content has
+    // changed since the previous frame, with no periodic `\e[2J` clears.
+    // (See the 2.1.110 changelog "/tui fullscreen" entry: full-redraw is now
+    // opt-in, default is diff. 2.1.111 then added Ctrl+L as a manual force-
+    // redraw escape hatch — confirming no automatic full clear ever fires.)
     //
-    // Detect this pattern — no `\e[2J` anywhere in the log but multiple
-    // `\e[H` redraws — and truncate to just the last frame so it renders on a
-    // clean viewport. We inject `\e[2J\e[H` before the last frame to ensure
-    // avt's viewport is wiped. Logs that DO emit `\e[2J` periodically (our
-    // current-chat pattern) are left untouched.
-    if !text.contains("\x1b[2J") {
-        let home_count = text.matches("\x1b[H").count();
-        if home_count > 3 {
-            if let Some(last_home) = text.rfind("\x1b[H") {
-                let mut fresh = String::with_capacity(text.len() - last_home + 8);
-                fresh.push_str("\x1b[2J\x1b[H");
-                fresh.push_str(&text[last_home..]);
-                text = fresh;
-            }
+    // The diff renderer assumes the terminal preserves the previous frame's
+    // state so unwritten cells retain their old glyphs. That's valid on a
+    // real terminal where cells are sticky, but breaks here: avt replays
+    // thousands of partial frames and cells Claude silently skips keep
+    // residue from unrelated earlier frames. "replace" renders as "repl─ce"
+    // because cell 4 was skipped by this frame's diff but held '─' from an
+    // older horizontal bar at that position.
+    //
+    // Detect cell-diff mode by its fingerprint — many `\e[H` redraws with
+    // zero or near-zero `\e[2J` — and reset avt to a clean viewport right
+    // before the last frame so it renders without accumulated residue. Logs
+    // from older Claude builds (our `ncld` patches) that still emit clears
+    // periodically are left untouched.
+    let home_count = text.matches("\x1b[H").count();
+    let clear_count = text.matches("\x1b[2J").count() + text.matches("\x1b[3J").count();
+    // Zero clears = the new cell-diff renderer running unattenuated. Any
+    // clears at all (e.g. from `/clear`, session transitions, or older
+    // binaries) let avt recover natural scrollback and we leave the log
+    // alone. Keeps the ncld / older-Claude case unaffected.
+    let is_cell_diff_mode = home_count > 20 && clear_count == 0;
+    if is_cell_diff_mode {
+        if let Some(last_home) = text.rfind("\x1b[H") {
+            let mut fresh = String::with_capacity(text.len() - last_home + 8);
+            fresh.push_str("\x1b[2J\x1b[H");
+            fresh.push_str(&text[last_home..]);
+            text = fresh;
         }
     }
 
