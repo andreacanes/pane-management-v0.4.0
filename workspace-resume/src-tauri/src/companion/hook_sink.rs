@@ -23,7 +23,7 @@ use uuid::Uuid;
 
 use super::{
     error::AppError,
-    models::{now_ms, ApprovalDto, Decision, EventDto, PaneState},
+    models::{now_ms, ApprovalDto, Decision, EventDto, PaneState, WaitingReason},
     state::{AppState, BindingConfidence, NtfyAction, NtfyMessage, PendingApproval},
 };
 
@@ -118,17 +118,21 @@ pub async fn notification(
         (_, "idle_prompt") => {
             handle_attention_prompt_inner(
                 state, payload, "Claude idle", "Claude is waiting for you", "input",
+                WaitingReason::Request,
             ).await
         }
         (_, m) if is_attention_matcher(m) => {
             handle_attention_prompt_inner(
                 state, payload, "Claude question", "Claude needs your attention", "input",
+                WaitingReason::Request,
             ).await
         }
-        // Stop hook: Claude finished its turn, instant push
+        // Stop hook: Claude finished its turn — user should nudge it with
+        // the next prompt. Distinct from Request-style attention.
         ("Stop" | "stop", _) => {
             handle_attention_prompt_inner(
                 state, payload, "Claude finished", "Claude is done — tap to continue", "info",
+                WaitingReason::Continue,
             ).await
         }
         // PreToolUse hook: AskUserQuestion about to render
@@ -137,6 +141,7 @@ pub async fn notification(
         {
             handle_attention_prompt_inner(
                 state, payload, "Claude question", "Claude is asking you a question", "input",
+                WaitingReason::Request,
             ).await
         }
         // Elicitation hook: Claude Code asking user a question (AskUserQuestion
@@ -144,6 +149,7 @@ pub async fn notification(
         ("Elicitation" | "elicitation", _) => {
             handle_attention_prompt_inner(
                 state, payload, "Claude question", "Claude is asking you a question", "input",
+                WaitingReason::Request,
             ).await
         }
         // Anything else — approve and move on
@@ -206,7 +212,9 @@ async fn handle_permission_prompt(
     // Flip the pane to Waiting so the grid card turns amber immediately.
     // Must happen BEFORE we park on the oneshot so the state flip races the
     // notification rather than the user's response.
-    state.transition(&pane_id, PaneState::Waiting).await;
+    state
+        .transition_with_reason(&pane_id, PaneState::Waiting, Some(WaitingReason::Request))
+        .await;
 
     // Broadcast to WebSocket clients (the pane-management app)
     let _ = state.events.send(EventDto::ApprovalCreated {
@@ -266,6 +274,7 @@ async fn handle_attention_prompt_inner(
     default_title: &str,
     default_message: &str,
     kind: &str,
+    reason: WaitingReason,
 ) -> Result<Json<HookReply>, AppError> {
     let pane_id = match resolve_pane(&state, &payload).await {
         Some(id) => id,
@@ -279,8 +288,14 @@ async fn handle_attention_prompt_inner(
 
     let (project_name, account) = pane_context(&state, &pane_id).await;
 
-    state.attention_panes.write().await.insert(pane_id.clone());
-    state.transition(&pane_id, PaneState::Waiting).await;
+    state
+        .attention_panes
+        .write()
+        .await
+        .insert(pane_id.clone(), reason);
+    state
+        .transition_with_reason(&pane_id, PaneState::Waiting, Some(reason))
+        .await;
 
     // Title precedence: explicit payload.title > tool_name > default.
     let base_title = payload
@@ -331,7 +346,7 @@ async fn clear_pane_waiting_if_no_pending(state: &AppState, pane_id: &str) {
     if still_pending {
         return;
     }
-    let in_attention = state.attention_panes.read().await.contains(pane_id);
+    let in_attention = state.attention_panes.read().await.contains_key(pane_id);
     if in_attention {
         return;
     }

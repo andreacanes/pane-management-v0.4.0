@@ -7,7 +7,7 @@ use std::time::{Duration, Instant};
 use sha2::{Digest, Sha256};
 
 use super::{
-    models::{now_ms, EventDto, PaneDto, PaneState},
+    models::{now_ms, EventDto, PaneDto, PaneState, WaitingReason},
     state::{AppState, BindingConfidence, PaneRecord},
 };
 
@@ -172,8 +172,8 @@ async fn poll_once(state: &AppState) -> anyhow::Result<()> {
     // Snapshot cross-pane state once per tick instead of acquiring the
     // locks per-pane. The per-pane loop uses these snapshots to derive the
     // desired PaneState without holding either of these RwLocks.
-    let attention_snapshot: HashSet<String> =
-        state.attention_panes.read().await.iter().cloned().collect();
+    let attention_snapshot: HashMap<String, WaitingReason> =
+        state.attention_panes.read().await.clone();
     let pending_approval_panes: HashSet<String> = state
         .approvals
         .read()
@@ -237,6 +237,7 @@ async fn poll_once(state: &AppState) -> anyhow::Result<()> {
                 current_command: cur_cmd.clone(),
                 current_path: cur_path.clone(),
                 state: PaneState::Idle,
+                waiting_reason: None,
                 last_output_preview: preview.clone(),
                 project_encoded_name: project_encoded.clone(),
                 project_display_name: project_display.clone(),
@@ -315,7 +316,7 @@ async fn poll_once(state: &AppState) -> anyhow::Result<()> {
             rec.binding_confidence = BindingConfidence::None;
         }
         let has_pending = pending_approval_panes.contains(&id);
-        let mut in_attention = attention_snapshot.contains(&id);
+        let mut in_attention = attention_snapshot.contains_key(&id);
         // If Claude has exited but the pane is still in the attention
         // set, drop the flag — no one is there to respond any more.
         if !claude_alive && in_attention {
@@ -354,16 +355,40 @@ async fn poll_once(state: &AppState) -> anyhow::Result<()> {
             PaneState::Running
         };
 
-        if rec.dto.state != desired {
+        // Approvals outrank attention: a permission prompt is always a
+        // Request even if a Stop hook later flagged Continue on the same
+        // pane. Non-Waiting states carry no reason.
+        let desired_reason = if desired == PaneState::Waiting {
+            if has_pending {
+                Some(WaitingReason::Request)
+            } else {
+                attention_snapshot.get(&id).copied()
+            }
+        } else {
+            None
+        };
+
+        let state_changed = rec.dto.state != desired;
+        let reason_changed = rec.dto.waiting_reason != desired_reason;
+        if state_changed || reason_changed {
             let old = rec.dto.state;
             rec.dto.state = desired;
+            rec.dto.waiting_reason = desired_reason;
             rec.dto.updated_at = now;
-            let _ = state.events.send(EventDto::PaneStateChanged {
-                pane_id: id.clone(),
-                old,
-                new: desired,
-                at: now,
-            });
+            if state_changed {
+                let _ = state.events.send(EventDto::PaneStateChanged {
+                    pane_id: id.clone(),
+                    old,
+                    new: desired,
+                    at: now,
+                });
+            } else {
+                // Same state, different reason — push the full DTO so
+                // clients can re-render the Waiting chip.
+                let _ = state.events.send(EventDto::PaneUpdated {
+                    pane: rec.dto.clone(),
+                });
+            }
         }
 
         if is_new {

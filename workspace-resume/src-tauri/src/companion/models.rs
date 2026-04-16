@@ -22,6 +22,20 @@ pub enum PaneState {
     Done,
 }
 
+/// Why a pane is in `PaneState::Waiting`. Carried alongside the state so
+/// the apk Waiting tab can render approval-style prompts distinctly from
+/// Claude having stopped mid-flow and wanting a follow-up nudge.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Hash)]
+#[serde(rename_all = "snake_case")]
+pub enum WaitingReason {
+    /// Claude explicitly asked something of the user: permission prompt,
+    /// elicitation dialog, AskUserQuestion, idle_prompt hook, etc.
+    Request,
+    /// Claude finished a turn and stopped (Stop hook). The user should
+    /// decide what to ask next — Claude is not asking anything.
+    Continue,
+}
+
 impl Default for PaneState {
     fn default() -> Self {
         PaneState::Idle
@@ -41,6 +55,11 @@ pub struct PaneDto {
     /// POSIX path inside WSL
     pub current_path: String,
     pub state: PaneState,
+    /// Sub-category of `state == Waiting`. Absent for every other state.
+    /// `Request` = Claude asked something (approval, elicitation, ...);
+    /// `Continue` = Claude stopped (Stop hook) and wants a user nudge.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub waiting_reason: Option<WaitingReason>,
     /// Up to 5 tail lines, ANSI-stripped, from the last capture-pane.
     pub last_output_preview: Vec<String>,
     /// `-home-andrea-pane-management` etc.

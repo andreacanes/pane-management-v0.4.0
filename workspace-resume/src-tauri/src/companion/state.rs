@@ -1,7 +1,7 @@
 //! Shared companion state: pane store, approvals registry, broadcast channel,
 //! bearer token, hook secret, and the embedded ntfy message buffer.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Instant;
 
@@ -14,7 +14,9 @@ use tauri_plugin_store::StoreExt;
 use tokio::sync::{broadcast, oneshot, RwLock};
 use uuid::Uuid;
 
-use super::models::{AccountRateLimit, ApprovalDto, ApprovalResponse, EventDto, PaneDto, PaneState};
+use super::models::{
+    AccountRateLimit, ApprovalDto, ApprovalResponse, EventDto, PaneDto, PaneState, WaitingReason,
+};
 
 /// Stored per pane: the public DTO plus internal bookkeeping.
 #[derive(Debug, Clone)]
@@ -110,11 +112,13 @@ pub struct AppState {
     pub started_at: Instant,
     pub bind_addr: String,
     pub project_cache: Arc<RwLock<ProjectCache>>,
-    /// Panes flagged as needing user attention via a Claude Code
-    /// `idle_prompt` hook. Unlike approvals there is nothing to allow or
-    /// deny — the flag sticks until the pane produces fresh output (user
-    /// responded) or Claude exits. Cleared by the tmux poller.
-    pub attention_panes: Arc<RwLock<HashSet<String>>>,
+    /// Panes flagged as needing user attention via a Claude Code hook.
+    /// Value is the `WaitingReason` the hook implies: `Request` when
+    /// Claude is asking something (idle_prompt / elicitation / AskUser),
+    /// `Continue` when Claude just stopped (`Stop` hook). The flag
+    /// sticks until the pane produces fresh output (user responded) or
+    /// Claude exits. Cleared by the tmux poller.
+    pub attention_panes: Arc<RwLock<HashMap<String, WaitingReason>>>,
     /// Per-account Anthropic rate limit data, populated by the
     /// rate_limit_poller background task every 60 s.
     pub rate_limits: Arc<RwLock<Vec<AccountRateLimit>>>,
@@ -174,25 +178,52 @@ impl AppState {
             started_at: Instant::now(),
             bind_addr: format!("{}:{}", super::BIND_ADDR, super::COMPANION_PORT),
             project_cache: Arc::new(RwLock::new(ProjectCache::default())),
-            attention_panes: Arc::new(RwLock::new(HashSet::new())),
+            attention_panes: Arc::new(RwLock::new(HashMap::new())),
             rate_limits: Arc::new(RwLock::new(Vec::new())),
         })
     }
 
     /// Apply a state transition, emit an event, update `updated_at`.
     pub async fn transition(&self, pane_id: &str, new_state: PaneState) {
+        self.transition_with_reason(pane_id, new_state, None).await;
+    }
+
+    /// Transition a pane to `new_state`, atomically setting the
+    /// `waiting_reason` so clients never see a Waiting state without a
+    /// reason during the ≤2s window until the next poller tick. Non-
+    /// Waiting states always clear the reason.
+    pub async fn transition_with_reason(
+        &self,
+        pane_id: &str,
+        new_state: PaneState,
+        reason: Option<WaitingReason>,
+    ) {
+        let effective_reason = if new_state == PaneState::Waiting {
+            reason
+        } else {
+            None
+        };
         let mut panes = self.panes.write().await;
         if let Some(rec) = panes.get_mut(pane_id) {
-            if rec.dto.state != new_state {
+            let state_changed = rec.dto.state != new_state;
+            let reason_changed = rec.dto.waiting_reason != effective_reason;
+            if state_changed || reason_changed {
                 let old = rec.dto.state;
                 rec.dto.state = new_state;
+                rec.dto.waiting_reason = effective_reason;
                 rec.dto.updated_at = super::models::now_ms();
-                let _ = self.events.send(EventDto::PaneStateChanged {
-                    pane_id: pane_id.to_string(),
-                    old,
-                    new: new_state,
-                    at: rec.dto.updated_at,
-                });
+                if state_changed {
+                    let _ = self.events.send(EventDto::PaneStateChanged {
+                        pane_id: pane_id.to_string(),
+                        old,
+                        new: new_state,
+                        at: rec.dto.updated_at,
+                    });
+                } else {
+                    let _ = self.events.send(EventDto::PaneUpdated {
+                        pane: rec.dto.clone(),
+                    });
+                }
             }
         }
     }
