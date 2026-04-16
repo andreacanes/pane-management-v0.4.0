@@ -110,26 +110,63 @@ fn lookup_project<'a>(
 
 pub async fn run(state: AppState) {
     loop {
+        let t0 = std::time::Instant::now();
         if let Err(e) = poll_once(&state).await {
             tracing::debug!("tmux poll error: {e}");
+        }
+        let dt = t0.elapsed();
+        if dt.as_millis() > 500 {
+            tracing::info!(elapsed_ms = %dt.as_millis(), "slow poll tick");
         }
         tokio::time::sleep(POLL_INTERVAL).await;
     }
 }
 
 async fn poll_once(state: &AppState) -> anyhow::Result<()> {
-    // List every pane across every session in one tmux call.
-    // Format: session|window_index|window_name|pane_index|current_command|current_path|pane_pid|pane_pipe|pane_id|pane_start_command
-    // `pane_pipe` (tmux 3.2+) is `1` when pipe-pane is active on the pane.
-    // `pane_id` is tmux's stable `%N` id — stable for the life of the pane
-    // within the tmux server, survives renumber-windows and reshuffling.
-    // pane_start_command stays last because it can legitimately contain `|`.
-    let list_cmd = "tmux list-panes -a -F \
+    // Fuse list-panes + per-pane capture-pane into ONE wsl.exe invocation.
+    // Each wsl.exe spawn on Windows costs ~200ms of overhead; doing 3 calls
+    // per tick (list, capture, stat) stretched the poll to 700ms+. Merging
+    // list+capture saves one full round-trip.
+    //
+    // Output layout:
+    //   ---LIST:BEGIN---
+    //   <one pane per line, format below>
+    //   ---LIST:END---
+    //   ---CAP:<id>:BEGIN--- / <capture bytes> / ---CAP:<id>:END---  (repeated)
+    //
+    // pane_pipe (tmux 3.2+) = 1 when pipe-pane is active.
+    // pane_id is tmux's stable `%N` uid.
+    let combined = "echo '---LIST:BEGIN---'; \
+        tmux list-panes -a -F \
         '#{session_name}|#{window_index}|#{window_name}|#{pane_index}|#{pane_current_command}|#{pane_current_path}|#{pane_pid}|#{pane_pipe}|#{pane_id}|#{pane_start_command}' \
-        2>/dev/null || true";
-    let out = crate::commands::tmux::run_tmux_command_async(list_cmd.to_string())
+        2>/dev/null; \
+        echo '---LIST:END---'; \
+        for id in $(tmux list-panes -a -F '#{session_name}:#{window_index}.#{pane_index}' 2>/dev/null); do \
+            echo \"---CAP:$id:BEGIN---\"; \
+            tmux capture-pane -p -t \"$id\" -S -5 2>/dev/null; \
+            echo \"---CAP:$id:END---\"; \
+        done";
+    let combined_out = crate::commands::tmux::run_tmux_command_async(combined.to_string())
         .await
         .map_err(|e| anyhow::anyhow!(e))?;
+
+    // Split into the LIST section and the capture section.
+    let list_begin = "---LIST:BEGIN---";
+    let list_end = "---LIST:END---";
+    let out = if let (Some(b), Some(e)) = (
+        combined_out.find(list_begin),
+        combined_out.find(list_end),
+    ) {
+        let list_start = b + list_begin.len();
+        combined_out[list_start..e].trim_matches('\n').to_string()
+    } else {
+        String::new()
+    };
+    // Everything after the LIST section is the capture markers.
+    let captures_section = combined_out
+        .find(list_end)
+        .map(|i| combined_out[i + list_end.len()..].to_string())
+        .unwrap_or_default();
 
     let mut seen: HashSet<String> = HashSet::new();
     let mut fresh: HashMap<
@@ -176,27 +213,8 @@ async fn poll_once(state: &AppState) -> anyhow::Result<()> {
         );
     }
 
-    // Capture all pane previews in a single wsl.exe invocation. Each pane's
-    // output is bracketed by `---CAP:<id>:BEGIN---` / `---CAP:<id>:END---`
-    // markers so we can split the combined stream back into per-pane buckets.
-    // Spawning wsl.exe once per pane per poll is what was saturating the
-    // blocking pool and lagging the HTTP handlers.
-    let captures = {
-        let mut script = String::new();
-        for id in fresh.keys() {
-            script.push_str(&format!(
-                "echo '---CAP:{id}:BEGIN---'; tmux capture-pane -p -t {id} -S -5 2>/dev/null; echo '---CAP:{id}:END---'; ",
-            ));
-        }
-        if script.is_empty() {
-            String::new()
-        } else {
-            crate::commands::tmux::run_tmux_command_async(script)
-                .await
-                .unwrap_or_default()
-        }
-    };
-    let cap_map = parse_capture_batch(&captures);
+    // Captures already fetched in the same wsl call above.
+    let cap_map = parse_capture_batch(&captures_section);
 
     // Resolve each pane's working directory to a known project (cached
     // for 30 s — list_projects shells out to wsl.exe and is too expensive
@@ -303,6 +321,26 @@ async fn poll_once(state: &AppState) -> anyhow::Result<()> {
             pane_uid: pane_uid.clone(),
         });
 
+        // Detect pane renumbering: if the same tmux coordinate (session:window.pane)
+        // now points to a DIFFERENT underlying pane (different %N uid), clear the
+        // stale session binding so proc-walk rebinds to the actual running session.
+        // Without this, killing a pane and letting its sibling renumber into the
+        // vacated slot leaves the record pointing at the dead session.
+        let prev_uid = rec.pane_uid.clone();
+        if !prev_uid.is_empty() && prev_uid != pane_uid {
+            tracing::info!(
+                pane = %id,
+                old_uid = %prev_uid,
+                new_uid = %pane_uid,
+                "pane renumbered into this coordinate — clearing session binding"
+            );
+            rec.dto.claude_session_id = None;
+            rec.binding_confidence = BindingConfidence::None;
+            rec.claude_account = None;
+            rec.dto.claude_account = None;
+            rec.output_hash = [0u8; 32]; // force next hash compare to re-emit
+        }
+
         // Update mutable fields
         rec.dto.session_name = session.clone();
         rec.dto.window_index = window_index;
@@ -357,6 +395,7 @@ async fn poll_once(state: &AppState) -> anyhow::Result<()> {
                 seq: now as u64,
                 at: now,
             });
+            tracing::debug!(pane = %id, "emit PaneOutputChanged");
         }
 
         // Desired PaneState derivation. Single source of truth:
@@ -577,34 +616,44 @@ async fn poll_once(state: &AppState) -> anyhow::Result<()> {
         }
     }
 
-    // Run Claude account detection for any claude-alive panes that we
-    // haven't detected yet. Each detection shells out once to walk
-    // /proc/<pid>/environ. Results are cached on the PaneRecord so
-    // steady-state cost is zero.
-    for (pane_id, shell_pid) in detect_queue {
-        if let Some(account) = crate::commands::tmux::detect_claude_account(&shell_pid).await {
-            let updated_dto = {
-                let mut panes = state.panes.write().await;
-                if let Some(rec) = panes.get_mut(&pane_id) {
-                    rec.claude_account = Some(account.clone());
-                    rec.dto.claude_account = Some(account);
-                    rec.dto.updated_at = now_ms();
-                    Some(rec.dto.clone())
-                } else {
-                    None
+    // Claude account + session detection both shell out via wsl.exe and
+    // can take 500ms-1s per pane. Running them sequentially inside the poll
+    // blocked the main loop for 10-15s on the first boot (9 panes × ~1s ×
+    // 2 detections). Spawn each as a background task that writes into
+    // state.panes when done — the next poll tick will see the result.
+
+    let detect_state = state.clone();
+    tokio::spawn(async move {
+        for (pane_id, shell_pid) in detect_queue {
+            if let Some(account) =
+                crate::commands::tmux::detect_claude_account(&shell_pid).await
+            {
+                let updated_dto = {
+                    let mut panes = detect_state.panes.write().await;
+                    if let Some(rec) = panes.get_mut(&pane_id) {
+                        rec.claude_account = Some(account.clone());
+                        rec.dto.claude_account = Some(account);
+                        rec.dto.updated_at = now_ms();
+                        Some(rec.dto.clone())
+                    } else {
+                        None
+                    }
+                };
+                if let Some(pane) = updated_dto {
+                    let _ = detect_state.events.send(EventDto::PaneUpdated { pane });
                 }
-            };
-            if let Some(pane) = updated_dto {
-                let _ = state.events.send(EventDto::PaneUpdated { pane });
             }
         }
-    }
+    });
 
     // Resolve session bindings: walk /proc for each pane that runs claude
-    // but has no explicit binding. The proc-walk reads file descriptors,
-    // so it finds the JSONL Claude is actually writing — beats the MRU
-    // heuristic when multiple Claude sessions share a project.
-    for (pane_id, shell_pid) in session_detect_queue {
+    // but has no explicit binding. Also runs as a background task so it
+    // doesn't block the main poll cadence. Pending→session log migration
+    // fires as the session id gets bound.
+    let session_state = state.clone();
+    tokio::spawn(async move {
+        let state = session_state; // shadow to match the original variable name below
+        for (pane_id, shell_pid) in session_detect_queue {
         if let Some((session_id, encoded_project, is_mru)) =
             detect_claude_session(&shell_pid).await
         {
@@ -678,7 +727,8 @@ async fn poll_once(state: &AppState) -> anyhow::Result<()> {
                 });
             }
         }
-    }
+        }
+    }); // end tokio::spawn for session_detect_queue
 
     // Refresh `last_activity_at` from JSONL file mtime. This is the
     // honest "last conversation activity" signal — it advances when
@@ -700,41 +750,47 @@ async fn poll_once(state: &AppState) -> anyhow::Result<()> {
             .collect()
     };
     if !stat_targets.is_empty() {
-        let mut script = String::new();
-        for (id, path) in &stat_targets {
-            // Single quote in pane id is impossible (tmux format), so no
-            // escape needed. Path is server-built, also safe.
-            script.push_str(&format!(
-                "printf '%s|' '{}'; stat -c '%Y' \"{}\" 2>/dev/null || echo '0'\n",
-                id, path
-            ));
-        }
-        if let Ok(out) = crate::commands::tmux::run_tmux_command_async(script).await {
-            let mut updates: Vec<(String, i64)> = Vec::new();
-            for line in out.lines() {
-                let mut parts = line.splitn(2, '|');
-                let id = parts.next().unwrap_or("");
-                let mtime_s: i64 = parts
-                    .next()
-                    .unwrap_or("0")
-                    .trim()
-                    .parse()
-                    .unwrap_or(0);
-                if mtime_s > 0 && !id.is_empty() {
-                    updates.push((id.to_string(), mtime_s * 1000));
-                }
+        // The JSONL mtime refresh is informational only (powers the
+        // `last_activity_at` field used by the Stashed filter). It should
+        // NOT block the poll — run it as a background task so the main
+        // loop can immediately emit PaneOutputChanged events and start
+        // the next tick.
+        let stat_state = state.clone();
+        tokio::spawn(async move {
+            let mut script = String::new();
+            for (id, path) in &stat_targets {
+                script.push_str(&format!(
+                    "printf '%s|' '{}'; stat -c '%Y' \"{}\" 2>/dev/null || echo '0'\n",
+                    id, path
+                ));
             }
-            if !updates.is_empty() {
-                let mut panes_w = state.panes.write().await;
-                for (id, ms) in updates {
-                    if let Some(rec) = panes_w.get_mut(&id) {
-                        if rec.dto.last_activity_at != Some(ms) {
-                            rec.dto.last_activity_at = Some(ms);
+            if let Ok(out) = crate::commands::tmux::run_tmux_command_async(script).await {
+                let mut updates: Vec<(String, i64)> = Vec::new();
+                for line in out.lines() {
+                    let mut parts = line.splitn(2, '|');
+                    let id = parts.next().unwrap_or("");
+                    let mtime_s: i64 = parts
+                        .next()
+                        .unwrap_or("0")
+                        .trim()
+                        .parse()
+                        .unwrap_or(0);
+                    if mtime_s > 0 && !id.is_empty() {
+                        updates.push((id.to_string(), mtime_s * 1000));
+                    }
+                }
+                if !updates.is_empty() {
+                    let mut panes_w = stat_state.panes.write().await;
+                    for (id, ms) in updates {
+                        if let Some(rec) = panes_w.get_mut(&id) {
+                            if rec.dto.last_activity_at != Some(ms) {
+                                rec.dto.last_activity_at = Some(ms);
+                            }
                         }
                     }
                 }
             }
-        }
+        });
     }
 
     // Drop panes that disappeared from tmux output. Emit PaneRemoved
