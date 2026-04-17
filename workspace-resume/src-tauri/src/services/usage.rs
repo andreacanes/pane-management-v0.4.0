@@ -3,10 +3,12 @@
 //! Parses `~/.claude/projects/<proj>/<uuid>.jsonl` files for the
 //! `message.usage` field on assistant records and sums tokens + cost
 //! per session and per project. Pricing table matches Anthropic's
-//! published rates (April 2026, USD per 1M tokens).
+//! published rates (April 2026, USD per 1M tokens). Opus 4.7 ships at
+//! the same rates as Opus 4.6, with the 1M context window included at
+//! standard pricing (no long-context premium).
 //!
 //! Models are matched by prefix to absorb future point revisions
-//! (e.g. `claude-opus-4-6` matches `opus-4-6-20260304` etc.).
+//! (e.g. `claude-opus-4-7` matches `opus-4-7-<datestamp>` etc.).
 
 use std::collections::HashMap;
 use std::fs::File;
@@ -30,7 +32,12 @@ struct Pricing {
 /// Anthropic public pricing (April 2026). Update when prices change.
 fn pricing_for(model: &str) -> Pricing {
     let m = model.to_lowercase();
-    if m.contains("opus-4-6") || m.contains("opus-4-5") || m.contains("opus-4.6") {
+    if m.contains("opus-4-7")
+        || m.contains("opus-4-6")
+        || m.contains("opus-4-5")
+        || m.contains("opus-4.7")
+        || m.contains("opus-4.6")
+    {
         Pricing {
             input_per_mtok: 15.0,
             output_per_mtok: 75.0,
@@ -286,6 +293,21 @@ mod tests {
         assert!((p.input_per_mtok - 15.0).abs() < 1e-9);
         assert!((p.output_per_mtok - 75.0).abs() < 1e-9);
         assert!((p.cache_read_per_mtok - 1.5).abs() < 1e-9);
+    }
+
+    #[test]
+    fn test_pricing_opus_4_7_matches_4_6() {
+        let p = pricing_for("claude-opus-4-7");
+        assert!((p.input_per_mtok - 15.0).abs() < 1e-9);
+        assert!((p.output_per_mtok - 75.0).abs() < 1e-9);
+        assert!((p.cache_write_per_mtok - 18.75).abs() < 1e-9);
+        assert!((p.cache_read_per_mtok - 1.5).abs() < 1e-9);
+    }
+
+    #[test]
+    fn test_pricing_opus_4_7_dated_suffix() {
+        let p = pricing_for("claude-opus-4-7-20260415");
+        assert!((p.input_per_mtok - 15.0).abs() < 1e-9);
     }
 
     #[test]
