@@ -39,6 +39,14 @@ pub struct PaneRecord {
     /// Empty when we haven't seen the pane yet. Used as the `pending/` log
     /// filename before a claude_session_id is detected.
     pub pane_uid: String,
+    /// Pane width in columns from `#{pane_width}` at the last poll tick.
+    /// Fed to the VT emulator when replaying the log so avt's line-wrap
+    /// boundary matches Claude's — mismatched widths cause character-level
+    /// mixing (cells at cols > real-width hold stale writes, and auto-wrap
+    /// lands content on the wrong logical row). `0` when the pane has not
+    /// been seen yet by the poller; `replay_to_lines` falls back to a sane
+    /// default in that case.
+    pub pane_width: u16,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]

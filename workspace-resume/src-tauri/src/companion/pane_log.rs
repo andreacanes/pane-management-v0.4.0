@@ -44,10 +44,14 @@ pub const TRUNCATE_TO: u64 = 10 * 1024 * 1024; // 10MB
 /// avt the full retained history.
 pub const DEFAULT_TAIL_BYTES: u64 = MAX_LOG_SIZE;
 
-/// Virtual terminal grid dimensions used for replay. Must be >= the widest
-/// pane we'll render, or content wraps differently than it did on the real
-/// terminal. 200x80 matches typical WezTerm/tmux panes.
-pub const REPLAY_COLS: usize = 200;
+/// Fallback virtual-terminal width used when the caller doesn't know the
+/// pane's actual columns (brand-new pane, lookup miss). Any real value
+/// queried from `#{pane_width}` and passed to `replay_to_lines` takes
+/// precedence. Do not lean on this — a hardcoded width that mismatches
+/// Claude's TUI columns is exactly what produced the 2026-04-16
+/// character-level mixing (cells at cols > real-width holding stale
+/// writes, auto-wrap landing content on the wrong logical row).
+pub const REPLAY_COLS_FALLBACK: usize = 200;
 pub const REPLAY_ROWS: usize = 80;
 
 /// Scrollback cap for the virtual terminal.
@@ -127,9 +131,17 @@ pub fn ensure_log_dir() -> std::io::Result<()> {
 /// return the rendered grid as lines with ANSI SGR codes embedded. The
 /// Android AnsiParser renders these codes as colors/bold/italic.
 ///
+/// `width` must be the tmux pane's real columns (from `#{pane_width}`) so
+/// avt's auto-wrap boundary matches Claude's TUI. A mismatched width is
+/// what produced the 2026-04-16 character-level mixing: Claude would wrap
+/// at col W and start the overflow on the next logical row; avt at a wider
+/// grid would NOT wrap there and would stamp the overflow at cols W..end
+/// of the current row, stomping cells from the following row on the next
+/// write. Pass `REPLAY_COLS_FALLBACK` only when you really have no width.
+///
 /// `avt` silently ignores ESC[3J (erase-scrollback), which is what we want
 /// — it's what prevented this from working via plain `tmux capture-pane`.
-pub fn replay_to_lines(bytes: &[u8]) -> Vec<String> {
+pub fn replay_to_lines(bytes: &[u8], width: usize) -> Vec<String> {
     if bytes.is_empty() {
         return Vec::new();
     }
@@ -166,49 +178,25 @@ pub fn replay_to_lines(bytes: &[u8]) -> Vec<String> {
     // mid-frame start leaves avt with a partial escape sequence and
     // corrupts the first render. `read_tail_bytes` snaps to `\e[H` for
     // exactly this reason.
-    //
-    // Earlier iterations of this function truncated to the last `\e[H`
-    // frame + an injected `\e[2J`. That worked when the whole log was
-    // garbled (feeding less garbage produces less garbage) but masked
-    // the real bug: the tail was mis-aligned. With `\e[H`-aligned tails
-    // avt's full-log replay is clean, so we feed the bytes as-is.
 
+    let effective_width = if width == 0 { REPLAY_COLS_FALLBACK } else { width };
     let mut vt = avt::Vt::builder()
-        .size(REPLAY_COLS, REPLAY_ROWS)
+        .size(effective_width, REPLAY_ROWS)
         .scrollback_limit(REPLAY_SCROLLBACK)
         .build();
     let _ = vt.feed_str(&text);
 
-    // Merge continuation rows. When Claude writes a line longer than the
-    // viewport width (200 cols here), avt wraps it across two rows — the
-    // first row fills to col 199, the second starts at col 0 with the rest
-    // of the same logical line. Android's text wrapper handles the final
-    // re-wrap at its own width; we just need to rejoin the two rows.
-    //
-    // Because we feed the full log (including Claude's initial full-draw
-    // frame) the avt state matches Claude's model at the end — cells at
-    // col 199 have content only when Claude actually wrapped there, so
-    // this heuristic no longer fires on residue.
-    let mut out: Vec<String> = Vec::new();
-    let mut prev_was_full = false;
-    for line in vt.lines() {
-        let (rendered, is_full) = line_to_ansi_with_fullness(line);
-        if prev_was_full && !out.is_empty() {
-            out.last_mut().unwrap().push_str(&rendered);
-        } else {
-            out.push(rendered);
-        }
-        prev_was_full = is_full;
-    }
-    out
+    // No continuation-row merge. With avt sized to the real pane width,
+    // Claude's own line breaks are faithful — Claude never writes past
+    // width without emitting its own newline — so there is nothing to
+    // rejoin. An earlier implementation glued `col == width-1` rows to
+    // the next row; at the wrong width that concatenated unrelated rows.
+    vt.lines().map(line_to_ansi).collect()
 }
 
 /// Convert an `avt::Line` to a `String` with ANSI SGR escape codes embedded
 /// so the client's ANSI parser can render colors and text attributes.
-/// Returns (rendered, was_full) where `was_full` is true when the last
-/// meaningful cell is at column REPLAY_COLS - 1 — used to detect wrap
-/// continuations.
-fn line_to_ansi_with_fullness(line: &avt::Line) -> (String, bool) {
+fn line_to_ansi(line: &avt::Line) -> String {
     let cells = line.cells();
     let last_meaningful = cells.iter().rposition(|c| {
         let pen = c.pen();
@@ -216,9 +204,8 @@ fn line_to_ansi_with_fullness(line: &avt::Line) -> (String, bool) {
     });
     let end = match last_meaningful {
         Some(idx) => idx + 1,
-        None => return (String::new(), false),
+        None => return String::new(),
     };
-    let was_full = end == REPLAY_COLS;
 
     // Strip excessive leading whitespace. Claude's TUI centers splash/header
     // content with 30-50 columns of padding so it sits mid-screen on a 189-
@@ -260,7 +247,7 @@ fn line_to_ansi_with_fullness(line: &avt::Line) -> (String, bool) {
     if had_styled {
         out.push_str("\x1b[0m");
     }
-    (out, was_full)
+    out
 }
 
 fn pen_is_default(pen: &avt::Pen) -> bool {

@@ -136,9 +136,12 @@ async fn poll_once(state: &AppState) -> anyhow::Result<()> {
     //
     // pane_pipe (tmux 3.2+) = 1 when pipe-pane is active.
     // pane_id is tmux's stable `%N` uid.
+    // pane_width is columns — fed into avt at /capture time so line wrap
+    // matches Claude's TUI and cell-diff renders without character-level
+    // mixing.
     let combined = "echo '---LIST:BEGIN---'; \
         tmux list-panes -a -F \
-        '#{session_name}|#{window_index}|#{window_name}|#{pane_index}|#{pane_current_command}|#{pane_current_path}|#{pane_pid}|#{pane_pipe}|#{pane_id}|#{pane_start_command}' \
+        '#{session_name}|#{window_index}|#{window_name}|#{pane_index}|#{pane_current_command}|#{pane_current_path}|#{pane_pid}|#{pane_pipe}|#{pane_id}|#{pane_width}|#{pane_start_command}' \
         2>/dev/null; \
         echo '---LIST:END---'; \
         for id in $(tmux list-panes -a -F '#{session_name}:#{window_index}.#{pane_index}' 2>/dev/null); do \
@@ -171,7 +174,7 @@ async fn poll_once(state: &AppState) -> anyhow::Result<()> {
     let mut seen: HashSet<String> = HashSet::new();
     let mut fresh: HashMap<
         String,
-        (String, u32, String, u32, String, String, String, String, String, bool),
+        (String, u32, String, u32, String, String, String, String, String, bool, u16),
     > = HashMap::new();
 
     for line in out.lines() {
@@ -179,7 +182,7 @@ async fn poll_once(state: &AppState) -> anyhow::Result<()> {
             continue;
         }
         let parts: Vec<&str> = line.split('|').collect();
-        if parts.len() < 10 {
+        if parts.len() < 11 {
             continue;
         }
         let session = parts[0].to_string();
@@ -192,7 +195,8 @@ async fn poll_once(state: &AppState) -> anyhow::Result<()> {
         let pane_pipe_active = parts[7] == "1";
         // `pane_id` from tmux is `%N` — strip the `%` for filesystem safety.
         let pane_uid = parts[8].trim_start_matches('%').to_string();
-        let start_cmd = parts[9..].join("|"); // in case start_command contains pipes
+        let pane_width: u16 = parts[9].parse().unwrap_or(0);
+        let start_cmd = parts[10..].join("|"); // in case start_command contains pipes
         let id = format!("{}:{}.{}", session, window_index, pane_index);
 
         seen.insert(id.clone());
@@ -209,6 +213,7 @@ async fn poll_once(state: &AppState) -> anyhow::Result<()> {
                 start_cmd,
                 pane_uid,
                 pane_pipe_active,
+                pane_width,
             ),
         );
     }
@@ -258,7 +263,7 @@ async fn poll_once(state: &AppState) -> anyhow::Result<()> {
     // Apply updates + detect new panes
     for (
         id,
-        (session, window_index, window_name, pane_index, cur_cmd, cur_path, pane_pid, start_cmd, pane_uid, pane_pipe_active),
+        (session, window_index, window_name, pane_index, cur_cmd, cur_path, pane_pid, start_cmd, pane_uid, pane_pipe_active, pane_width),
     ) in fresh.into_iter()
     {
         let project_match = lookup_project(&project_map, &cur_path).cloned();
@@ -319,6 +324,7 @@ async fn poll_once(state: &AppState) -> anyhow::Result<()> {
             binding_confidence: binding,
             claude_account: None,
             pane_uid: pane_uid.clone(),
+            pane_width,
         });
 
         // Detect pane renumbering: if the same tmux coordinate (session:window.pane)
@@ -350,6 +356,7 @@ async fn poll_once(state: &AppState) -> anyhow::Result<()> {
         rec.dto.current_path = cur_path.clone();
         rec.dto.project_encoded_name = project_encoded.clone();
         rec.dto.project_display_name = project_display.clone();
+        rec.pane_width = pane_width;
         rec.pane_uid = pane_uid.clone();
         if claude_session_id.is_some() && rec.binding_confidence != BindingConfidence::Explicit {
             rec.dto.claude_session_id = claude_session_id.clone();

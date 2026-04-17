@@ -166,11 +166,15 @@ async fn capture_pane(
     // the right per-session log file. Logs are keyed by session uuid (stable
     // across tmux renumbers, `/clear`, and companion restarts) or by the
     // tmux pane uid when no session has been detected yet (pending).
-    let (session_id, pane_uid) = {
+    let (session_id, pane_uid, pane_width) = {
         let panes = state.panes.read().await;
         match panes.get(&id) {
-            Some(rec) => (rec.dto.claude_session_id.clone(), rec.pane_uid.clone()),
-            None => (None, String::new()),
+            Some(rec) => (
+                rec.dto.claude_session_id.clone(),
+                rec.pane_uid.clone(),
+                rec.pane_width as usize,
+            ),
+            None => (None, String::new(), 0),
         }
     };
 
@@ -195,7 +199,7 @@ async fn capture_pane(
     if let Some(log_path) = log_path {
         match tokio::task::spawn_blocking(move || {
             pane_log::read_tail_bytes(&log_path, tail_bytes)
-                .map(|bytes| pane_log::replay_to_lines(&bytes))
+                .map(|bytes| pane_log::replay_to_lines(&bytes, pane_width))
         })
         .await
         {
