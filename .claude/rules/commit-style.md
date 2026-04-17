@@ -7,7 +7,7 @@ Commit messages use `feat:` / `fix:` / `refactor:` / `chore:` / `test:` / `docs:
 Every commit must end with the co-author trailer:
 
 ```
-Co-Authored-By: Claude Opus 4.6 (1M context) <noreply@anthropic.com>
+Co-Authored-By: Claude Opus 4.7 (1M context) <noreply@anthropic.com>
 ```
 
 Never `git push --force` or `git commit --no-verify`. Always create new commits rather than amending published ones.
