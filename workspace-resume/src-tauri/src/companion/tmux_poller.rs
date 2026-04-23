@@ -39,6 +39,25 @@ fn path_basename(p: &str) -> String {
 /// `commands::tmux::pane_is_claude`, though this version is intentionally
 /// stricter (token match instead of substring) to avoid enabling pipe-pane
 /// on plain shells whose history text happens to include "claude".
+/// Scan the last 5-line capture preview for Claude Code TUI markers.
+/// Used when `current_command` is `ssh` — tmux reports the foreground
+/// SSH process, not the Claude instance running on the far side of the
+/// tunnel, so the shell-command heuristic can't see it. Checking for the
+/// word "claude" (lowercased, any position) catches both Claude's own
+/// banner lines (`Claude Code v2.x`, `with max effort`) and its prompt
+/// decoration (`claude >`). Some false positives are acceptable here —
+/// the cost of mislabeling a random `ssh` session is one misplaced
+/// green dot, not a functional regression.
+fn preview_looks_claude(preview: &[String]) -> bool {
+    for line in preview {
+        let lower = line.to_ascii_lowercase();
+        if lower.contains("claude") || lower.contains("with max effort") {
+            return true;
+        }
+    }
+    false
+}
+
 fn is_claude_like(current_cmd: &str, start_cmd: &str) -> bool {
     let cc = current_cmd.trim();
     if cc == "claude" || cc == "ncld" || cc.starts_with("cli-ncld") {
@@ -409,7 +428,7 @@ async fn poll_once_remote(state: &AppState, alias: &str) -> anyhow::Result<()> {
         // Queue a session-binding resolve via lsof-over-SSH when Claude
         // is alive and we haven't bound a session id yet. `BindingConfidence`
         // is `Explicit` only when we parsed `--resume <uuid>` from the
-        // start command; anything else — the normal `mcld` path — lands
+        // start command; anything else — the normal `mncld` path — lands
         // here.
         if claude_alive
             && rec.binding_confidence == BindingConfidence::None
@@ -836,7 +855,17 @@ async fn poll_once(state: &AppState) -> anyhow::Result<()> {
         //   claude_alive  (pane_current/start_command heuristic)
         //   has_pending   (approvals map, snapshot above)
         //   in_attention  (attention_panes, snapshot above)
-        let claude_alive = crate::commands::tmux::pane_is_claude(&cur_cmd, &start_cmd);
+        //
+        // Special case: a pane whose current_command is `ssh` can still
+        // be interactively running Claude when the user did
+        // `ssh mac -t "cc <project> <account>"` or similar. tmux only
+        // sees `ssh` as the foreground process, so the command-name
+        // heuristic comes up empty — but the capture output carries
+        // Claude's TUI (the word "claude" in banners, prompts, or the
+        // rendered /effort tag). Fall back to scanning the last-capture
+        // preview when the current command is `ssh`.
+        let claude_alive = crate::commands::tmux::pane_is_claude(&cur_cmd, &start_cmd)
+            || (cur_cmd.trim().eq_ignore_ascii_case("ssh") && preview_looks_claude(&preview));
         if claude_alive && rec.claude_account.is_none() && !pane_pid.is_empty() {
             detect_queue.push((id.clone(), pane_pid.clone()));
         }
@@ -1519,7 +1548,7 @@ walk() {{
   local comm
   comm=$(ps -o comm= -p "$pid" 2>/dev/null | tr -d ' ')
   case "$comm" in
-    */claude|claude|mcld|*/mcld)
+    */claude|claude|mcld|*/mcld|mncld|*/mncld|cli-mncld-*|*/cli-mncld-*)
       echo "$pid"
       return 0
       ;;

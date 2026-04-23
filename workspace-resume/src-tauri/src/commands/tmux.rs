@@ -417,12 +417,18 @@ pub async fn populate_git_info(panes: &mut [TmuxPane]) {
 /// this when a new patched/repackaged Claude binary shows up. Currently
 /// recognises:
 /// - `claude` / `claude-b` — upstream binaries
-/// - `cli-ncld-*.bin` — Andrea's patched binaries from `~/claude-patching`;
-///   they print the same banner strings and run Claude Code internally,
-///   so the poller must classify them as Claude-alive to reach the
-///   `Running`/`Waiting` branches in the state machine.
+/// - `cli-ncld-*.bin` (WSL) / `cli-mncld-*.bin` (Mac) — Andrea's patched
+///   binaries from `~/claude-patching`; they print the same banner strings
+///   and run Claude Code internally, so the poller must classify them as
+///   Claude-alive to reach the `Running`/`Waiting` branches in the state
+///   machine. The `cli-mncld-` variant is the Mac (Mach-O arm64) build.
+/// - `cld` / `cld2` / `cld3` / `ncld` / `ncld2` / `ncld3` / `mncld` —
+///   Andrea's shell-function wrappers (WSL `.bashrc`, Mac `.zshenv`).
+///   When a pane was started with one of these (tmux start_command) the
+///   contains-`"cld"` check catches all of them without needing to
+///   enumerate every version suffix (cld88, ncld113, ncld111, ...).
 fn is_claude_command(cmd_lower: &str) -> bool {
-    cmd_lower.contains("claude") || cmd_lower.contains("cli-ncld")
+    cmd_lower.contains("claude") || cmd_lower.contains("cld")
 }
 
 /// Return true if the pane is "running Claude" — either the foreground

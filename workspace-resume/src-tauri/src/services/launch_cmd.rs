@@ -29,11 +29,11 @@ pub struct LaunchParams<'a> {
     pub yolo: bool,
 }
 
-/// Build the full `cd "<path>" && [env_prefix]{ncld|mcld}[ -r sid][ --yolo]` string.
+/// Build the full `cd "<path>" && [env_prefix]{ncld|mncld}[ -r sid][ --yolo]` string.
 pub fn build_launch_command(p: &LaunchParams) -> String {
     let base = match p.host {
         HostTarget::Local => "ncld",
-        HostTarget::Remote { .. } => "mcld",
+        HostTarget::Remote { .. } => "mncld",
     };
 
     // Config-dir selection. Map from identity key → env prefix. The
@@ -169,7 +169,7 @@ mod tests {
             resume_sid: None,
             yolo: false,
         });
-        assert_eq!(s, r#"cd "/Users/admin/projects/foo" && mcld"#);
+        assert_eq!(s, r#"cd "/Users/admin/projects/foo" && mncld"#);
     }
 
     #[test]
@@ -183,7 +183,7 @@ mod tests {
         });
         assert_eq!(
             s,
-            r#"cd "/Users/admin/projects/foo" && mcld -r abc-123 --dangerously-skip-permissions"#
+            r#"cd "/Users/admin/projects/foo" && mncld -r abc-123 --dangerously-skip-permissions"#
         );
     }
 
@@ -198,7 +198,7 @@ mod tests {
         });
         assert_eq!(
             s,
-            r#"cd "/Users/admin/projects/foo" && CLAUDE_CONFIG_DIR="$HOME/.claude-b" mcld"#
+            r#"cd "/Users/admin/projects/foo" && CLAUDE_CONFIG_DIR="$HOME/.claude-b" mncld"#
         );
     }
 
@@ -213,7 +213,7 @@ mod tests {
         });
         assert_eq!(
             s,
-            r#"cd "/Users/admin/projects/foo" && CLAUDE_CONFIG_DIR="$HOME/.claude-b" mcld -r abc-123"#
+            r#"cd "/Users/admin/projects/foo" && CLAUDE_CONFIG_DIR="$HOME/.claude-b" mncld -r abc-123"#
         );
     }
 
@@ -228,7 +228,7 @@ mod tests {
         });
         assert_eq!(
             s,
-            r#"cd "/Users/admin/projects/foo" && CLAUDE_CONFIG_DIR="$HOME/.claude-c" mcld"#
+            r#"cd "/Users/admin/projects/foo" && CLAUDE_CONFIG_DIR="$HOME/.claude-c" mncld"#
         );
     }
 
@@ -243,7 +243,7 @@ mod tests {
         });
         assert_eq!(
             s,
-            r#"cd "/Users/admin/projects/foo" && CLAUDE_CONFIG_DIR="$HOME/.claude-c" mcld -r xyz-789"#
+            r#"cd "/Users/admin/projects/foo" && CLAUDE_CONFIG_DIR="$HOME/.claude-c" mncld -r xyz-789"#
         );
     }
 

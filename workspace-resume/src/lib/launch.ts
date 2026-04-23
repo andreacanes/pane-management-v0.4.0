@@ -157,7 +157,7 @@ export async function launchToPane(opts: {
   const account = opts.account ?? "andrea";
 
   if (host !== "local") {
-    // Remote host: Rust-side launch_in_pane assembles the cd-then-mcld
+    // Remote host: Rust-side launch_in_pane assembles the cd-then-mncld
     // string and routes it over SSH to the target host's tmux.
     await launchInPane({
       session: opts.tmuxSession,
