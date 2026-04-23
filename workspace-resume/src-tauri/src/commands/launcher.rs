@@ -365,6 +365,76 @@ fn chrono_now() -> String {
     format!("{}Z", secs)
 }
 
+// ---------------------
+// Host-aware pane launching (Mac Studio integration)
+// ---------------------
+
+/// Assemble the Claude launch command for a given host/account/project.
+/// Exposed primarily as a debug / test surface — the frontend typically
+/// goes straight to [`launch_in_pane`] which bundles the assembly plus
+/// the tmux send-keys side effect. Pure; no side effects.
+#[tauri::command]
+pub async fn build_launch_command(
+    host: String,
+    account: String,
+    project_path: String,
+    resume_sid: Option<String>,
+    yolo: bool,
+) -> Result<String, String> {
+    let host_target = crate::services::host_target::HostTarget::from_str(Some(&host));
+    let params = crate::services::launch_cmd::LaunchParams {
+        host: &host_target,
+        account: &account,
+        project_path: &project_path,
+        resume_sid: resume_sid.as_deref(),
+        yolo,
+    };
+    Ok(crate::services::launch_cmd::build_launch_command(&params))
+}
+
+/// Launch (or re-launch) Claude inside a tmux pane on a specific host
+/// under a specific account. Replaces the frontend's previous pattern
+/// of building the `cd ... && ncld -r ...` string in TypeScript and
+/// calling `send_to_pane` — all the vocab knowledge now lives in
+/// `services::launch_cmd::build_launch_command` and the host dispatch
+/// lives in `commands::tmux::send_to_pane_on`.
+///
+/// For `host = "mac"`, the final shell command is sent via
+/// `ssh mac -- tmux send-keys ...`, so the resolved tmux pane lives
+/// on the Mac. `$HOME` expansion happens inside the pane's own shell
+/// — `CLAUDE_CONFIG_DIR="$HOME/.claude-c"` resolves to
+/// `/Users/admin/.claude-c` on the Mac, not the calling Windows/WSL
+/// user's home.
+#[tauri::command]
+pub async fn launch_in_pane(
+    session: String,
+    window: u32,
+    pane: u32,
+    host: String,
+    account: String,
+    project_path: String,
+    resume_sid: Option<String>,
+    yolo: bool,
+) -> Result<(), String> {
+    let host_target = crate::services::host_target::HostTarget::from_str(Some(&host));
+    let params = crate::services::launch_cmd::LaunchParams {
+        host: &host_target,
+        account: &account,
+        project_path: &project_path,
+        resume_sid: resume_sid.as_deref(),
+        yolo,
+    };
+    let command = crate::services::launch_cmd::build_launch_command(&params);
+    crate::commands::tmux::send_to_pane_on(
+        &host_target,
+        &session,
+        window,
+        pane,
+        &command,
+    )
+    .await
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -131,6 +131,71 @@ pub async fn run_tmux_command_async(script: String) -> Result<String, String> {
         .map_err(|e| format!("tmux join error: {}", e))?
 }
 
+/// Host-aware variant of [`run_tmux_command`]. When `host` is
+/// [`HostTarget::Local`], behaves identically to the plain helper. When
+/// `host` is [`HostTarget::Remote`], wraps the script in
+/// `ssh <alias> -- '<quoted>'` and runs that through the existing
+/// `wsl.exe -e bash -c` envelope — reusing the user's WSL-side ssh
+/// config, Tailscale MagicDNS, `id_ed25519_*` key, and
+/// `creation_flags(0x08000000)` handling.
+pub fn run_tmux_command_on(
+    host: &crate::services::host_target::HostTarget,
+    script: &str,
+) -> Result<String, String> {
+    use crate::services::host_target::{ssh_shell_quote, HostTarget};
+    match host {
+        HostTarget::Local => run_tmux_command(script),
+        HostTarget::Remote { alias } => {
+            let wrapped = format!("ssh {} -- {}", alias, ssh_shell_quote(script));
+            run_tmux_command(&wrapped)
+        }
+    }
+}
+
+/// Async host-aware variant of [`run_tmux_command_async`]. See
+/// [`run_tmux_command_on`] for the Local vs Remote semantics.
+pub async fn run_tmux_command_async_on(
+    host: crate::services::host_target::HostTarget,
+    script: String,
+) -> Result<String, String> {
+    tokio::task::spawn_blocking(move || run_tmux_command_on(&host, &script))
+        .await
+        .map_err(|e| format!("tmux join error: {}", e))?
+}
+
+/// Host-aware `tmux send-keys` that works for both local and remote
+/// panes. Remote panes hit the target host over SSH; the final shell
+/// command runs inside whichever tmux pane this is targeting, so
+/// `$HOME` and other env expansion happen on the pane's own host.
+///
+/// `command` is the user's raw shell command (e.g. `cd foo && ncld`).
+/// This helper handles the single-quote escaping for `send-keys`;
+/// remote transport escaping happens one layer up in
+/// [`run_tmux_command_on`] via `ssh_shell_quote`.
+pub async fn send_to_pane_on(
+    host: &crate::services::host_target::HostTarget,
+    session_name: &str,
+    window_index: u32,
+    pane_index: u32,
+    command: &str,
+) -> Result<(), String> {
+    let escaped = command.replace('\'', "'\\''");
+    let script = format!(
+        "tmux send-keys -t '{}:{}.{}' '{}' Enter",
+        session_name, window_index, pane_index, escaped
+    );
+    eprintln!(
+        "[send_to_pane_on] host={} target={}:{}.{} command={}",
+        host.wire_str(),
+        session_name,
+        window_index,
+        pane_index,
+        command
+    );
+    run_tmux_command_async_on(host.clone(), script).await?;
+    Ok(())
+}
+
 /// Write binary data to a file on the WSL filesystem by piping through
 /// `wsl.exe -e bash -c "cat > '<path>'"`. The parent directory is created
 /// automatically. This is synchronous — call [`write_file_to_wsl_async`]
