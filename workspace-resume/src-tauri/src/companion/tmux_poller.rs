@@ -58,6 +58,86 @@ fn preview_looks_claude(preview: &[String]) -> bool {
     false
 }
 
+/// Whole-word containment — `w` must be bounded by non-alphanumeric
+/// characters (or the string ends). Prevents `"cld"` from matching
+/// inside `"ncld"` or `"cli-mncld-118.bin"`.
+fn contains_word(haystack: &str, w: &str) -> bool {
+    for (idx, _) in haystack.match_indices(w) {
+        let bytes = haystack.as_bytes();
+        let before_ok = idx == 0 || !bytes[idx - 1].is_ascii_alphanumeric();
+        let end = idx + w.len();
+        let after_ok = end >= bytes.len() || !bytes[end].is_ascii_alphanumeric();
+        if before_ok && after_ok {
+            return true;
+        }
+    }
+    false
+}
+
+/// Synthesize a `claude_account` value for a Claude-alive pane whose
+/// current command is `ssh` — the /proc walker sees only the ssh
+/// process and never reaches a Claude descendant, so the usual
+/// detection returns None. Scan `start_command` + the last-capture
+/// preview for account markers, prioritizing explicit config-dir
+/// paths > `-3`/`-2` wrapper suffixes > identity names > primary
+/// fallback. Returns `None` only when nothing Claude-ish is visible
+/// at all (caller already knows the pane is Claude-alive, so this is
+/// rare — falls through to bare `claude` / `mncld` → andrea).
+fn detect_account_from_ssh_context(
+    preview: &[String],
+    start_command: &str,
+) -> Option<String> {
+    let mut hay = String::with_capacity(256);
+    hay.push_str(&start_command.to_ascii_lowercase());
+    hay.push(' ');
+    for line in preview {
+        hay.push_str(&line.to_ascii_lowercase());
+        hay.push(' ');
+    }
+
+    // Tier 1 — explicit CLAUDE_CONFIG_DIR path. Most authoritative: a
+    // literal `.claude-c` / `.claude-b` in the ssh command (e.g.
+    // `ssh mac -t 'env CLAUDE_CONFIG_DIR=~/.claude-c mncld'`) pins the
+    // account unambiguously.
+    if hay.contains(".claude-c") {
+        return Some("sully".to_string());
+    }
+    if hay.contains(".claude-b") {
+        return Some("bravura".to_string());
+    }
+
+    // Tier 2 — `-3` / `-2` suffixed wrappers from ~/.bashrc or
+    // ~/.zshenv (`cld3`, `ncld3`, `claude3`, `mncld3` → sully;
+    // `cld2`, `ncld2`, `claude2`, `mncld2` → bravura), or the
+    // identity name as a standalone token (e.g. `cc akamai sully`).
+    for w in ["cld3", "ncld3", "claude3", "mncld3", "sully"] {
+        if contains_word(&hay, w) {
+            return Some("sully".to_string());
+        }
+    }
+    for w in ["cld2", "ncld2", "claude2", "mncld2", "bravura"] {
+        if contains_word(&hay, w) {
+            return Some("bravura".to_string());
+        }
+    }
+
+    // Tier 3 — bare wrapper / patched-binary names → andrea (the
+    // primary account). `cli-ncld`/`cli-mncld` are the patched native
+    // builds; `cld`/`ncld`/`claude`/`mncld` are the bare wrappers;
+    // `cc` is the Mac `~/bin/cc <project>` launcher with no account
+    // arg (defaults to andrea); `andrea` catches literal identity
+    // mentions.
+    for w in [
+        "cld", "ncld", "claude", "mncld", "cli-ncld", "cli-mncld", "cc", "andrea",
+    ] {
+        if contains_word(&hay, w) {
+            return Some("andrea".to_string());
+        }
+    }
+
+    None
+}
+
 fn is_claude_like(current_cmd: &str, start_cmd: &str) -> bool {
     let cc = current_cmd.trim();
     if cc == "claude" || cc == "ncld" || cc.starts_with("cli-ncld") {
@@ -866,8 +946,20 @@ async fn poll_once(state: &AppState) -> anyhow::Result<()> {
         // preview when the current command is `ssh`.
         let claude_alive = crate::commands::tmux::pane_is_claude(&cur_cmd, &start_cmd)
             || (cur_cmd.trim().eq_ignore_ascii_case("ssh") && preview_looks_claude(&preview));
-        if claude_alive && rec.claude_account.is_none() && !pane_pid.is_empty() {
+        let is_ssh_claude =
+            cur_cmd.trim().eq_ignore_ascii_case("ssh") && claude_alive;
+        if claude_alive && rec.claude_account.is_none() && !pane_pid.is_empty() && !is_ssh_claude {
+            // Skip /proc-based detection for ssh-wrapped panes — the
+            // walker never reaches Claude because it runs on the far
+            // side of the tunnel. The context-based synth below picks
+            // the account up from start_command / capture preview.
             detect_queue.push((id.clone(), pane_pid.clone()));
+        }
+        if is_ssh_claude && rec.claude_account.is_none() {
+            if let Some(acct) = detect_account_from_ssh_context(&preview, &start_cmd) {
+                rec.claude_account = Some(acct.clone());
+                rec.dto.claude_account = Some(acct);
+            }
         }
         // Queue session detection (proc-walk for open .jsonl) when Claude
         // is alive but we haven't explicitly bound a session_id yet.
@@ -1747,6 +1839,98 @@ mod tests {
         assert_eq!(strip_ansi("\x1b[31mhello\x1b[0m"), "hello");
         assert_eq!(strip_ansi("no ansi"), "no ansi");
         assert_eq!(strip_ansi("carry\rreturn"), "carryreturn");
+    }
+
+    #[test]
+    fn contains_word_boundaries() {
+        assert!(contains_word("cld3 something", "cld3"));
+        assert!(contains_word("prefix cld3", "cld3"));
+        assert!(contains_word("cld3", "cld3"));
+        assert!(!contains_word("encld3ed", "cld3"));
+        // "cld" must NOT match inside "ncld" or "mncld" or "cli-ncld-118.bin"
+        assert!(!contains_word("ncld file", "cld"));
+        assert!(!contains_word("mncld", "cld"));
+        assert!(!contains_word("cli-mncld-118.bin", "cld"));
+        // "cld" CAN stand alone.
+        assert!(contains_word("type cld then enter", "cld"));
+    }
+
+    #[test]
+    fn detect_account_ssh_config_dir_sully() {
+        // `ssh mac -t 'env CLAUDE_CONFIG_DIR=~/.claude-c mncld'`
+        let start = r#"ssh mac -t env CLAUDE_CONFIG_DIR=/Users/admin/.claude-c mncld"#;
+        assert_eq!(
+            detect_account_from_ssh_context(&[], start),
+            Some("sully".to_string())
+        );
+    }
+
+    #[test]
+    fn detect_account_ssh_config_dir_bravura() {
+        let start = r#"ssh mac -t env CLAUDE_CONFIG_DIR=$HOME/.claude-b mncld"#;
+        assert_eq!(
+            detect_account_from_ssh_context(&[], start),
+            Some("bravura".to_string())
+        );
+    }
+
+    #[test]
+    fn detect_account_ssh_wrapper_suffix_3() {
+        let start = "ssh mac -t cld3";
+        assert_eq!(
+            detect_account_from_ssh_context(&[], start),
+            Some("sully".to_string())
+        );
+    }
+
+    #[test]
+    fn detect_account_ssh_wrapper_suffix_2() {
+        let start = "ssh mac -t ncld2";
+        assert_eq!(
+            detect_account_from_ssh_context(&[], start),
+            Some("bravura".to_string())
+        );
+    }
+
+    #[test]
+    fn detect_account_ssh_cc_with_account_arg() {
+        // Mac's `cc <project> <account>` launcher.
+        let start = "ssh mac -t cc akamai-v3-bestbuy sully";
+        assert_eq!(
+            detect_account_from_ssh_context(&[], start),
+            Some("sully".to_string())
+        );
+    }
+
+    #[test]
+    fn detect_account_ssh_bare_cc_is_andrea() {
+        // Bare `cc <project>` defaults to andrea.
+        let start = "ssh mac -t cc akamai-v3-bestbuy";
+        assert_eq!(
+            detect_account_from_ssh_context(&[], start),
+            Some("andrea".to_string())
+        );
+    }
+
+    #[test]
+    fn detect_account_from_preview_only() {
+        // start_command is a resurrect wrapper — no Claude hint.
+        // Preview carries the banner line.
+        let start = r#"cat '/home/andrea/.local/share/tmux/resurrect/...'"#;
+        let preview = vec![
+            "✳ Claude Code v2.1.118".to_string(),
+            "  Opus 4.7 with max effort · Claude Max".to_string(),
+        ];
+        assert_eq!(
+            detect_account_from_ssh_context(&preview, start),
+            Some("andrea".to_string())
+        );
+    }
+
+    #[test]
+    fn detect_account_no_claude_markers_at_all() {
+        let start = "ssh somewhere-else-completely";
+        assert_eq!(detect_account_from_ssh_context(&[], start), None);
     }
 
     #[test]
