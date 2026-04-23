@@ -3,6 +3,8 @@ import { createDroppable } from "@thisbeyond/solid-dnd";
 import { useApp } from "../../contexts/AppContext";
 import {
   setPaneAssignment,
+  setPaneAssignmentMeta,
+  syncProjectToMac,
   killPane,
   openDirectory,
 } from "../../lib/tauri-commands";
@@ -123,22 +125,103 @@ export function PaneSlot(props: { pane: TmuxPane; assignment?: string | null }) 
   const gitBranch = () => props.pane.git_branch || null;
   const isWorktree = () => props.pane.is_worktree === true;
 
+  // Per-slot host/account selectors — read from the full-struct
+  // sibling map so default "local" / "andrea" applies for legacy
+  // entries without a persisted host/account.
+  const currentHost = () => {
+    const full = state.paneAssignmentsFull[String(paneIndex())];
+    return full?.host ?? "local";
+  };
+  const currentAccount = () => {
+    const full = state.paneAssignmentsFull[String(paneIndex())];
+    return full?.account ?? "andrea";
+  };
+  const [syncing, setSyncing] = createSignal(false);
+
   async function handleResume() {
     const p = effectiveProject();
-    if (!p || launching()) return;
+    const sess = state.selectedTmuxSession;
+    const winIdx = state.selectedTmuxWindow;
+    if (!p || !sess || winIdx == null || launching()) return;
     setLaunching(true);
-    try { await launchToPane(p, state, paneIndex()); }
+    try {
+      await launchToPane({
+        tmuxSession: sess,
+        tmuxWindow: winIdx,
+        tmuxPanes: state.tmuxPanes,
+        paneAssignments: state.paneAssignments,
+        encodedProject: p.encoded_name,
+        projectPath: p.actual_path,
+        sessionId: null,
+        boundSession: p.meta?.bound_session ?? null,
+        targetPaneIndex: paneIndex(),
+        host: currentHost(),
+        account: currentAccount(),
+      });
+    }
     catch (e) { console.error("[PaneSlot] resume error:", e); }
     finally { setLaunching(false); refreshTmuxState(); }
   }
 
   async function handleNewSession() {
     const p = effectiveProject();
-    if (!p || launching()) return;
+    const sess = state.selectedTmuxSession;
+    const winIdx = state.selectedTmuxWindow;
+    if (!p || !sess || winIdx == null || launching()) return;
     setLaunching(true);
-    try { await newSessionInPane(p, state, paneIndex()); }
+    try {
+      await newSessionInPane({
+        tmuxSession: sess,
+        tmuxWindow: winIdx,
+        tmuxPanes: state.tmuxPanes,
+        paneAssignments: state.paneAssignments,
+        encodedProject: p.encoded_name,
+        projectPath: p.actual_path,
+        targetPaneIndex: paneIndex(),
+        host: currentHost(),
+        account: currentAccount(),
+      });
+    }
     catch (e) { console.error("[PaneSlot] newSession error:", e); }
     finally { setLaunching(false); refreshTmuxState(); }
+  }
+
+  async function handleHostChange(newHost: string) {
+    const sess = state.selectedTmuxSession;
+    const winIdx = state.selectedTmuxWindow;
+    if (!sess || winIdx == null) return;
+    try {
+      await setPaneAssignmentMeta(sess, winIdx, paneIndex(), newHost, currentAccount());
+      refreshTmuxState();
+    } catch (e) {
+      console.error("[PaneSlot] handleHostChange error:", e);
+    }
+  }
+
+  async function handleAccountChange(newAccount: string) {
+    const sess = state.selectedTmuxSession;
+    const winIdx = state.selectedTmuxWindow;
+    if (!sess || winIdx == null) return;
+    try {
+      await setPaneAssignmentMeta(sess, winIdx, paneIndex(), currentHost(), newAccount);
+      refreshTmuxState();
+    } catch (e) {
+      console.error("[PaneSlot] handleAccountChange error:", e);
+    }
+  }
+
+  async function handleSyncToMac() {
+    const p = effectiveProject();
+    if (!p || syncing()) return;
+    setSyncing(true);
+    try {
+      const out = await syncProjectToMac(p.encoded_name);
+      console.log("[PaneSlot] sync-to-mac:", out);
+    } catch (e) {
+      console.error("[PaneSlot] syncToMac error:", e);
+    } finally {
+      setSyncing(false);
+    }
   }
 
   async function handleFork() {
@@ -229,6 +312,22 @@ export function PaneSlot(props: { pane: TmuxPane; assignment?: string | null }) 
         <div class="pane-slot-body">
           <div class="pane-slot-primary">
             <span class="pane-slot-title">{projectName()}</span>
+            <Show when={currentHost() !== "local"}>
+              <span
+                class="pane-slot-host-badge"
+                title={`Pane runs on ${currentHost()}`}
+                style={{
+                  "background": "rgba(20, 184, 166, 0.18)",
+                  "color": "#14b8a6",
+                  "padding": "1px 6px",
+                  "border-radius": "999px",
+                  "font-size": "10px",
+                  "font-weight": "600",
+                  "text-transform": "uppercase",
+                  "letter-spacing": "0.04em",
+                }}
+              >{currentHost()}</span>
+            </Show>
             <AccountBadge compact pane={props.pane} />
             <Show when={statusKind()}>
               <StatusChip status={statusKind()!} compact />
@@ -246,6 +345,51 @@ export function PaneSlot(props: { pane: TmuxPane; assignment?: string | null }) 
               </span>
             </Show>
           </div>
+
+          <Show when={hasProject()}>
+            <div
+              class="pane-slot-host-account"
+              style={{
+                "display": "flex",
+                "gap": "6px",
+                "margin-top": "4px",
+                "font-size": "11px",
+              }}
+              onClick={(e) => e.stopPropagation()}
+            >
+              <select
+                value={currentHost()}
+                onChange={(e) => handleHostChange(e.currentTarget.value)}
+                title="Where this pane runs"
+                style={{
+                  "background": "var(--surface-2, #1f1f23)",
+                  "color": "var(--text, #d4d4d4)",
+                  "border": "1px solid var(--border, #2d2d33)",
+                  "border-radius": "4px",
+                  "padding": "2px 4px",
+                }}
+              >
+                <option value="local">WSL</option>
+                <option value="mac">Mac</option>
+              </select>
+              <select
+                value={currentAccount()}
+                onChange={(e) => handleAccountChange(e.currentTarget.value)}
+                title="Claude account"
+                style={{
+                  "background": "var(--surface-2, #1f1f23)",
+                  "color": "var(--text, #d4d4d4)",
+                  "border": "1px solid var(--border, #2d2d33)",
+                  "border-radius": "4px",
+                  "padding": "2px 4px",
+                }}
+              >
+                <option value="andrea">Andrea</option>
+                <option value="bravura">Bravura</option>
+                <option value="sully">Sully</option>
+              </select>
+            </div>
+          </Show>
 
           <div class="pane-slot-actions">
             <Show when={showResume()}>
@@ -291,6 +435,15 @@ export function PaneSlot(props: { pane: TmuxPane; assignment?: string | null }) 
                   <button class="pane-slot-menu-item" onClick={() => { handleOpenDir(); setMenuOpen(false); }}>
                     <FolderOpen size={12} /> Open directory
                   </button>
+                  <Show when={hasProject() && currentHost() === "mac"}>
+                    <button
+                      class="pane-slot-menu-item"
+                      disabled={syncing()}
+                      onClick={() => { handleSyncToMac(); setMenuOpen(false); }}
+                    >
+                      <FolderOpen size={12} /> {syncing() ? "Syncing…" : "Sync to Mac"}
+                    </button>
+                  </Show>
                   <Show when={hasProject()}>
                     <button class="pane-slot-menu-item" onClick={() => { handleClear(); setMenuOpen(false); }}>
                       Clear assignment

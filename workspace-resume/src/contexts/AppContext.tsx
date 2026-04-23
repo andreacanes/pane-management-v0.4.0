@@ -56,6 +56,11 @@ interface AppState {
   tmuxWindows: TmuxWindow[];
   tmuxPanes: TmuxPane[];
   paneAssignments: Record<string, string>;
+  /** Full pane-slot assignment records keyed by pane index (as string).
+   *  Populated alongside `paneAssignments`. Carries the host/account
+   *  fields that the flat map elides. Slice A introduced the struct
+   *  server-side; Slice C surfaces it to the UI for dropdowns. */
+  paneAssignmentsFull: Record<string, import("../lib/types").PaneAssignment>;
   panePresets: PanePreset[];
   activeSessions: ActiveSession[];
   sessionOrder: string[];
@@ -132,6 +137,7 @@ export function AppProvider(props: { children: JSX.Element }) {
     tmuxWindows: [],
     tmuxPanes: [],
     paneAssignments: {},
+    paneAssignmentsFull: {},
     panePresets: [],
     activeSessions: [],
     sessionOrder: [],
@@ -324,6 +330,7 @@ export function AppProvider(props: { children: JSX.Element }) {
     const window = state.selectedTmuxWindow;
     if (session == null || window == null) {
       setState("paneAssignments", reconcile({}));
+      setState("paneAssignmentsFull", reconcile({}));
       return;
     }
     try {
@@ -333,6 +340,17 @@ export function AppProvider(props: { children: JSX.Element }) {
       setState("paneAssignments", reconcile(assignments));
     } catch (e) {
       console.error("[AppContext] loadPaneAssignments error:", e);
+    }
+    // Fetch the struct-shape sibling so PaneSlot can read host/account.
+    // Separate round-trip keeps existing callers of `paneAssignments`
+    // untouched and lets the struct load fail independently.
+    try {
+      const { getPaneAssignmentsFull } = await import("../lib/tauri-commands");
+      const full = await getPaneAssignmentsFull(session, window);
+      setState("paneAssignmentsFull", reconcile(full));
+    } catch (e) {
+      console.error("[AppContext] loadPaneAssignmentsFull error:", e);
+      setState("paneAssignmentsFull", reconcile({}));
     }
   }
 

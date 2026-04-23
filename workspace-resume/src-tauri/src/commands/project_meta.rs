@@ -408,6 +408,32 @@ pub fn get_pane_assignments_full_sync(
     load_pane_assignments(app)
 }
 
+/// Filter the full-struct assignment map to one session+window, keyed
+/// by pane_index (as a string to match the existing flat command's
+/// wire shape). Used by the frontend to populate host/account
+/// dropdowns in PaneSlot without forcing every existing caller of
+/// `get_pane_assignments` to learn the new struct shape.
+#[tauri::command]
+pub async fn get_pane_assignments_full(
+    session_name: String,
+    window_index: u32,
+    app: tauri::AppHandle,
+) -> Result<HashMap<String, PaneAssignment>, String> {
+    let all = load_pane_assignments(&app)?;
+    let prefix = format!("{}|{}|", session_name, window_index);
+    Ok(all
+        .into_iter()
+        .filter(|(k, _)| k.starts_with(&prefix))
+        .map(|(k, v)| {
+            let pane_idx = k
+                .strip_prefix(&prefix)
+                .unwrap_or(&k)
+                .to_string();
+            (pane_idx, v)
+        })
+        .collect())
+}
+
 #[tauri::command]
 pub async fn set_pane_assignment(
     session_name: String,

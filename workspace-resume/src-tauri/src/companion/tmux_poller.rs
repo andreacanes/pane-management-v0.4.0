@@ -112,18 +112,363 @@ fn lookup_project<'a>(
     }
 }
 
+/// Remote polling cadence. Slower than local (1s) because each tick is
+/// a full SSH round-trip over Tailscale — ~10-30ms with ControlMaster
+/// warm, 200-500ms on a cold handshake. 3s is responsive enough for
+/// approval / attention events, slow enough to absorb a DERP-relay
+/// fallback without flooding the Mac.
+const REMOTE_POLL_INTERVAL: Duration = Duration::from_secs(3);
+
 pub async fn run(state: AppState) {
+    let mut remote_last: HashMap<String, Instant> = HashMap::new();
     loop {
         let t0 = std::time::Instant::now();
+
+        // Local poll — every tick, unchanged cadence.
         if let Err(e) = poll_once(&state).await {
-            tracing::debug!("tmux poll error: {e}");
+            tracing::debug!("tmux poll error (local): {e}");
         }
+
+        // Remote polls — discover active remote hosts from pane
+        // assignments and fire each on its own cadence. When no pane
+        // targets a remote host, the inner loop doesn't execute and
+        // we don't pay any SSH cost.
+        let remote_hosts = discover_remote_hosts(&state).await;
+        for alias in remote_hosts {
+            let due = remote_last
+                .get(&alias)
+                .map(|t| t.elapsed() >= REMOTE_POLL_INTERVAL)
+                .unwrap_or(true);
+            if due {
+                if let Err(e) = poll_once_remote(&state, &alias).await {
+                    tracing::debug!(alias = %alias, "tmux poll error (remote): {e}");
+                }
+                remote_last.insert(alias, Instant::now());
+            }
+        }
+
         let dt = t0.elapsed();
         if dt.as_millis() > 500 {
             tracing::info!(elapsed_ms = %dt.as_millis(), "slow poll tick");
         }
         tokio::time::sleep(POLL_INTERVAL).await;
     }
+}
+
+/// Enumerate distinct non-local host aliases currently assigned to any
+/// pane slot. Reads from the Tauri store via the handle held on
+/// [`AppState`]; cheap enough to call every 1s tick (store is in-memory
+/// after first load, serde-deserializes a small HashMap).
+async fn discover_remote_hosts(state: &AppState) -> HashSet<String> {
+    let full = match crate::commands::project_meta::get_pane_assignments_full_sync(&state.app) {
+        Ok(m) => m,
+        Err(e) => {
+            tracing::debug!("pane_assignments read failed during remote discovery: {e}");
+            return HashSet::new();
+        }
+    };
+    full.values()
+        .filter_map(|a| {
+            if a.host.is_empty() || a.host == "local" {
+                None
+            } else {
+                Some(a.host.clone())
+            }
+        })
+        .collect()
+}
+
+/// Build a lookup from `"<session>|<window>|<pane>"` → configured
+/// account for every pane assignment targeting `alias`. Used by
+/// [`poll_once_remote`] to synthesize `claude_account` on the DTO
+/// since /proc isn't reachable across SSH.
+async fn remote_account_map_for_alias(
+    state: &AppState,
+    alias: &str,
+) -> HashMap<String, String> {
+    let full = match crate::commands::project_meta::get_pane_assignments_full_sync(&state.app) {
+        Ok(m) => m,
+        Err(_) => return HashMap::new(),
+    };
+    let mut out = HashMap::new();
+    for (key, assignment) in full {
+        if assignment.host == alias {
+            // Strip the session|window|pane key shape — pane_assignment
+            // keys are literally that already.
+            out.insert(key, assignment.account);
+        }
+    }
+    out
+}
+
+/// Remote-host variant of [`poll_once`]. Stripped down: no /proc
+/// account detection (not reachable across SSH), no session binding
+/// (would need lsof-on-Mac), no pipe-pane / log rotation (those write
+/// to the local filesystem). Responsibilities:
+///
+/// 1. Fetch list-panes + capture-pane via SSH in one batched call.
+/// 2. Upsert PaneRecord entries with `<alias>/` prefixed ids.
+/// 3. Synthesize `claude_account` from pane assignments.
+/// 4. Derive PaneState / waiting_reason using the same rules as local.
+/// 5. Emit PaneStateChanged / PaneOutputChanged / PaneUpdated events.
+/// 6. Prune remote panes under this alias that disappeared from tmux.
+async fn poll_once_remote(state: &AppState, alias: &str) -> anyhow::Result<()> {
+    use crate::services::host_target::HostTarget;
+    let host = HostTarget::Remote { alias: alias.to_string() };
+
+    // Same batched script as the local poll. `$(...)` and quoting work
+    // identically on the Mac; tmux's format strings are portable.
+    let combined = "echo '---LIST:BEGIN---'; \
+        tmux list-panes -a -F \
+        '#{session_name}|#{window_index}|#{window_name}|#{pane_index}|#{pane_current_command}|#{pane_current_path}|#{pane_pid}|#{pane_pipe}|#{pane_id}|#{pane_width}|#{pane_start_command}' \
+        2>/dev/null; \
+        echo '---LIST:END---'; \
+        for id in $(tmux list-panes -a -F '#{session_name}:#{window_index}.#{pane_index}' 2>/dev/null); do \
+            echo \"---CAP:$id:BEGIN---\"; \
+            tmux capture-pane -p -t \"$id\" -S -5 2>/dev/null; \
+            echo \"---CAP:$id:END---\"; \
+        done";
+    let combined_out =
+        crate::commands::tmux::run_tmux_command_async_on(host.clone(), combined.to_string())
+            .await
+            .map_err(|e| anyhow::anyhow!(e))?;
+
+    let list_begin = "---LIST:BEGIN---";
+    let list_end = "---LIST:END---";
+    let out = if let (Some(b), Some(e)) = (
+        combined_out.find(list_begin),
+        combined_out.find(list_end),
+    ) {
+        let list_start = b + list_begin.len();
+        combined_out[list_start..e].trim_matches('\n').to_string()
+    } else {
+        String::new()
+    };
+    let captures_section = combined_out
+        .find(list_end)
+        .map(|i| combined_out[i + list_end.len()..].to_string())
+        .unwrap_or_default();
+    let cap_map = parse_capture_batch(&captures_section);
+
+    let account_map = remote_account_map_for_alias(state, alias).await;
+    let mut seen: HashSet<String> = HashSet::new();
+
+    // Snapshots used by the state-derivation rule (same source of truth
+    // as local poll — phone hook flags + pending approvals).
+    let attention_snapshot: HashMap<String, WaitingReason> =
+        state.attention_panes.read().await.clone();
+    let pending_approval_panes: HashSet<String> = state
+        .approvals
+        .read()
+        .await
+        .values()
+        .map(|p| p.dto.pane_id.clone())
+        .collect();
+
+    for line in out.lines() {
+        if line.trim().is_empty() {
+            continue;
+        }
+        let parts: Vec<&str> = line.split('|').collect();
+        if parts.len() < 11 {
+            continue;
+        }
+        let session = parts[0].to_string();
+        let window_index: u32 = parts[1].parse().unwrap_or(0);
+        let window_name = parts[2].to_string();
+        let pane_index: u32 = parts[3].parse().unwrap_or(0);
+        let current_cmd = parts[4].to_string();
+        let current_path = parts[5].to_string();
+        // pane_pid is remote — unusable for /proc walks; kept as bookkeeping only.
+        // pane_pipe is irrelevant for remote (no pipe-pane on Mac side).
+        let pane_uid = parts[8].trim_start_matches('%').to_string();
+        let pane_width: u16 = parts[9].parse().unwrap_or(0);
+        let start_cmd = parts[10..].join("|");
+
+        // pane_assignment key format is "<session>|<window>|<pane>".
+        let coord_key = format!("{}|{}|{}", session, window_index, pane_index);
+        let synthesized_account = account_map.get(&coord_key).cloned();
+
+        // Remote pane id: `<alias>/<session>:<window>.<pane>` for
+        // uniqueness against local panes sharing the same tmux coordinate.
+        let id = format!("{}/{}:{}.{}", alias, session, window_index, pane_index);
+        let tmux_coord = format!("{}:{}.{}", session, window_index, pane_index);
+        seen.insert(id.clone());
+
+        let cap_out = cap_map.get(&tmux_coord).cloned().unwrap_or_default();
+        let preview: Vec<String> = cap_out
+            .lines()
+            .rev()
+            .take(5)
+            .map(strip_ansi)
+            .collect::<Vec<_>>()
+            .into_iter()
+            .rev()
+            .collect();
+        let output_hash = sha256(&cap_out);
+
+        let claude_session_id = parse_resume_uuid(&start_cmd);
+        let binding = if claude_session_id.is_some() {
+            BindingConfidence::Explicit
+        } else {
+            BindingConfidence::None
+        };
+
+        let mut panes = state.panes.write().await;
+        let now = now_ms();
+        let is_new = !panes.contains_key(&id);
+        let rec = panes.entry(id.clone()).or_insert_with(|| PaneRecord {
+            dto: PaneDto {
+                id: id.clone(),
+                session_name: session.clone(),
+                window_index,
+                window_name: window_name.clone(),
+                pane_index,
+                current_command: current_cmd.clone(),
+                current_path: current_path.clone(),
+                state: PaneState::Idle,
+                waiting_reason: None,
+                last_output_preview: preview.clone(),
+                project_encoded_name: None,
+                project_display_name: None,
+                claude_session_id: claude_session_id.clone(),
+                claude_account: synthesized_account.clone(),
+                host: Some(alias.to_string()),
+                claude_effort: None,
+                updated_at: now,
+                last_activity_at: None,
+                warning: None,
+            },
+            output_hash: [0u8; 32],
+            last_output_change: None,
+            binding_confidence: binding,
+            claude_account: synthesized_account.clone(),
+            pane_uid: pane_uid.clone(),
+            pane_width,
+        });
+
+        // Field updates — synthesized_account can change if the user
+        // flips the account dropdown; host is idempotent.
+        rec.dto.session_name = session.clone();
+        rec.dto.window_index = window_index;
+        rec.dto.window_name = window_name.clone();
+        rec.dto.pane_index = pane_index;
+        rec.dto.current_command = current_cmd.clone();
+        rec.dto.current_path = current_path.clone();
+        rec.pane_width = pane_width;
+        rec.pane_uid = pane_uid.clone();
+        if rec.dto.claude_account != synthesized_account {
+            rec.dto.claude_account = synthesized_account.clone();
+            rec.claude_account = synthesized_account.clone();
+        }
+        if rec.dto.host.as_deref() != Some(alias) {
+            rec.dto.host = Some(alias.to_string());
+        }
+        if claude_session_id.is_some()
+            && rec.binding_confidence != BindingConfidence::Explicit
+        {
+            rec.dto.claude_session_id = claude_session_id.clone();
+            rec.binding_confidence = BindingConfidence::Explicit;
+        }
+
+        let output_changed = rec.output_hash != output_hash;
+        if output_changed {
+            rec.output_hash = output_hash;
+            rec.last_output_change = Some(Instant::now());
+            rec.dto.last_output_preview = preview.clone();
+            let _ = state.events.send(EventDto::PaneOutputChanged {
+                pane_id: id.clone(),
+                tail: preview.clone(),
+                seq: now as u64,
+                at: now,
+            });
+            // Effort detection works cross-host: it's text parsing of
+            // the terminal capture, no filesystem dependency.
+            if let Some(new_effort) = detect_effort(&cap_out) {
+                if rec.dto.claude_effort.as_deref() != Some(new_effort) {
+                    rec.dto.claude_effort = Some(new_effort.to_string());
+                    let _ = state.events.send(EventDto::PaneUpdated {
+                        pane: rec.dto.clone(),
+                    });
+                }
+            }
+        }
+
+        // State derivation — matches local poll's rules (Idle when Claude
+        // exits or output stales; Waiting when an approval/attention flag
+        // is set; Running when output moves).
+        let claude_alive = crate::commands::tmux::pane_is_claude(&current_cmd, &start_cmd);
+        let has_pending = pending_approval_panes.contains(&id);
+        let in_attention = attention_snapshot.contains_key(&id);
+        let output_stale = rec
+            .last_output_change
+            .map(|t| t.elapsed() > IDLE_TIMEOUT)
+            .unwrap_or(true);
+
+        let desired = if !claude_alive {
+            PaneState::Idle
+        } else if has_pending || in_attention {
+            PaneState::Waiting
+        } else if output_stale {
+            PaneState::Idle
+        } else {
+            PaneState::Running
+        };
+
+        let desired_reason = if desired == PaneState::Waiting {
+            if has_pending {
+                Some(WaitingReason::Request)
+            } else {
+                attention_snapshot.get(&id).copied()
+            }
+        } else {
+            None
+        };
+
+        let state_changed = rec.dto.state != desired;
+        let reason_changed = rec.dto.waiting_reason != desired_reason;
+        if state_changed || reason_changed {
+            let old = rec.dto.state;
+            rec.dto.state = desired;
+            rec.dto.waiting_reason = desired_reason;
+            rec.dto.updated_at = now;
+            if state_changed {
+                let _ = state.events.send(EventDto::PaneStateChanged {
+                    pane_id: id.clone(),
+                    old,
+                    new: desired,
+                    at: now,
+                });
+            } else {
+                let _ = state.events.send(EventDto::PaneUpdated {
+                    pane: rec.dto.clone(),
+                });
+            }
+        }
+
+        if is_new {
+            tracing::debug!(pane = %id, alias = %alias, "new remote pane discovered");
+        }
+    }
+
+    // Prune remote panes under THIS alias that disappeared this tick.
+    // Other aliases and local panes are untouched.
+    let mut panes = state.panes.write().await;
+    let prefix = format!("{}/", alias);
+    let gone: Vec<String> = panes
+        .keys()
+        .filter(|k| k.starts_with(&prefix) && !seen.contains(*k))
+        .cloned()
+        .collect();
+    for id in &gone {
+        panes.remove(id);
+        let _ = state.events.send(EventDto::PaneRemoved {
+            pane_id: id.clone(),
+            at: now_ms(),
+        });
+    }
+
+    Ok(())
 }
 
 async fn poll_once(state: &AppState) -> anyhow::Result<()> {
@@ -320,6 +665,7 @@ async fn poll_once(state: &AppState) -> anyhow::Result<()> {
                 project_display_name: project_display.clone(),
                 claude_session_id: claude_session_id.clone(),
                 claude_account: None,
+                host: Some("local".to_string()),
                 claude_effort: None,
                 updated_at: now,
                 last_activity_at: None,
@@ -895,10 +1241,15 @@ async fn poll_once(state: &AppState) -> anyhow::Result<()> {
 
     // Drop panes that disappeared from tmux output. Emit PaneRemoved
     // per pane, then SessionEnded only for sessions with no remaining panes.
+    //
+    // Skip remote panes here — their ids contain a `<alias>/` prefix
+    // (e.g. `mac/main:0.0`) and are pruned by their own host-specific
+    // poll pass. Letting the local prune touch them would remove every
+    // Mac pane on every tick.
     let mut panes = state.panes.write().await;
     let gone: Vec<String> = panes
         .keys()
-        .filter(|k| !seen.contains(*k))
+        .filter(|k| !k.contains('/') && !seen.contains(*k))
         .cloned()
         .collect();
     let mut affected_sessions: HashSet<String> = HashSet::new();

@@ -57,7 +57,7 @@ export interface ActivePane {
   current_path: string;
   start_command: string;
   pane_pid?: string;
-  claude_account?: "andrea" | "bravura" | null;
+  claude_account?: "andrea" | "bravura" | "sully" | null;
 }
 
 export interface SessionInfo {
@@ -139,8 +139,8 @@ export interface TmuxPane {
   start_command?: string;
   /** Top-level process PID for this pane (usually the shell). */
   pane_pid?: string;
-  /** Server-detected Claude profile ("andrea" | "bravura"). */
-  claude_account?: "andrea" | "bravura" | null;
+  /** Server-detected Claude profile ("andrea" | "bravura" | "sully"). */
+  claude_account?: "andrea" | "bravura" | "sully" | null;
   /** Window index this pane belongs to (stamped by the backend). */
   window_index: number;
   /** Short git branch name at current_path, null when not a git repo. */
@@ -162,8 +162,11 @@ export interface PanePreset {
 }
 
 export interface PaneAssignment {
-  pane_index: number;
-  encoded_project: string | null;
+  encoded_project: string;
+  /** `"local"` (WSL) or an SSH alias such as `"mac"`. Default `"local"`. */
+  host: string;
+  /** `"andrea"` | `"bravura"` | `"sully"` — matches the Rust registry. */
+  account: string;
 }
 
 export interface WindowPaneStatus {

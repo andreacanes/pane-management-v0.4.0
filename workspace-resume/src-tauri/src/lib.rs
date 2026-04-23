@@ -83,6 +83,7 @@ pub fn run() {
             commands::project_meta::delete_pane_preset,
             commands::project_meta::get_pane_assignments,
             commands::project_meta::get_pane_assignments_raw,
+            commands::project_meta::get_pane_assignments_full,
             commands::project_meta::set_pane_assignment,
             commands::project_meta::set_pane_assignment_meta,
         ])

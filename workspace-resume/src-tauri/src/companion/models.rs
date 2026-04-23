@@ -73,12 +73,20 @@ pub struct PaneDto {
     /// Claude Code JSONL UUID if we've bound one to this pane.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub claude_session_id: Option<String>,
-    /// Which Claude account the pane is running under, detected from
-    /// the child process's `CLAUDE_CONFIG_DIR` env var. `"andrea"` or
-    /// `"bravura"` — `None` when the pane isn't a Claude session or we
-    /// haven't detected yet.
+    /// Which Claude account the pane is running under. On local panes:
+    /// detected from the child process's `CLAUDE_CONFIG_DIR` env var
+    /// (`"andrea"` / `"bravura"` / `"sully"`). On remote panes: synthesized
+    /// from the pane assignment's `account` field since /proc isn't
+    /// reachable cross-host. `None` when the pane isn't a Claude session
+    /// or we haven't detected yet.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub claude_account: Option<String>,
+    /// Which host the pane lives on: `"local"` (WSL tmux on this Windows
+    /// machine) or an SSH alias such as `"mac"`. `None` in wire payloads
+    /// from servers that predate Mac-host integration; clients should
+    /// treat `None` as `"local"`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub host: Option<String>,
     /// Current `/effort` level detected from the pane's terminal output.
     /// `"low"`, `"medium"`, `"high"`, or `"max"`. Sticky-cached in the
     /// poller: set when `detect_effort` finds a banner (`"with max effort"`)

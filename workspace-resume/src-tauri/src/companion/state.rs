@@ -165,6 +165,10 @@ pub struct AppState {
     pub audit: Option<Arc<super::audit_log::AuditLog>>,
     /// App data directory (Windows), used by the audit endpoint to read logs.
     pub audit_data_dir: Option<std::path::PathBuf>,
+    /// Tauri handle for looking up persisted settings (pane_assignments
+    /// for remote host / account synthesis, project_meta, etc.) from the
+    /// companion's background workers. Clone is cheap (Arc internally).
+    pub app: AppHandle,
 }
 
 impl AppState {
@@ -227,6 +231,7 @@ impl AppState {
             rate_limits: Arc::new(RwLock::new(Vec::new())),
             audit: None,
             audit_data_dir: None,
+            app: app.clone(),
         })
     }
 

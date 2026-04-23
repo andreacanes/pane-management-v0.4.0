@@ -290,6 +290,60 @@ export async function setPaneAssignment(sessionName: string, windowIndex: number
   return invoke("set_pane_assignment", { sessionName, windowIndex, paneIndex, encodedProject });
 }
 
+/** Read pane assignments for one session+window as the full struct
+ *  (encoded_project + host + account). Sibling of `getPaneAssignments`,
+ *  which returns only the encoded_project for legacy callers. */
+export async function getPaneAssignmentsFull(sessionName: string, windowIndex: number): Promise<Record<string, import("./types").PaneAssignment>> {
+  return invoke("get_pane_assignments_full", { sessionName, windowIndex });
+}
+
+/** Update just the host + account on an existing pane assignment.
+ *  Errors if the slot has no project assigned. */
+export async function setPaneAssignmentMeta(sessionName: string, windowIndex: number, paneIndex: number, host: string, account: string): Promise<void> {
+  return invoke("set_pane_assignment_meta", { sessionName, windowIndex, paneIndex, host, account });
+}
+
+/** Assemble + send the Claude launch command to a pane on the given host.
+ *  Replaces the previous TS-side `cd ... && ncld -r ...` string-building
+ *  for the Mac-host path. Local hosts can still use the legacy sendToPane
+ *  path unchanged. */
+export async function launchInPane(opts: {
+  session: string;
+  window: number;
+  pane: number;
+  host: string;
+  account: string;
+  projectPath: string;
+  resumeSid: string | null;
+  yolo: boolean;
+}): Promise<void> {
+  return invoke("launch_in_pane", opts);
+}
+
+/** Debug/test surface for `services::launch_cmd::build_launch_command`. */
+export async function buildLaunchCommand(opts: {
+  host: string;
+  account: string;
+  projectPath: string;
+  resumeSid: string | null;
+  yolo: boolean;
+}): Promise<string> {
+  return invoke("build_launch_command", opts);
+}
+
+/** Kick off a new Mutagen bidirectional sync for a project between WSL
+ *  and the Mac (`/Users/admin/projects/<name>`). Idempotent — re-running
+ *  for an already-synced project is a no-op. Returns the helper's combined
+ *  stdout so the UI can display the outcome. */
+export async function syncProjectToMac(encodedProject: string): Promise<string> {
+  return invoke("sync_project_to_mac", { encodedProject });
+}
+
+/** SSH aliases of currently-supported remote hosts (static ["mac"] for MVP). */
+export async function listRemoteHosts(): Promise<string[]> {
+  return invoke("list_remote_hosts");
+}
+
 export async function checkPaneStatuses(sessionName: string): Promise<Record<string, WindowPaneStatus>> {
   return invoke("check_pane_statuses", { sessionName });
 }

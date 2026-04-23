@@ -4,9 +4,22 @@ import {
   createPane,
   listSessions,
   cancelPaneCommand,
+  launchInPane,
 } from "./tauri-commands";
 import type { TmuxPane } from "./types";
 import { toWslPath } from "./path";
+
+/**
+ * Derive the Mac-side project path for a Mutagen-synced project.
+ * Convention (from `mac_studio_bridge` memory): `/home/andrea/<basename>`
+ * on WSL ↔ `/Users/admin/projects/<basename>` on the Mac. The basename
+ * matches on both sides because `sync-add-project` preserves it.
+ */
+function toMacPath(wslProjectPath: string): string {
+  const parts = wslProjectPath.split("/").filter((s) => s.length > 0);
+  const basename = parts[parts.length - 1] ?? "";
+  return `/Users/admin/projects/${basename}`;
+}
 
 // Re-export toWslPath so existing imports from launch.ts still work.
 export { toWslPath } from "./path";
@@ -112,6 +125,10 @@ export async function launchToPane(opts: {
   boundSession?: string | null;
   targetPaneIndex?: number;
   yolo?: boolean;
+  /** `"local"` (default, unchanged behaviour) or an SSH alias like `"mac"`. */
+  host?: string;
+  /** `"andrea"` (default) | `"bravura"` | `"sully"`. */
+  account?: string;
 }): Promise<number> {
   const paneIndex = await resolvePaneIndex(opts);
 
@@ -121,11 +138,8 @@ export async function launchToPane(opts: {
 
   await setPaneAssignment(opts.tmuxSession, opts.tmuxWindow, paneIndex, opts.encodedProject);
 
-  const wslPath = toWslPath(opts.projectPath);
-  const yoloFlag = opts.yolo ? " --dangerously-skip-permissions" : "";
-
   // Determine which session ID to use: explicit > bound > most-recent
-  let resumeId = opts.sessionId || opts.boundSession;
+  let resumeId: string | null | undefined = opts.sessionId || opts.boundSession;
 
   if (!resumeId) {
     try {
@@ -139,9 +153,36 @@ export async function launchToPane(opts: {
     }
   }
 
+  const host = opts.host ?? "local";
+  const account = opts.account ?? "andrea";
+
+  if (host !== "local") {
+    // Remote host: Rust-side launch_in_pane assembles the cd-then-mcld
+    // string and routes it over SSH to the target host's tmux.
+    await launchInPane({
+      session: opts.tmuxSession,
+      window: opts.tmuxWindow,
+      pane: paneIndex,
+      host,
+      account,
+      projectPath: toMacPath(opts.projectPath),
+      resumeSid: resumeId ?? null,
+      yolo: opts.yolo ?? false,
+    });
+    return paneIndex;
+  }
+
+  // Local path (unchanged pre-integration behaviour).
+  const wslPath = toWslPath(opts.projectPath);
+  const yoloFlag = opts.yolo ? " --dangerously-skip-permissions" : "";
+  const envPrefix = account === "bravura"
+    ? `CLAUDE_CONFIG_DIR="$HOME/.claude-b" `
+    : account === "sully"
+      ? `CLAUDE_CONFIG_DIR="$HOME/.claude-c" `
+      : "";
   const claudeCmd = resumeId
-    ? `${CLAUDE_CMD} -r ${resumeId}${yoloFlag}`
-    : `${CLAUDE_CMD} -r${yoloFlag}`;
+    ? `${envPrefix}${CLAUDE_CMD} -r ${resumeId}${yoloFlag}`
+    : `${envPrefix}${CLAUDE_CMD} -r${yoloFlag}`;
 
   // Chain cd + claude as a single command so claude only starts after cd completes
   await sendToPane(opts.tmuxSession, opts.tmuxWindow, paneIndex, `cd "${wslPath}" && ${claudeCmd}`);
@@ -262,6 +303,8 @@ export async function newSessionInPane(opts: {
   projectPath: string;
   targetPaneIndex?: number;
   yolo?: boolean;
+  host?: string;
+  account?: string;
 }): Promise<number> {
   const paneIndex = await resolvePaneIndex(opts);
 
@@ -271,9 +314,31 @@ export async function newSessionInPane(opts: {
 
   await setPaneAssignment(opts.tmuxSession, opts.tmuxWindow, paneIndex, opts.encodedProject);
 
+  const host = opts.host ?? "local";
+  const account = opts.account ?? "andrea";
+
+  if (host !== "local") {
+    await launchInPane({
+      session: opts.tmuxSession,
+      window: opts.tmuxWindow,
+      pane: paneIndex,
+      host,
+      account,
+      projectPath: toMacPath(opts.projectPath),
+      resumeSid: null,
+      yolo: opts.yolo ?? false,
+    });
+    return paneIndex;
+  }
+
   const wslPath = toWslPath(opts.projectPath);
   const yoloFlag = opts.yolo ? " --dangerously-skip-permissions" : "";
-  await sendToPane(opts.tmuxSession, opts.tmuxWindow, paneIndex, `cd "${wslPath}" && ${CLAUDE_CMD}${yoloFlag}`);
+  const envPrefix = account === "bravura"
+    ? `CLAUDE_CONFIG_DIR="$HOME/.claude-b" `
+    : account === "sully"
+      ? `CLAUDE_CONFIG_DIR="$HOME/.claude-c" `
+      : "";
+  await sendToPane(opts.tmuxSession, opts.tmuxWindow, paneIndex, `cd "${wslPath}" && ${envPrefix}${CLAUDE_CMD}${yoloFlag}`);
 
   return paneIndex;
 }
