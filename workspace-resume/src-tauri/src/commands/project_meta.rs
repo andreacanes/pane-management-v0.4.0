@@ -1,5 +1,6 @@
 use std::collections::HashMap;
 
+use crate::models::pane_assignment::{PaneAssignment, RawAssignment};
 use crate::models::pane_preset::PanePreset;
 use crate::models::project_meta::{ProjectMeta, ProjectTier};
 
@@ -75,7 +76,12 @@ fn save_pane_presets(
     Ok(())
 }
 
-fn load_pane_assignments(app: &tauri::AppHandle) -> Result<HashMap<String, String>, String> {
+/// Load pane assignments, tolerating the legacy shape where each value
+/// was a bare `String` (encoded project). Values are normalized into
+/// [`PaneAssignment`] via the [`RawAssignment`] untagged-enum shim.
+/// The next [`save_pane_assignments`] call migrates the store to the
+/// modern shape automatically.
+fn load_pane_assignments(app: &tauri::AppHandle) -> Result<HashMap<String, PaneAssignment>, String> {
     use tauri_plugin_store::StoreExt;
 
     let store = app
@@ -83,15 +89,18 @@ fn load_pane_assignments(app: &tauri::AppHandle) -> Result<HashMap<String, Strin
         .map_err(|e| format!("Failed to open settings store: {}", e))?;
 
     match store.get("pane_assignments") {
-        Some(value) => serde_json::from_value::<HashMap<String, String>>(value.clone())
-            .map_err(|e| format!("Failed to parse pane_assignments: {}", e)),
+        Some(value) => {
+            let raw: HashMap<String, RawAssignment> = serde_json::from_value(value.clone())
+                .map_err(|e| format!("Failed to parse pane_assignments: {}", e))?;
+            Ok(raw.into_iter().map(|(k, v)| (k, v.into())).collect())
+        }
         None => Ok(HashMap::new()),
     }
 }
 
 fn save_pane_assignments(
     app: &tauri::AppHandle,
-    data: &HashMap<String, String>,
+    data: &HashMap<String, PaneAssignment>,
 ) -> Result<(), String> {
     use tauri_plugin_store::StoreExt;
 
@@ -107,6 +116,18 @@ fn save_pane_assignments(
         .save()
         .map_err(|e| format!("Failed to save store: {}", e))?;
     Ok(())
+}
+
+/// Flatten the full-struct map down to the legacy `encoded_project`-only
+/// shape used by the current Tauri IPC wire. Slice C widens the wire to
+/// return the full struct; until then, readers get a plain string map
+/// and are oblivious to host/account fields.
+fn flatten_assignments(
+    full: &HashMap<String, PaneAssignment>,
+) -> HashMap<String, String> {
+    full.iter()
+        .map(|(k, v)| (k.clone(), v.encoded_project.clone()))
+        .collect()
 }
 
 // ---------------------
@@ -338,7 +359,8 @@ fn pane_key(session: &str, window: u32, pane: u32) -> String {
     format!("{}|{}|{}", session, window, pane)
 }
 
-/// Filter assignments for a specific session+window, returning just pane_index → project.
+/// Filter the (already-flattened) pane_index → encoded_project map to a
+/// specific session+window. Used by legacy-wire Tauri commands.
 fn filter_assignments(
     all: &HashMap<String, String>,
     session: &str,
@@ -360,8 +382,12 @@ pub async fn get_pane_assignments(
     window_index: u32,
     app: tauri::AppHandle,
 ) -> Result<HashMap<String, String>, String> {
-    let all = load_pane_assignments(&app)?;
-    Ok(filter_assignments(&all, &session_name, window_index))
+    let full = load_pane_assignments(&app)?;
+    Ok(filter_assignments(
+        &flatten_assignments(&full),
+        &session_name,
+        window_index,
+    ))
 }
 
 /// Return ALL pane assignments unfiltered (for resurrect — needs full cross-session state).
@@ -369,7 +395,17 @@ pub async fn get_pane_assignments(
 pub async fn get_pane_assignments_raw(
     app: tauri::AppHandle,
 ) -> Result<HashMap<String, String>, String> {
-    load_pane_assignments(&app)
+    let full = load_pane_assignments(&app)?;
+    Ok(flatten_assignments(&full))
+}
+
+/// Return ALL pane assignments as full [`PaneAssignment`] structs —
+/// used by the tmux_poller to discover active remote hosts and
+/// synthesize `claude_account` for remote panes.
+pub fn get_pane_assignments_full_sync(
+    app: &tauri::AppHandle,
+) -> Result<HashMap<String, PaneAssignment>, String> {
+    load_pane_assignments(app)
 }
 
 #[tauri::command]
@@ -385,7 +421,19 @@ pub async fn set_pane_assignment(
 
     match encoded_project {
         Some(project) => {
-            all.insert(key, project);
+            // Preserve host/account on an existing entry; start from
+            // defaults (local/andrea) for a fresh assignment. This keeps
+            // drag-assign behaviour unchanged while letting the dropdown
+            // path (set_pane_assignment_meta) mutate the other fields
+            // independently.
+            match all.get_mut(&key) {
+                Some(existing) => {
+                    existing.encoded_project = project;
+                }
+                None => {
+                    all.insert(key, PaneAssignment::new_local(project));
+                }
+            }
         }
         None => {
             all.remove(&key);
@@ -393,7 +441,43 @@ pub async fn set_pane_assignment(
     }
 
     save_pane_assignments(&app, &all)?;
-    Ok(filter_assignments(&all, &session_name, window_index))
+    Ok(filter_assignments(
+        &flatten_assignments(&all),
+        &session_name,
+        window_index,
+    ))
+}
+
+/// Update just the `host` and `account` of an existing pane assignment.
+/// Errors if no project is currently assigned to the slot — the
+/// frontend should only expose host/account dropdowns on assigned slots.
+#[tauri::command]
+pub async fn set_pane_assignment_meta(
+    session_name: String,
+    window_index: u32,
+    pane_index: u32,
+    host: String,
+    account: String,
+    app: tauri::AppHandle,
+) -> Result<(), String> {
+    let mut all = load_pane_assignments(&app)?;
+    let key = pane_key(&session_name, window_index, pane_index);
+
+    match all.get_mut(&key) {
+        Some(entry) => {
+            entry.host = host;
+            entry.account = account;
+        }
+        None => {
+            return Err(format!(
+                "no pane assignment at {} — assign a project before setting host/account",
+                key
+            ));
+        }
+    }
+
+    save_pane_assignments(&app, &all)?;
+    Ok(())
 }
 
 #[cfg(test)]

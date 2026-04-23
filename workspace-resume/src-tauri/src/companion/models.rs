@@ -79,6 +79,15 @@ pub struct PaneDto {
     /// haven't detected yet.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub claude_account: Option<String>,
+    /// Current `/effort` level detected from the pane's terminal output.
+    /// `"low"`, `"medium"`, `"high"`, or `"max"`. Sticky-cached in the
+    /// poller: set when `detect_effort` finds a banner (`"with max effort"`)
+    /// or echoed `/effort <level>`, cleared on pane renumber / session
+    /// change. `None` for non-Claude panes, or Claude panes where neither
+    /// signal has been seen yet (e.g. the desktop started after the
+    /// banner scrolled off and the user hasn't interacted with the chip).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub claude_effort: Option<String>,
     /// Epoch milliseconds of last state/output change.
     pub updated_at: i64,
     /// Epoch milliseconds of the last conversation message — derived from
@@ -88,6 +97,13 @@ pub struct PaneDto {
     /// panes or when the JSONL doesn't exist yet.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub last_activity_at: Option<i64>,
+    /// Operator-visible warning set by the companion when it detects an
+    /// abnormal state for this pane — e.g., session_id collision with
+    /// another pane. UI renders this as a yellow chip with the message
+    /// in a tooltip. Cleared the next time the pane's detection completes
+    /// cleanly. None for healthy panes.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub warning: Option<String>,
 }
 
 // ---------------------------------------------------------------------------
@@ -372,6 +388,15 @@ pub struct CreatePaneRequest {
 #[derive(Debug, Serialize)]
 pub struct CreatePaneResponse {
     pub pane_id: String,
+}
+
+/// Body for `POST /api/v1/panes/{id}/fork`. The target pane id is in the
+/// URL path; the source session_id is read server-side from AppState.
+/// Response reuses `CreatePaneResponse` — caller only needs the new
+/// pane's id to navigate there.
+#[derive(Debug, Deserialize)]
+pub struct ForkPaneRequest {
+    pub account: String, // "andrea" | "bravura"
 }
 
 // ---------------------------------------------------------------------------

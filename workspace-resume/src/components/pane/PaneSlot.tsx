@@ -6,7 +6,11 @@ import {
   killPane,
   openDirectory,
 } from "../../lib/tauri-commands";
-import { launchToPane, newSessionInPane } from "../../lib/launch";
+import {
+  launchToPane,
+  newSessionInPane,
+  forkPaneSession,
+} from "../../lib/launch";
 import { deriveName, fromWslPath } from "../../lib/path";
 import type { TmuxPane, ProjectWithMeta } from "../../lib/types";
 import { StatusChip } from "../ui/StatusChip";
@@ -78,7 +82,14 @@ export function PaneSlot(props: { pane: TmuxPane; assignment?: string | null }) 
     }
     return assigned || detected;
   };
-  const isRunningClaude = () => props.pane.current_command?.toLowerCase().includes("claude");
+  // Andrea's Claude binary appears as `cli-ncld-114.bin`, which does NOT
+  // contain the literal "claude". Widen the match so any ncld wrapper
+  // also registers — otherwise the UI mis-reports running-Claude panes
+  // as idle, and hides Fork / shows Resume+New in the wrong state.
+  const isRunningClaude = () => {
+    const cmd = props.pane.current_command?.toLowerCase() ?? "";
+    return cmd.includes("claude") || cmd.includes("ncld");
+  };
   const projectName = () => {
     const p = effectiveProject();
     if (p) return p.meta.display_name || deriveName(p.actual_path);
@@ -101,6 +112,14 @@ export function PaneSlot(props: { pane: TmuxPane; assignment?: string | null }) 
   };
 
   const showResume = () => hasProject() && !isRunningClaude();
+  /**
+   * Fork is available whenever the pane is running Claude and we can
+   * identify a project to look up sessions in. Session-id resolution
+   * happens inside forkPaneSession (parse start_command → bound_session
+   * → listSessions MRU), so we don't need to pre-resolve here — the
+   * async fallback chain is more robust than what we can compute sync.
+   */
+  const showFork = () => isRunningClaude() && effectiveProject() != null;
   const gitBranch = () => props.pane.git_branch || null;
   const isWorktree = () => props.pane.is_worktree === true;
 
@@ -120,6 +139,37 @@ export function PaneSlot(props: { pane: TmuxPane; assignment?: string | null }) 
     try { await newSessionInPane(p, state, paneIndex()); }
     catch (e) { console.error("[PaneSlot] newSession error:", e); }
     finally { setLaunching(false); refreshTmuxState(); }
+  }
+
+  async function handleFork() {
+    const sess = state.selectedTmuxSession;
+    const winIdx = state.selectedTmuxWindow;
+    const p = effectiveProject();
+    if (!sess || winIdx == null || launching() || !p) return;
+    // Prefer an explicit id parsed from start_command when present; otherwise
+    // forkPaneSession will fall back to bound_session → listSessions MRU.
+    const startCmd = props.pane.start_command || "";
+    const match = startCmd.match(/(?:^|\s)(?:--resume|-r)\s+([0-9a-f-]{36})(?:\s|$)/i);
+    const explicitSid = match ? match[1] : null;
+    setLaunching(true);
+    try {
+      await forkPaneSession({
+        tmuxSession: sess,
+        tmuxWindow: winIdx,
+        tmuxPanes: state.tmuxPanes,
+        paneAssignments: state.paneAssignments,
+        encodedProject: p.encoded_name,
+        projectPath: p.actual_path,
+        sourcePaneIndex: paneIndex(),
+        sessionId: explicitSid,
+        boundSession: p.meta?.bound_session,
+      });
+    } catch (e) {
+      console.error("[PaneSlot] fork error:", e);
+    } finally {
+      setLaunching(false);
+      refreshTmuxState();
+    }
   }
 
   async function handleClear() {
@@ -204,6 +254,17 @@ export function PaneSlot(props: { pane: TmuxPane; assignment?: string | null }) 
               </Button>
               <Button variant="secondary" size="sm" onClick={handleNewSession} disabled={launching()}>
                 New
+              </Button>
+            </Show>
+            <Show when={showFork()}>
+              <Button
+                variant="secondary"
+                size="sm"
+                onClick={handleFork}
+                disabled={launching()}
+                title="Fork this conversation — this pane continues as a new branch, a sibling pane opens the original frozen at the fork point"
+              >
+                <GitBranch size={12} /> Fork
               </Button>
             </Show>
 

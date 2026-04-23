@@ -33,11 +33,15 @@ fn path_basename(p: &str) -> String {
 }
 
 /// True when the pane is running Claude Code — either the live foreground
-/// command is `claude`/`ncld` or the start_command launched one. Used to
-/// decide which panes get pipe-pane logging.
+/// command is `claude`/`ncld` or a `cli-ncld-*.bin` patched binary from
+/// `~/claude-patching`, or the start_command launched one. Used to decide
+/// which panes get pipe-pane logging — must stay in sync with
+/// `commands::tmux::pane_is_claude`, though this version is intentionally
+/// stricter (token match instead of substring) to avoid enabling pipe-pane
+/// on plain shells whose history text happens to include "claude".
 fn is_claude_like(current_cmd: &str, start_cmd: &str) -> bool {
     let cc = current_cmd.trim();
-    if cc == "claude" || cc == "ncld" {
+    if cc == "claude" || cc == "ncld" || cc.starts_with("cli-ncld") {
         return true;
     }
     // start_command is the full invocation, e.g. "claude --resume <uuid>"
@@ -46,7 +50,7 @@ fn is_claude_like(current_cmd: &str, start_cmd: &str) -> bool {
     let sc = start_cmd.trim();
     for tok in sc.split_whitespace().take(2) {
         let stripped = tok.rsplit('/').next().unwrap_or(tok);
-        if stripped == "claude" || stripped == "ncld" {
+        if stripped == "claude" || stripped == "ncld" || stripped.starts_with("cli-ncld") {
             return true;
         }
     }
@@ -316,8 +320,10 @@ async fn poll_once(state: &AppState) -> anyhow::Result<()> {
                 project_display_name: project_display.clone(),
                 claude_session_id: claude_session_id.clone(),
                 claude_account: None,
+                claude_effort: None,
                 updated_at: now,
                 last_activity_at: None,
+                warning: None,
             },
             output_hash: [0u8; 32],
             last_output_change: None,
@@ -344,6 +350,7 @@ async fn poll_once(state: &AppState) -> anyhow::Result<()> {
             rec.binding_confidence = BindingConfidence::None;
             rec.claude_account = None;
             rec.dto.claude_account = None;
+            rec.dto.claude_effort = None;
             rec.output_hash = [0u8; 32]; // force next hash compare to re-emit
         }
 
@@ -403,6 +410,20 @@ async fn poll_once(state: &AppState) -> anyhow::Result<()> {
                 at: now,
             });
             tracing::debug!(pane = %id, "emit PaneOutputChanged");
+
+            // Effort detection — sticky cache. Only emit when the detected
+            // level differs from what we had; when detection returns None
+            // we keep the previous value (the banner scrolls off the
+            // 45-line window eventually, but the setting is still accurate).
+            if let Some(new_effort) = detect_effort(&cap_out) {
+                if rec.dto.claude_effort.as_deref() != Some(new_effort) {
+                    rec.dto.claude_effort = Some(new_effort.to_string());
+                    let _ = state.events.send(EventDto::PaneUpdated {
+                        pane: rec.dto.clone(),
+                    });
+                    tracing::debug!(pane = %id, effort = %new_effort, "emit PaneUpdated (effort)");
+                }
+            }
         }
 
         // Desired PaneState derivation. Single source of truth:
@@ -437,6 +458,15 @@ async fn poll_once(state: &AppState) -> anyhow::Result<()> {
         if !claude_alive && rec.binding_confidence != BindingConfidence::None {
             rec.dto.claude_session_id = None;
             rec.binding_confidence = BindingConfidence::None;
+        }
+        // And the effort setting is per-Claude-session — clear it so the
+        // next Claude invocation in this pane starts with no stale value
+        // while its banner is being detected.
+        if !claude_alive && rec.dto.claude_effort.is_some() {
+            rec.dto.claude_effort = None;
+            let _ = state.events.send(EventDto::PaneUpdated {
+                pane: rec.dto.clone(),
+            });
         }
         let has_pending = pending_approval_panes.contains(&id);
         let mut in_attention = attention_snapshot.contains_key(&id);
@@ -534,11 +564,18 @@ async fn poll_once(state: &AppState) -> anyhow::Result<()> {
     // of the rest of the poll flow. Errors log but don't fail the poll.
     for (pane_id, pane_uid, old_session, target, pipe_active) in pipe_actions {
         tokio::spawn(async move {
-            // Pending → known transition: migrate the pending log's content
-            // into the new session log so history is preserved contiguously
-            // across the transition.
-            if pipe_active && old_session.is_none() {
+            // Pending → session transition: stop the old pipe FIRST so
+            // the cat-subprocess flushes and exits before we move the
+            // pending file underneath it (otherwise cat keeps writing
+            // to a now-unlinked inode and that output is lost). Then
+            // migrate the pending bytes into the session log so
+            // history stays contiguous across the transition.
+            let needs_pending_migration = pipe_active
+                && old_session.is_none()
+                && matches!(&target, super::pane_log::LogTarget::Session(_));
+            if needs_pending_migration {
                 if let super::pane_log::LogTarget::Session(sid) = &target {
+                    let _ = super::pane_log::disable_pipe_pane(&pane_id).await;
                     if let Err(e) =
                         super::pane_log::migrate_pending_to_session(&pane_uid, sid).await
                     {
@@ -553,13 +590,17 @@ async fn poll_once(state: &AppState) -> anyhow::Result<()> {
                     }
                 }
             }
-            // If the pipe is active but we're switching targets, close first.
-            if pipe_active {
-                let _ = super::pane_log::disable_pipe_pane(&pane_id).await;
-            }
-            match super::pane_log::enable_pipe_pane(&pane_id, &target).await {
-                Ok(()) => tracing::info!(pane = %pane_id, target = ?target, "pipe-pane configured"),
-                Err(e) => tracing::debug!(pane = %pane_id, "pipe-pane enable failed: {e}"),
+            match super::pane_log::atomic_migrate_pipe_pane(&pane_id, &target).await {
+                Ok(()) => tracing::info!(
+                    pane = %pane_id,
+                    target = ?target,
+                    "pipe-pane configured (verified writing)"
+                ),
+                Err(e) => tracing::error!(
+                    pane = %pane_id,
+                    target = ?target,
+                    "atomic pipe migration failed: {e}"
+                ),
             }
         });
     }
@@ -669,16 +710,54 @@ async fn poll_once(state: &AppState) -> anyhow::Result<()> {
             let mut migrate_info: Option<(String, String)> = None; // (pane_uid, session_id)
             let updated_dto = {
                 let mut panes = state.panes.write().await;
-                if is_mru {
-                    let claimed_elsewhere = panes.iter().any(|(other_id, other_rec)| {
-                        other_id != &pane_id
-                            && other_rec.dto.claude_session_id.as_deref() == Some(&session_id)
+
+                // Session-id collision check. Two panes must never bind to
+                // the same session_id regardless of detection path (FD or
+                // MRU). Prior code only guarded MRU; with that guard, an
+                // FD-path race during a `/branch` copy-forward could silently
+                // bind a second pane to a session that already belongs to
+                // a sibling, producing the tool-use/tool-result positional
+                // violations that surface as Anthropic API 400s.
+                //
+                // Policy: first-writer-wins. The pane losing the race keeps
+                // its previous binding (or None) and gets a `warning` field
+                // set on its DTO so the UI flags the collision. The winning
+                // pane's binding is unchanged.
+                let claiming_pane: Option<String> =
+                    panes.iter().find_map(|(other_id, other_rec)| {
+                        if other_id != &pane_id
+                            && other_rec.dto.claude_session_id.as_deref()
+                                == Some(&session_id)
+                            && other_rec.binding_confidence
+                                != BindingConfidence::None
+                        {
+                            Some(other_id.clone())
+                        } else {
+                            None
+                        }
                     });
-                    if claimed_elsewhere {
-                        continue;
+
+                if let Some(other) = claiming_pane {
+                    let warning = format!("session_id collides with {}", other);
+                    if let Some(rec) = panes.get_mut(&pane_id) {
+                        if rec.dto.warning.as_deref() != Some(&warning) {
+                            tracing::warn!(
+                                pane = %pane_id,
+                                session = %session_id,
+                                %other,
+                                is_mru,
+                                "session_id collision — binding skipped"
+                            );
+                            rec.dto.warning = Some(warning);
+                            rec.dto.updated_at = now_ms();
+                            Some(rec.dto.clone())
+                        } else {
+                            None
+                        }
+                    } else {
+                        None
                     }
-                }
-                if let Some(rec) = panes.get_mut(&pane_id) {
+                } else if let Some(rec) = panes.get_mut(&pane_id) {
                     if rec.binding_confidence != BindingConfidence::Explicit {
                         // Capture the Pending → Session transition now that
                         // the session_id is being bound. If the pane's
@@ -694,6 +773,11 @@ async fn poll_once(state: &AppState) -> anyhow::Result<()> {
                         rec.binding_confidence = BindingConfidence::Heuristic;
                         if rec.dto.project_encoded_name.is_none() {
                             rec.dto.project_encoded_name = Some(encoded_project);
+                        }
+                        // Clear any stale collision warning now that the
+                        // binding is valid again.
+                        if rec.dto.warning.is_some() {
+                            rec.dto.warning = None;
                         }
                         rec.dto.updated_at = now_ms();
                         Some(rec.dto.clone())
@@ -711,7 +795,9 @@ async fn poll_once(state: &AppState) -> anyhow::Result<()> {
             if let Some((uid, sid)) = migrate_info {
                 let pid_clone = pane_id.clone();
                 tokio::spawn(async move {
-                    // Stop the pending pipe before moving the file.
+                    // Stop the pending pipe before moving the file so
+                    // no in-flight cat writes land on the pending inode
+                    // after we unlink it (buffered output would be lost).
                     let _ = super::pane_log::disable_pipe_pane(&pid_clone).await;
                     if let Err(e) =
                         super::pane_log::migrate_pending_to_session(&uid, &sid).await
@@ -726,10 +812,17 @@ async fn poll_once(state: &AppState) -> anyhow::Result<()> {
                         );
                     }
                     let target = super::pane_log::LogTarget::Session(sid);
-                    if let Err(e) =
-                        super::pane_log::enable_pipe_pane(&pid_clone, &target).await
-                    {
-                        tracing::debug!(pane = %pid_clone, "pipe re-target failed: {e}");
+                    match super::pane_log::atomic_migrate_pipe_pane(&pid_clone, &target).await {
+                        Ok(()) => tracing::info!(
+                            pane = %pid_clone,
+                            target = ?target,
+                            "pipe-pane migrated to session (verified writing)"
+                        ),
+                        Err(e) => tracing::error!(
+                            pane = %pid_clone,
+                            target = ?target,
+                            "atomic pipe migration failed: {e}"
+                        ),
                     }
                 });
             }
@@ -890,25 +983,85 @@ fn strip_ansi(s: &str) -> String {
     out
 }
 
+/// Scan a capture buffer for Claude Code's current effort level.
+///
+/// Two signals, both emitted by Claude Code 2.1+:
+/// - Session banner: `"with max effort · Claude Max"` — the level precedes
+///   the word "effort". Written once at the top of scrollback on session
+///   start; stays visible until the banner scrolls out.
+/// - Echoed slash command: `"/effort max"` — appears in the pane whenever
+///   the user (or the mobile EffortChip setter) runs the slash.
+///
+/// Scan is bottom-up and returns on the first hit, so when both signals
+/// appear in the buffer the more recent one wins. Returns `None` when
+/// neither is present — callers should keep any previously-cached value.
+fn detect_effort(capture: &str) -> Option<&'static str> {
+    for raw_line in capture.lines().rev() {
+        let line = strip_ansi(raw_line).to_ascii_lowercase();
+        // Keep `/` and `:` glued onto their tokens so "/effort" and "effort:"
+        // survive as single tokens. Everything else alphanumeric-adjacent is
+        // a delimiter. ASCII-only is fine: the signals are all Latin.
+        let tokens: Vec<&str> = line
+            .split(|c: char| !c.is_ascii_alphanumeric() && c != '/' && c != ':')
+            .filter(|s| !s.is_empty())
+            .collect();
+        for w in tokens.windows(2) {
+            // Banner: "<level> effort"
+            if w[1] == "effort" {
+                if let Some(lvl) = effort_level(w[0]) {
+                    return Some(lvl);
+                }
+            }
+            // Slash echo: "/effort <level>"
+            if w[0] == "/effort" {
+                if let Some(lvl) = effort_level(w[1]) {
+                    return Some(lvl);
+                }
+            }
+        }
+    }
+    None
+}
+
+fn effort_level(s: &str) -> Option<&'static str> {
+    match s {
+        "low" => Some("low"),
+        "medium" => Some("medium"),
+        "high" => Some("high"),
+        "max" => Some("max"),
+        _ => None,
+    }
+}
+
 /// Extract the uuid from `claude --resume <uuid>` or `claude -r <uuid>`
 /// in a pane's start command. Returns None if not a resume invocation.
+///
+/// When `--fork-session` is present, the uuid after `-r`/`--resume` names
+/// the *source* (frozen) session — the running Claude is writing to a
+/// brand-new uuid it picks at startup. Return None so the MRU fallback
+/// (`find_claude_session`) picks up the new JSONL on the next poll tick,
+/// instead of locking the pane to the frozen original.
 fn parse_resume_uuid(cmd: &str) -> Option<String> {
     let mut parts = cmd.split_whitespace();
     let _ = parts.next()?; // `claude`
     let mut expect_uuid = false;
+    let mut resume_uuid: Option<String> = None;
+    let mut forked = false;
     for part in parts {
         if expect_uuid {
-            // Minimal UUID shape check: 36 chars with 4 dashes
             if part.len() == 36 && part.matches('-').count() == 4 {
-                return Some(part.to_string());
+                resume_uuid = Some(part.to_string());
             }
             expect_uuid = false;
         }
         if part == "--resume" || part == "-r" {
             expect_uuid = true;
         }
+        if part == "--fork-session" {
+            forked = true;
+        }
     }
-    None
+    if forked { None } else { resume_uuid }
 }
 
 /// Find the Claude session JSONL for a tmux pane.
@@ -937,10 +1090,14 @@ walk() {{
   [ -d "/proc/$pid" ] || return 1
   local comm
   comm=$(cat "/proc/$pid/comm" 2>/dev/null)
-  if [ "$comm" = "claude" ]; then
-    echo "$pid"
-    return 0
-  fi
+  # comm is truncated to 15 chars by the kernel (TASK_COMM_LEN), so
+  # `cli-ncld-114.bin` appears as `cli-ncld-114.bi`. Match a prefix.
+  case "$comm" in
+    claude|cli-ncld-*|ncld|ncld2)
+      echo "$pid"
+      return 0
+      ;;
+  esac
   if [ "$comm" = "node" ]; then
     if grep -aq claude "/proc/$pid/cmdline" 2>/dev/null \
       || tr '\0' '\n' < "/proc/$pid/environ" 2>/dev/null | grep -q claude; then
@@ -956,22 +1113,32 @@ walk() {{
 claude_pid=$(walk {pid} 0)
 [ -z "$claude_pid" ] && exit 1
 
-# First-choice signal: catch a JSONL file descriptor while Claude has
-# it open. Claude reopens the file for each message write, so a short
-# burst of fd scans is usually enough for an actively-used pane. This
-# disambiguates two Claude instances in the same project dir — MRU
-# alone would map both to the last-written file and swap transcripts.
-# The `read -t 0.1 < /dev/null` trick gives us fractional-second
-# sleeps without needing `sleep 0.1` (not portable across shells).
+# First-choice signal: catch a JSONL file descriptor Claude has open for
+# WRITING while it's active. The write-mode filter is load-bearing — when
+# Claude resumes a session whose JSONL is `forkedFrom` an ancestor, it
+# briefly opens the parent JSONL in read-only mode to resolve fork history.
+# Without the mode check we'd bind the pane to the parent session name,
+# which is how two panes could end up appearing to claim the same session
+# id even though only one is actually writing it. The fdinfo `flags:` line
+# encodes POSIX open flags in octal — low two bits: 0=RDONLY, 1=WRONLY,
+# 2=RDWR. Claude's append-to-JSONL path uses O_WRONLY|O_APPEND (so flags &
+# 3 == 1). Read-only transients have flags & 3 == 0 and must be skipped.
 for i in $(seq 1 15); do
   for fd in /proc/$claude_pid/fd/*; do
     target=$(readlink "$fd" 2>/dev/null) || continue
     case "$target" in
-      "$HOME/.claude/projects/"*/*.jsonl|"$HOME/.claude-b/projects/"*/*.jsonl)
-        echo "$target"
-        exit 0
-        ;;
+      "$HOME/.claude/projects/"*/*.jsonl|"$HOME/.claude-b/projects/"*/*.jsonl) ;;
+      *) continue ;;
     esac
+    fdnum=$(basename "$fd")
+    flags=$(awk '/^flags:/ {{print $2; exit}}' "/proc/$claude_pid/fdinfo/$fdnum" 2>/dev/null)
+    [ -z "$flags" ] && continue
+    # Octal flags: bitwise AND with 3 (low two bits) picks RDONLY/WRONLY/RDWR.
+    mode=$(( 0$flags & 3 ))
+    if [ "$mode" = "1" ] || [ "$mode" = "2" ]; then
+      echo "$target"
+      exit 0
+    fi
   done
   read -t 0.1 </dev/null 2>/dev/null || true
 done
@@ -1037,5 +1204,58 @@ mod tests {
         assert_eq!(strip_ansi("\x1b[31mhello\x1b[0m"), "hello");
         assert_eq!(strip_ansi("no ansi"), "no ansi");
         assert_eq!(strip_ansi("carry\rreturn"), "carryreturn");
+    }
+
+    #[test]
+    fn test_detect_effort_banner() {
+        // Claude Code 2.1+ banner — level precedes "effort".
+        let cap = "Claude Code v2.1.111\n  Opus 4.7 (1M context) with max effort · Claude Max\n  ~/pane-management\n";
+        assert_eq!(detect_effort(cap), Some("max"));
+
+        let cap = "Opus 4.7 with high effort · Claude Pro";
+        assert_eq!(detect_effort(cap), Some("high"));
+
+        let cap = "Sonnet 4.6 with medium effort · Claude Max";
+        assert_eq!(detect_effort(cap), Some("medium"));
+
+        let cap = "Haiku with low effort · Claude";
+        assert_eq!(detect_effort(cap), Some("low"));
+    }
+
+    #[test]
+    fn test_detect_effort_slash_echo() {
+        // User ran /effort via the chip or typed it manually.
+        let cap = "some earlier output\n> /effort high\n";
+        assert_eq!(detect_effort(cap), Some("high"));
+    }
+
+    #[test]
+    fn test_detect_effort_prefers_most_recent() {
+        // Banner up top, user later ran /effort low → low should win.
+        let cap = "Opus 4.7 (1M context) with max effort · Claude Max\nsome work\n/effort low\n";
+        assert_eq!(detect_effort(cap), Some("low"));
+    }
+
+    #[test]
+    fn test_detect_effort_survives_ansi() {
+        // Typical ANSI-decorated banner line — escape codes get stripped.
+        let cap = "\x1b[38;2;200;200;200mOpus 4.7 (1M context) with \x1b[1mmax effort\x1b[0m · Claude Max\x1b[0m";
+        assert_eq!(detect_effort(cap), Some("max"));
+    }
+
+    #[test]
+    fn test_detect_effort_no_false_positive_on_claude_max() {
+        // "Claude Max" at the end of the banner is the Anthropic plan name,
+        // not an effort setting. The level must immediately precede "effort".
+        let cap = "Opus 4.7 (1M context) · Claude Max";
+        assert_eq!(detect_effort(cap), None);
+    }
+
+    #[test]
+    fn test_detect_effort_none_when_absent() {
+        assert_eq!(detect_effort(""), None);
+        assert_eq!(detect_effort("bash prompt\n$ ls\n"), None);
+        // "max" appears but not paired with "effort".
+        assert_eq!(detect_effort("max context window\n"), None);
     }
 }

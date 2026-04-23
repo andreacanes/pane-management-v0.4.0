@@ -491,3 +491,154 @@ pub async fn rotate_and_reattach(
     enable_pipe_pane(pane_id, target).await?;
     Ok(true)
 }
+
+/// Current byte count of the log file backing `target`. Returns 0 when
+/// the file is missing. Cheap stat call used by the pipe-pane verifier
+/// to bracket the grace window without doing any IO on the log itself.
+pub fn log_target_size(target: &LogTarget) -> u64 {
+    std::fs::metadata(target.win_path())
+        .map(|m| m.len())
+        .unwrap_or(0)
+}
+
+/// Switch pipe-pane to `new_target` and confirm the sink is actually
+/// writing before returning Ok. This is the atomic-migration primitive
+/// that replaces naked `enable_pipe_pane` calls whenever a migration is
+/// happening — the previous code trusted tmux's `pane_pipe=1` as proof
+/// of success, which misses the failure mode where tmux believes a pipe
+/// is attached but the cat-subprocess died immediately (e.g. path issue,
+/// race during session transition) and subsequent pane output never
+/// reaches disk.
+///
+/// Verification works by size-delta across a grace window. Claude Code's
+/// Barkeep statusline ticks every few hundred ms on any alive pane, so
+/// a 2.5s window is generous for a working pipe and tight enough that
+/// a twice-failed attempt costs ~6s total off the poll hot path
+/// (harmless — the caller spawns this in a detached tokio task).
+///
+/// On total failure the pipe is left DISABLED. That's deliberate: the
+/// poll loop's `needs_action = !pane_pipe_active || sid_changed` branch
+/// will re-trigger this routine on the next 2s tick, so a transient
+/// failure self-heals without needing any extra state-machine plumbing.
+/// If the failure persists, each retry logs an ERROR — noisy but
+/// visible, which is the right tradeoff versus a silently-dead pipe.
+pub async fn atomic_migrate_pipe_pane(
+    pane_id: &str,
+    new_target: &LogTarget,
+) -> Result<(), String> {
+    const SETTLE: std::time::Duration = std::time::Duration::from_millis(200);
+    const GRACE: std::time::Duration = std::time::Duration::from_millis(2500);
+
+    async fn attempt(pane_id: &str, new_target: &LogTarget) -> Result<(u64, u64), String> {
+        enable_pipe_pane(pane_id, new_target).await?;
+        // enable's shell script seeds the log from `capture-pane -S -` when
+        // the file is empty; settle briefly so that one-shot write finishes
+        // before we sample the "pre" size and don't mistake the seed for
+        // pipe output.
+        tokio::time::sleep(SETTLE).await;
+        let pre = log_target_size(new_target);
+        tokio::time::sleep(GRACE).await;
+        let post = log_target_size(new_target);
+        Ok((pre, post))
+    }
+
+    let (pre, post) = attempt(pane_id, new_target).await?;
+    if post > pre {
+        return Ok(());
+    }
+
+    tracing::warn!(
+        pane = pane_id,
+        target = ?new_target,
+        pre,
+        post,
+        "pipe-pane verify failed, retrying once"
+    );
+    let (pre2, post2) = attempt(pane_id, new_target).await?;
+    if post2 > pre2 {
+        return Ok(());
+    }
+
+    // Both attempts saw zero growth. Disable so `pane_pipe==0` on the
+    // next tick and the poller re-fires us rather than wedging with an
+    // attached-but-dead pipe.
+    let _ = disable_pipe_pane(pane_id).await;
+    Err(format!(
+        "pipe-pane verify failed twice for {:?} (sizes {pre}→{post}, retry {pre2}→{post2})",
+        new_target
+    ))
+}
+
+#[cfg(test)]
+mod replay_regressions {
+    //! Regression tests against captured pipe-pane fixtures. Each fixture
+    //! is a real (or trimmed) pipe-pane log captured from a pane that
+    //! exhibited a specific rendering bug on the APK side. The tests
+    //! exercise `replay_to_lines` directly — if they fail, the replay
+    //! pipeline is at fault; if they pass while the APK still looks
+    //! broken, the issue is downstream of the companion.
+
+    use super::*;
+
+    /// Fixture captured from session `abacb07b-d1e7-47d2-84f4-d18bdb1eb11d`
+    /// (main:1.2) on 2026-04-17 while the user was viewing a pane where
+    /// (1) history was apparently capped at ~100 lines and (2) Claude
+    /// Code's TaskList / spinner / progress elements were leaking through
+    /// as static scrollback entries. See
+    /// `~/.claude/plans/rendering-is-fucking-broken-sunny-kurzweil.md`
+    /// for context.
+    const TASKWIDGET_FIXTURE: &[u8] =
+        include_bytes!("pane_log_test_fixtures/claude_2_1_111_taskwidget.bin");
+
+    /// Fixture pane was 189 cols wide (typical of the user's wezterm
+    /// setup). Using the fallback width here would cause spurious cell
+    /// mixing — see commit 37999e1 for why.
+    const FIXTURE_WIDTH: usize = 189;
+
+    #[test]
+    fn taskwidget_fixture_replay_does_not_leak_spinner() {
+        let lines = replay_to_lines(TASKWIDGET_FIXTURE, FIXTURE_WIDTH);
+        let joined = lines.join("\n");
+
+        // "Sautéed for <duration>" is one of Claude Code's animated
+        // thinking-spinner verbs. It's overwritten in place on a real
+        // terminal. If replay leaves it in the final output, AVT is
+        // preserving a transient frame as permanent content.
+        assert!(
+            !joined.contains("Sautéed for"),
+            "spinner verb 'Sautéed for' leaked into replay output — \
+             a transient TUI frame is being preserved"
+        );
+
+        // Tool-in-flight banner — same category.
+        assert!(
+            !joined.contains("Running 1 bash command"),
+            "'Running 1 bash command' leaked into replay output"
+        );
+    }
+
+    #[test]
+    fn taskwidget_fixture_replay_returns_substantial_history() {
+        // The fixture is 4.2 MB of mostly newline-terminated output from
+        // a long Claude session. If `vt.lines()` returns far fewer lines
+        // than a human-visible session would suggest (e.g. <200), the
+        // pipeline is truncating history somewhere. The user reported
+        // scrolling up in the APK hit a hard ~100-line cap; this test
+        // either reproduces that here (failing assertion) or rules out
+        // the replay stage as the culprit (passing).
+        //
+        // The threshold is intentionally loose: a 4.2 MB log should
+        // have many more than 200 logical lines after replay under any
+        // reasonable theory of operation.
+        let lines = replay_to_lines(TASKWIDGET_FIXTURE, FIXTURE_WIDTH);
+        let nonblank = lines.iter().filter(|l| !l.trim().is_empty()).count();
+        assert!(
+            nonblank >= 200,
+            "replay of 4.2 MB fixture returned only {} non-blank lines \
+             (total {}). If this is near 100, the ~100-line cap reproduces \
+             at the replay layer.",
+            nonblank,
+            lines.len()
+        );
+    }
+}

@@ -2,6 +2,7 @@ import { createSignal, Show, onMount, onCleanup } from "solid-js";
 import { createDraggable } from "@thisbeyond/solid-dnd";
 import { open } from "@tauri-apps/plugin-dialog";
 import { useApp } from "../../contexts/AppContext";
+import { createProjectFolder } from "../../lib/tauri-commands";
 import { toWslPath } from "../../lib/path";
 
 export const NEW_PROJECT_PREFIX = "new-project:";
@@ -29,6 +30,13 @@ export function NewProjectFlow(props: NewProjectFlowProps) {
   const [selectedPath, setSelectedPath] = createSignal<string | null>(null);
   const [duplicateMsg, setDuplicateMsg] = createSignal<string | null>(null);
   const [withContinuity, setWithContinuity] = createSignal(false);
+
+  // Create-folder sub-panel state
+  const [showCreate, setShowCreate] = createSignal(false);
+  const [createParent, setCreateParent] = createSignal("");
+  const [createName, setCreateName] = createSignal("");
+  const [createError, setCreateError] = createSignal<string | null>(null);
+  const [creating, setCreating] = createSignal(false);
 
   // Listen for successful drop from App.tsx
   onMount(() => {
@@ -71,6 +79,40 @@ export function NewProjectFlow(props: NewProjectFlowProps) {
     if (p) trySelect(p);
   }
 
+  async function handleBrowseCreateParent() {
+    const result = await open({ directory: true, title: "Select parent folder" });
+    if (result) {
+      setCreateParent(result as string);
+      setCreateError(null);
+    }
+  }
+
+  async function handleCreate() {
+    setCreateError(null);
+    const parent = createParent().trim();
+    const name = createName().trim();
+    if (!parent) {
+      setCreateError("Pick a parent folder first");
+      return;
+    }
+    if (!name) {
+      setCreateError("Give the folder a name");
+      return;
+    }
+    setCreating(true);
+    try {
+      const full = await createProjectFolder(parent, name);
+      setShowCreate(false);
+      setCreateName("");
+      trySelect(full);
+    } catch (e) {
+      setCreateError(e instanceof Error ? e.message : String(e));
+      console.error("[NewProjectFlow] createProjectFolder error:", e);
+    } finally {
+      setCreating(false);
+    }
+  }
+
   // -- Picking state --
   function PickerModal() {
     return (
@@ -98,6 +140,57 @@ export function NewProjectFlow(props: NewProjectFlowProps) {
           <button class="modal-btn primary new-project-browse-btn" onClick={handleBrowse}>
             Browse for folder...
           </button>
+          <div class="new-project-or">or</div>
+          <Show
+            when={showCreate()}
+            fallback={
+              <button
+                class="modal-btn new-project-browse-btn"
+                onClick={() => { setShowCreate(true); setCreateError(null); }}
+              >
+                Create new folder...
+              </button>
+            }
+          >
+            <div class="new-project-create-panel">
+              <div class="new-project-input-row">
+                <input
+                  type="text"
+                  class="new-project-path-input"
+                  placeholder="Parent folder..."
+                  value={createParent()}
+                  onInput={(e) => { setCreateParent(e.currentTarget.value); setCreateError(null); }}
+                />
+                <button class="modal-btn" onClick={handleBrowseCreateParent}>Browse</button>
+              </div>
+              <div class="new-project-input-row">
+                <input
+                  type="text"
+                  class="new-project-path-input"
+                  placeholder="New folder name..."
+                  value={createName()}
+                  onInput={(e) => { setCreateName(e.currentTarget.value); setCreateError(null); }}
+                  onKeyDown={(e) => { if (e.key === "Enter") handleCreate(); }}
+                />
+                <button
+                  class="modal-btn primary"
+                  onClick={handleCreate}
+                  disabled={creating()}
+                >
+                  {creating() ? "Creating..." : "Create"}
+                </button>
+              </div>
+              <Show when={createError()}>
+                <div class="new-project-duplicate">{createError()}</div>
+              </Show>
+              <button
+                class="modal-btn new-project-cancel"
+                onClick={() => { setShowCreate(false); setCreateError(null); }}
+              >
+                Back
+              </button>
+            </div>
+          </Show>
           <label class="new-project-continuity-check">
             <input
               type="checkbox"

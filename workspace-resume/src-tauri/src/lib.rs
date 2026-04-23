@@ -20,6 +20,7 @@ pub fn run() {
             commands::discovery::delete_session,
             commands::discovery::check_continuity_exists,
             commands::discovery::open_directory,
+            commands::discovery::create_project_folder,
             commands::discovery::get_inode,
             commands::discovery::find_inode_in_tree,
             commands::launcher::resume_session,
@@ -79,6 +80,7 @@ pub fn run() {
             commands::project_meta::get_pane_assignments,
             commands::project_meta::get_pane_assignments_raw,
             commands::project_meta::set_pane_assignment,
+            commands::project_meta::set_pane_assignment_meta,
         ])
         .setup(|app| {
             app.manage(commands::launcher::SessionTracker::new());

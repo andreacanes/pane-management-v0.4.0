@@ -325,6 +325,87 @@ pub async fn open_directory(path: String) -> Result<(), String> {
     open::that(&path).map_err(|e| format!("Failed to open directory: {}", e))
 }
 
+/// Resolve any supported path flavor to a Windows-side filesystem path usable
+/// by `std::fs`. Mirrors the three-branch logic in `check_path_exists`.
+fn resolve_to_windows_fs(path: &str) -> Option<String> {
+    // Already Windows-style — backslashes, UNC, or drive letter form.
+    if path.contains('\\') {
+        return Some(path.to_string());
+    }
+    if path.len() >= 2 && path.as_bytes()[1] == b':' {
+        return Some(path.to_string());
+    }
+    if let Some(win) = wsl_path_to_windows(path) {
+        return Some(win);
+    }
+    if path.starts_with('/') {
+        if let Some(info) = wsl::wsl_info() {
+            return Some(format!(
+                r"\\wsl.localhost\{}{}",
+                info.distro,
+                path.replace('/', "\\")
+            ));
+        }
+    }
+    None
+}
+
+/// Create a new project folder under `parent` named `name`. Returns the full
+/// path in the same slash style the caller used for `parent`, so the UI can
+/// pass it straight into the existing new-project flow.
+#[tauri::command]
+pub async fn create_project_folder(parent: String, name: String) -> Result<String, String> {
+    let name = name.trim();
+    if name.is_empty() {
+        return Err("Folder name cannot be empty".to_string());
+    }
+    if name == "." || name == ".." {
+        return Err("Folder name cannot be '.' or '..'".to_string());
+    }
+    const INVALID: &[char] = &['/', '\\', ':', '*', '?', '"', '<', '>', '|', '\0'];
+    if name.chars().any(|c| INVALID.contains(&c)) {
+        return Err(format!("Folder name contains invalid characters: {}", name));
+    }
+
+    let parent_raw = parent.trim();
+    if parent_raw.is_empty() {
+        return Err("Parent path cannot be empty".to_string());
+    }
+    let parent_clean_trim = parent_raw.trim_end_matches(|c| c == '/' || c == '\\');
+    let parent_clean = if parent_clean_trim.is_empty() {
+        parent_raw
+    } else {
+        parent_clean_trim
+    };
+
+    let parent_fs = resolve_to_windows_fs(parent_clean)
+        .ok_or_else(|| format!("Could not resolve parent path: {}", parent_clean))?;
+    let parent_path = std::path::Path::new(&parent_fs);
+    if !parent_path.is_dir() {
+        return Err(format!(
+            "Parent is not an existing directory: {}",
+            parent_clean
+        ));
+    }
+
+    let new_fs = parent_path.join(name);
+    if new_fs.exists() {
+        return Err(format!(
+            "A file or folder named \"{}\" already exists at that location",
+            name
+        ));
+    }
+
+    std::fs::create_dir_all(&new_fs).map_err(|e| format!("Failed to create folder: {}", e))?;
+
+    let sep = if parent_clean.contains('/') && !parent_clean.contains('\\') {
+        '/'
+    } else {
+        '\\'
+    };
+    Ok(format!("{}{}{}", parent_clean, sep, name))
+}
+
 /// Get the filesystem inode for a directory path.
 /// Runs via WSL, so uses Unix inode. The actual path may be on NTFS
 /// (via /mnt/c/) but WSL exposes a stable inode for NTFS files.

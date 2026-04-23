@@ -27,4 +27,9 @@ pub const ACCOUNTS: &[AccountDef] = &[
         label: "Bravura",
         config_dir: ".claude-b",
     },
+    AccountDef {
+        key: "sully",
+        label: "Sully",
+        config_dir: ".claude-c",
+    },
 ];

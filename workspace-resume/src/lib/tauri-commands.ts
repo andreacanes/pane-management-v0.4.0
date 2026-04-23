@@ -37,6 +37,10 @@ export async function openDirectory(path: string): Promise<void> {
   return invoke("open_directory", { path });
 }
 
+export async function createProjectFolder(parent: string, name: string): Promise<string> {
+  return invoke("create_project_folder", { parent, name });
+}
+
 export async function deleteSession(encodedProject: string, sessionId: string): Promise<void> {
   return invoke("delete_session", { encodedProject, sessionId });
 }

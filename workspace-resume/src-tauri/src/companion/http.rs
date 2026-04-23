@@ -17,8 +17,8 @@ use super::{
     models::{
         now_ms, AccountRateLimit, ApprovalDto, ApprovalResponse, CaptureResponse,
         ConversationMessage, ConversationResponse, CreatePaneRequest, CreatePaneResponse,
-        CreateWindowRequest, CreateWindowResponse, HealthDto, ImageRequest, InputRequest,
-        KeyRequest, PaneDto, ProjectDto, SessionDto, VoiceRequest,
+        CreateWindowRequest, CreateWindowResponse, ForkPaneRequest, HealthDto, ImageRequest,
+        InputRequest, KeyRequest, PaneDto, ProjectDto, SessionDto, VoiceRequest,
     },
     ntfy_server, pane_log,
     state::AppState,
@@ -38,6 +38,7 @@ pub fn router(state: AppState) -> Router {
         .route("/panes/{id}/image", post(send_image))
         .route("/panes/{id}/key", post(send_key))
         .route("/panes/{id}/cancel", post(cancel_pane))
+        .route("/panes/{id}/fork", post(fork_pane))
         .route("/approvals", get(list_approvals))
         .route("/approvals/{id}", post(resolve_approval))
         .route("/usage", get(usage_summary))
@@ -988,6 +989,134 @@ async fn create_pane(
         .to_string();
 
     tracing::info!(%new_pane_id, target = %req.target_pane_id, account = %req.account, flag = %flag, "pane split created");
+
+    Ok(Json(CreatePaneResponse {
+        pane_id: new_pane_id,
+    }))
+}
+
+/// Fork the conversation currently running in a pane. Drives Claude's
+/// built-in `/branch` slash command on the source pane (Claude creates
+/// a new session UUID Y internally and continues in place), then splits
+/// a new sibling pane that resumes the *original* session X so the
+/// pre-fork conversation is preserved and viewable.
+///
+/// Session id X is read from the companion's live `AppState.panes`
+/// snapshot, not from the request — the caller (mobile APK) only
+/// supplies the account so we know whether to launch `ncld` vs `ncld2`.
+/// If the pane has no detected session_id yet, the call 400s rather
+/// than guessing; the mobile UI should disable the Fork action until
+/// a session is bound.
+///
+/// Operation order matches `launch.ts::forkPaneSession`:
+///   1. Send `/branch` to the source pane.
+///   2. Sleep 1.5 s so Claude mints Y and stops writing X.
+///   3. Split a new pane -h adjacent to the source, inheriting cwd.
+///   4. Send `<cmd> -r X` to the new pane.
+async fn fork_pane(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+    Json(req): Json<ForkPaneRequest>,
+) -> Result<Json<CreatePaneResponse>, AppError> {
+    if id.is_empty() {
+        return Err(AppError::BadRequest("pane id is required".into()));
+    }
+    // Read session_id + check for collision atomically under one lock.
+    // A collision means another pane already owns the source session. If
+    // we proceed past it, the split+resume step below will launch a second
+    // cli-ncld process appending to the same JSONL — exactly the concurrent
+    // writer that produces the tool-use-concurrency 400 the user has been
+    // chasing. Better to 409 here and force them to resolve the source
+    // state first (kill one of the panes, or wait for the write-mode FD
+    // filter in detect_claude_session to re-bind detection correctly).
+    let session_id = {
+        let panes = state.panes.read().await;
+        let rec = panes.get(&id).ok_or_else(|| {
+            AppError::BadRequest("pane not found".into())
+        })?;
+        let sid = rec.dto.claude_session_id.clone().ok_or_else(|| {
+            AppError::BadRequest(
+                "pane has no detected claude session to fork".into(),
+            )
+        })?;
+        // Is any other pane currently bound to this same session? If so
+        // the binding we're about to fork from is already shared —
+        // forking again would create a third writer.
+        let also_holding: Vec<String> = panes
+            .iter()
+            .filter(|(other_id, other_rec)| {
+                *other_id != &id
+                    && other_rec.dto.claude_session_id.as_deref()
+                        == Some(sid.as_str())
+            })
+            .map(|(other_id, _)| other_id.clone())
+            .collect();
+        if !also_holding.is_empty() {
+            return Err(AppError::BadRequest(format!(
+                "fork refused: source session {} is also bound to {}. \
+                 resolve the duplicate binding first (kill one of the panes \
+                 or wait for the session detector to rebind), then retry.",
+                sid,
+                also_holding.join(", "),
+            )));
+        }
+        sid
+    };
+    let cmd = match req.account.as_str() {
+        "bravura" => "ncld2",
+        "andrea" | "" => "ncld",
+        other => {
+            return Err(AppError::BadRequest(format!(
+                "unknown account '{}': expected andrea|bravura",
+                other
+            )))
+        }
+    };
+    let id_esc = id.replace('\'', r"'\''");
+    let sid_esc = session_id.replace('\'', r"'\''");
+    // Target the new pane by its immutable `%N` pane_id, not by
+    // `session:win.pane` index. When split-window creates a pane adjacent
+    // to the source, tmux renumbers the remaining panes by spatial layout
+    // (so if the source window had panes 1 and 2 and we split pane 1, the
+    // new pane becomes index 2 and old pane 2 becomes index 3). The index
+    // reported at -P -F time isn't guaranteed to match the post-settle
+    // layout, but the %N id is immutable. We then resolve the %N back to
+    // the human `session:win.pane` for the API response.
+    let script = format!(
+        "tmux send-keys -t '{id}' '/branch' Enter; \
+         sleep 1.5; \
+         CWD=$(tmux display-message -p -t '{id}' '#{{pane_current_path}}'); \
+         NEW_PID=$(tmux split-window -h -t '{id}' -c \"$CWD\" -d \
+           -P -F '#{{pane_id}}' 2>&1); \
+         if [ -z \"$NEW_PID\" ] || [ \"${{NEW_PID#%}}\" = \"$NEW_PID\" ]; then \
+           echo \"ERR: split failed: $NEW_PID\"; exit 1; fi; \
+         tmux send-keys -t \"$NEW_PID\" '{cmd} -r {sid}' Enter; \
+         NEW=$(tmux display-message -p -t \"$NEW_PID\" \
+           '#{{session_name}}:#{{window_index}}.#{{pane_index}}'); \
+         echo \"NEW=$NEW\"",
+        id = id_esc,
+        cmd = cmd,
+        sid = sid_esc,
+    );
+
+    let out = crate::commands::tmux::run_tmux_command_async(script)
+        .await
+        .map_err(tmux_err)?;
+
+    let new_pane_id = out
+        .lines()
+        .find_map(|l| l.strip_prefix("NEW="))
+        .ok_or_else(|| AppError::BadRequest(format!("fork_pane parse failed: {}", out)))?
+        .trim()
+        .to_string();
+
+    tracing::info!(
+        source_pane = %id,
+        %new_pane_id,
+        source_sid = %session_id,
+        account = %req.account,
+        "pane forked via /branch"
+    );
 
     Ok(Json(CreatePaneResponse {
         pane_id: new_pane_id,

@@ -1314,6 +1314,16 @@ body {
   width: 100%;
 }
 
+.new-project-create-panel {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  padding: 8px;
+  background: var(--bg-primary);
+  border: 1px solid var(--border);
+  border-radius: 4px;
+}
+
 /* Ghost card (draggable) */
 .new-project-ghost-wrapper {
   padding: 12px 8px;

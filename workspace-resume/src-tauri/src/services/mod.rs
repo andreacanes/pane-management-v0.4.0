@@ -1,4 +1,6 @@
 pub mod git;
+pub mod host_target;
+pub mod launch_cmd;
 pub mod scanner;
 pub mod watcher;
 pub mod path_decoder;

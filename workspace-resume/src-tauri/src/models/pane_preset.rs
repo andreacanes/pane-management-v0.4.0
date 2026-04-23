@@ -7,12 +7,6 @@ pub struct PanePreset {
     pub pane_count: u32,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct PaneAssignment {
-    pub pane_index: u32,
-    pub encoded_project: Option<String>,
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -50,40 +44,5 @@ mod tests {
             let deserialized: PanePreset = serde_json::from_str(&json).unwrap();
             assert_eq!(deserialized.layout, layout);
         }
-    }
-
-    #[test]
-    fn test_pane_assignment_with_project() {
-        let assignment = PaneAssignment {
-            pane_index: 0,
-            encoded_project: Some("C--Users-USERNAME-project".to_string()),
-        };
-        let json = serde_json::to_string(&assignment).unwrap();
-        let deserialized: PaneAssignment = serde_json::from_str(&json).unwrap();
-        assert_eq!(deserialized.pane_index, 0);
-        assert_eq!(
-            deserialized.encoded_project,
-            Some("C--Users-USERNAME-project".to_string())
-        );
-    }
-
-    #[test]
-    fn test_pane_assignment_without_project() {
-        let assignment = PaneAssignment {
-            pane_index: 1,
-            encoded_project: None,
-        };
-        let json = serde_json::to_string(&assignment).unwrap();
-        let deserialized: PaneAssignment = serde_json::from_str(&json).unwrap();
-        assert_eq!(deserialized.pane_index, 1);
-        assert_eq!(deserialized.encoded_project, None);
-    }
-
-    #[test]
-    fn test_pane_assignment_from_json_with_null() {
-        let json = r#"{"pane_index":2,"encoded_project":null}"#;
-        let assignment: PaneAssignment = serde_json::from_str(json).unwrap();
-        assert_eq!(assignment.pane_index, 2);
-        assert_eq!(assignment.encoded_project, None);
     }
 }

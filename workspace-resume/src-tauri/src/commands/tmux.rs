@@ -6,17 +6,20 @@ use std::sync::{LazyLock, Mutex};
 use std::os::windows::process::CommandExt;
 
 /// Process-wide cache keyed by a pane's shell PID → detected Claude
-/// account (`"andrea"` or `"bravura"`). Both the companion poller and
-/// the Tauri command path read through this helper so detection shells
-/// out at most once per pane lifetime across the whole app.
+/// account (`"andrea"`, `"bravura"`, or `"sully"`). Both the companion
+/// poller and the Tauri command path read through this helper so
+/// detection shells out at most once per pane lifetime across the
+/// whole app.
 static PID_ACCOUNT_CACHE: LazyLock<Mutex<HashMap<String, String>>> =
     LazyLock::new(|| Mutex::new(HashMap::new()));
 
 /// Walk a pane's shell PID (+ direct and grand-children) and read
-/// each process's `/proc/<pid>/environ`. Returns `"bravura"` if any
-/// descendant has `CLAUDE_CONFIG_DIR=~/.claude-b`, `"andrea"` if a
-/// claude-ish process exists without a Bravura env var, or `None`
-/// when no Claude process is visible under the pane yet.
+/// each process's `/proc/<pid>/environ`. Returns `"sully"` if any
+/// descendant has `CLAUDE_CONFIG_DIR=~/.claude-c`, `"bravura"` for
+/// `~/.claude-b`, `"andrea"` if a claude-ish process exists without
+/// an alt-account env var, or `None` when no Claude process is visible
+/// under the pane yet. The `claude-c` arm is checked first so the more
+/// specific match wins over the shorter `claude-b` substring.
 ///
 /// Results are cached in [`PID_ACCOUNT_CACHE`] for the lifetime of
 /// the process — `wsl.exe` cost is paid exactly once per shell pid.
@@ -44,6 +47,7 @@ for p in $candidates; do
   env_val=$(tr '\0' '\n' < /proc/$p/environ 2>/dev/null | grep -E '^CLAUDE_CONFIG_DIR=' | head -1 | cut -d= -f2-)
   if [ -n "$env_val" ]; then
     case "$env_val" in
+      *claude-c*) echo sully;   exit 0 ;;
       *claude-b*) echo bravura; exit 0 ;;
       *)          echo andrea;  exit 0 ;;
     esac
@@ -63,6 +67,7 @@ done
     let out = run_tmux_command_async(script).await.ok()?;
     let line = out.lines().find(|l| !l.trim().is_empty())?.trim();
     let account = match line {
+        "sully" => Some("sully".to_string()),
         "bravura" => Some("bravura".to_string()),
         "andrea" => Some("andrea".to_string()),
         _ => None,
@@ -343,17 +348,29 @@ pub async fn populate_git_info(panes: &mut [TmuxPane]) {
     }
 }
 
+/// Names that identify a process as Claude (or a Claude wrapper). Extend
+/// this when a new patched/repackaged Claude binary shows up. Currently
+/// recognises:
+/// - `claude` / `claude-b` — upstream binaries
+/// - `cli-ncld-*.bin` — Andrea's patched binaries from `~/claude-patching`;
+///   they print the same banner strings and run Claude Code internally,
+///   so the poller must classify them as Claude-alive to reach the
+///   `Running`/`Waiting` branches in the state machine.
+fn is_claude_command(cmd_lower: &str) -> bool {
+    cmd_lower.contains("claude") || cmd_lower.contains("cli-ncld")
+}
+
 /// Return true if the pane is "running Claude" — either the foreground
 /// command is `claude`/`claude-b` directly, or the pane was started with
 /// the claude binary and the current foreground is not a plain shell
 /// (i.e., Claude is alive and waiting on a child tool invocation).
 pub fn pane_is_claude(current_command: &str, start_command: &str) -> bool {
     let cur = current_command.to_ascii_lowercase();
-    if cur.contains("claude") {
+    if is_claude_command(&cur) {
         return true;
     }
     let start = start_command.to_ascii_lowercase();
-    if !start.contains("claude") {
+    if !is_claude_command(&start) {
         return false;
     }
     let is_shell = matches!(
