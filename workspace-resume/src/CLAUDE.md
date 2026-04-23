@@ -35,7 +35,7 @@ src/
 
 - **Every Rust command gets a wrapper in `lib/tauri-commands.ts`** — no component imports `@tauri-apps/api/core` directly. Grep check: `invoke(` only appears in `tauri-commands.ts`. See `.claude/rules/tauri-commands.md` for the four-file lockstep edit
 - **DTO interfaces in `lib/types.ts` use `snake_case` field names** to match serde output (`encoded_name`, `path_exists`, `session_count`). Do not camelCase them
-- **`invoke()` arg objects use `camelCase` keys** because Tauri auto-converts them (`invoke("resume_session", { encodedProject, sessionId })`). Mixing this with snake_case produces silently-undefined fields
+- **`invoke()` arg objects use `camelCase` keys** because Tauri auto-converts them (`invoke("launch_in_pane", { session, window, pane, projectPath })`). Mixing this with snake_case produces silently-undefined fields
 - **Store reads go through the Tauri store plugin**, not `localStorage`. See `lib/store-keys.ts` for the canonical key list
 
 ## SolidJS idioms
@@ -64,6 +64,3 @@ Account-key literals `"andrea"` / `"bravura"` in UI code must read through `lib/
 
 `console.log` is a prune target, not an add target — upstream left ~40 of them scattered. New code should not add to the count. If you need tracing, add it on the Rust side and read the result.
 
-## Known inconsistency
-
-`CompanionConfig` is defined inline in `lib/tauri-commands.ts:98-105` instead of in `lib/types.ts`. Leave it alone unless you're deliberately fixing it in the same PR as a related change.

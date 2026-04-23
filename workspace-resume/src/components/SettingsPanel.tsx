@@ -2,7 +2,6 @@ import { createSignal, For, Show, onMount } from "solid-js";
 import { LazyStore } from "@tauri-apps/plugin-store";
 import {
   getTerminalSettings,
-  updateTerminalSettings,
   updateTmuxSessionName,
   getErrorLog,
   clearErrorLog,
@@ -11,7 +10,7 @@ import {
   rotateCompanionToken,
   type CompanionConfig,
 } from "../lib/tauri-commands";
-import type { TerminalBackend, ErrorLogEntry } from "../lib/types";
+import type { ErrorLogEntry } from "../lib/types";
 
 const uiStore = new LazyStore("settings.json");
 
@@ -31,7 +30,6 @@ export { showAnimations, showHotkeyHint };
 })();
 
 export function SettingsPanel() {
-  const [backend, setBackend] = createSignal<TerminalBackend>("tmux");
   const [tmuxSessionName, setTmuxSessionName] = createSignal("main");
   const [tmuxSessionDraft, setTmuxSessionDraft] = createSignal("main");
   const [sessionNameError, setSessionNameError] = createSignal<string | null>(null);
@@ -45,7 +43,6 @@ export function SettingsPanel() {
   onMount(async () => {
     try {
       const settings = await getTerminalSettings();
-      setBackend(settings.backend);
       setTmuxSessionName(settings.tmux_session_name);
       setTmuxSessionDraft(settings.tmux_session_name);
     } catch (e) {
@@ -93,18 +90,6 @@ export function SettingsPanel() {
       setErrors(log);
     } catch (e) {
       console.error("[SettingsPanel] Failed to load error log:", e);
-    }
-  }
-
-  async function handleBackendChange(value: string) {
-    setUpdating(true);
-    try {
-      const result = await updateTerminalSettings(value);
-      setBackend(result.backend);
-    } catch (e) {
-      console.error("[SettingsPanel] Failed to update settings:", e);
-    } finally {
-      setUpdating(false);
     }
   }
 
@@ -193,37 +178,24 @@ export function SettingsPanel() {
 
       <div class="settings-section">
         <h4>Terminal</h4>
-      <div class="settings-row">
-        <label for="terminal-backend">Terminal Backend:</label>
-        <select
-          id="terminal-backend"
-          value={backend()}
-          disabled={updating()}
-          onChange={(e) => handleBackendChange(e.currentTarget.value)}
-        >
-          <option value="tmux">tmux (WSL)</option>
-          <option value="warp">Warp</option>
-          <option value="powershell">PowerShell</option>
-        </select>
-      </div>
-      <div class="settings-row">
-        <label for="tmux-session-name">tmux session name:</label>
-        <input
-          id="tmux-session-name"
-          type="text"
-          value={tmuxSessionDraft()}
-          disabled={updating() || backend() !== "tmux"}
-          onInput={(e) => setTmuxSessionDraft(e.currentTarget.value)}
-          onBlur={handleSaveSessionName}
-          onKeyDown={(e) => {
-            if (e.key === "Enter") (e.currentTarget as HTMLInputElement).blur();
-          }}
-          placeholder="main"
-        />
-      </div>
-      <Show when={sessionNameError()}>
-        <div class="settings-row-error">{sessionNameError()}</div>
-      </Show>
+        <div class="settings-row">
+          <label for="tmux-session-name">tmux session name:</label>
+          <input
+            id="tmux-session-name"
+            type="text"
+            value={tmuxSessionDraft()}
+            disabled={updating()}
+            onInput={(e) => setTmuxSessionDraft(e.currentTarget.value)}
+            onBlur={handleSaveSessionName}
+            onKeyDown={(e) => {
+              if (e.key === "Enter") (e.currentTarget as HTMLInputElement).blur();
+            }}
+            placeholder="main"
+          />
+        </div>
+        <Show when={sessionNameError()}>
+          <div class="settings-row-error">{sessionNameError()}</div>
+        </Show>
       </div>
 
       <div class="settings-section">

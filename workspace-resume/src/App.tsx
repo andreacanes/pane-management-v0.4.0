@@ -83,7 +83,9 @@ function AppInner() {
       try {
         await setProjectTier(encodedProject, "pinned");
         refreshProjects();
-      } catch {}
+      } catch (e) {
+        console.error("[App] pin drop error:", e);
+      }
       return;
     }
 
@@ -131,7 +133,9 @@ function AppInner() {
       });
       refreshTmuxState();
       refreshProjects();
-    } catch {}
+    } catch (e) {
+      console.error("[App] executePaneDrop error:", e);
+    }
   }
 
   function AppShell() {

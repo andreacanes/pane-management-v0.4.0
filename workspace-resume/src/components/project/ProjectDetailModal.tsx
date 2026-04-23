@@ -1,6 +1,16 @@
 import { createSignal, createResource, For, Show, onMount, onCleanup } from "solid-js";
 import { useApp } from "../../contexts/AppContext";
-import { listSessions, setSessionBinding, deleteSession, openDirectory, setProjectTier, checkContinuityExists, sendToPane } from "../../lib/tauri-commands";
+import {
+  listSessions,
+  setSessionBinding,
+  deleteSession,
+  openDirectory,
+  setProjectTier,
+  checkContinuityExists,
+  sendToPane,
+  getSessionNames,
+  setSessionNames as setSessionNamesCmd,
+} from "../../lib/tauri-commands";
 import { launchToPane, newSessionInPane } from "../../lib/launch";
 import { toWslPath, deriveName } from "../../lib/path";
 import { relativeTime, formatDuration } from "../../lib/time";
@@ -35,12 +45,17 @@ export function ProjectDetailModal(props: Props) {
   const [editValue, setEditValue] = createSignal("");
   const [hasContinuity, setHasContinuity] = createSignal<boolean | null>(null);
 
-  // Load session rename data from localStorage + check Continuity
+  // Load session rename data from the Tauri store + check Continuity.
+  // Session names used to live in localStorage; moving to the store
+  // keeps them alongside the rest of the settings and survives a
+  // webview-origin change.
   onMount(async () => {
     try {
-      const stored = localStorage.getItem(`session-names:${props.project.encoded_name}`);
-      if (stored) setSessionNames(JSON.parse(stored));
-    } catch { /* ignore */ }
+      const stored = await getSessionNames(props.project.encoded_name);
+      setSessionNames(stored);
+    } catch (e) {
+      console.error("[ProjectDetailModal] getSessionNames error:", e);
+    }
     try {
       const exists = await checkContinuityExists(props.project.actual_path);
       setHasContinuity(exists);
@@ -49,9 +64,8 @@ export function ProjectDetailModal(props: Props) {
 
   function saveSessionNames(names: Record<string, string>) {
     setSessionNames(names);
-    localStorage.setItem(
-      `session-names:${props.project.encoded_name}`,
-      JSON.stringify(names),
+    setSessionNamesCmd(props.project.encoded_name, names).catch((e) =>
+      console.error("[ProjectDetailModal] setSessionNames error:", e),
     );
   }
 

@@ -8,17 +8,18 @@ import {
 } from "solid-js";
 import type { JSX } from "solid-js";
 import { createStore, produce, reconcile } from "solid-js/store";
-import { fromWslPath } from "../lib/path";
+import { pathMatchesProject } from "../lib/path";
 import { listen } from "@tauri-apps/api/event";
 import type { UnlistenFn } from "@tauri-apps/api/event";
 import {
   listProjects,
   getAllProjectMeta,
-  getActiveSessions,
   listTmuxSessions,
   listTmuxWindows,
   getTmuxState,
-  getPaneAssignments,
+  getAllPaneAssignmentsFull,
+  listTmuxPanesAllOn,
+  listRemoteHosts,
   getPanePresets,
   getInode,
   findInodeInTree,
@@ -40,7 +41,6 @@ import type {
   TmuxWindow,
   TmuxPane,
   PanePreset,
-  ActiveSession,
   WindowPaneStatus,
 } from "../lib/types";
 
@@ -54,15 +54,24 @@ interface AppState {
   selectedTmuxWindow: number | null;
   tmuxSessions: TmuxSession[];
   tmuxWindows: TmuxWindow[];
+  /** Panes rendered in the grid. After the host-aware refactor this is
+   *  a union of (1) the local WSL tmux session:window selected above
+   *  and (2) any remote-host panes that are running Claude — one grid
+   *  spans multiple tmux servers. Each pane self-describes its host,
+   *  session_name, and window_index; consumers never infer coordinates
+   *  from the outer `selectedTmux*` ambient context. */
   tmuxPanes: TmuxPane[];
+  /** Encoded-project map keyed on the full 4-segment coord
+   *  `"host|session|window|pane"`. Swapped from the old pane-index keys
+   *  so a local `main:0.3` and a Mac `main:0.3` don't collide. */
   paneAssignments: Record<string, string>;
-  /** Full pane-slot assignment records keyed by pane index (as string).
-   *  Populated alongside `paneAssignments`. Carries the host/account
-   *  fields that the flat map elides. Slice A introduced the struct
-   *  server-side; Slice C surfaces it to the UI for dropdowns. */
+  /** Full assignment records keyed on the same 4-segment coord. Carries
+   *  host/account alongside the encoded_project. */
   paneAssignmentsFull: Record<string, import("../lib/types").PaneAssignment>;
+  /** SSH aliases we poll for remote panes. Seeded at mount from
+   *  `listRemoteHosts` (Rust-side static for MVP: `["mac"]`). */
+  remoteHosts: string[];
   panePresets: PanePreset[];
-  activeSessions: ActiveSession[];
   sessionOrder: string[];
   pinnedOrder: string[];
   windowStatuses: Record<string, WindowPaneStatus>;
@@ -138,8 +147,8 @@ export function AppProvider(props: { children: JSX.Element }) {
     tmuxPanes: [],
     paneAssignments: {},
     paneAssignmentsFull: {},
+    remoteHosts: [],
     panePresets: [],
-    activeSessions: [],
     sessionOrder: [],
     pinnedOrder: [],
     windowStatuses: {},
@@ -291,6 +300,23 @@ export function AppProvider(props: { children: JSX.Element }) {
     }
   }
 
+  /** Heuristic: does this pane's foreground or start command look like
+   *  Claude Code? Mirrors the Rust `pane_is_claude` check — substring
+   *  match on "claude"/"cld" covers the stock binary, the patched
+   *  cli-{n,mn}cld-*.bin blobs, and every shell wrapper alias
+   *  (cld/cld2/cld3/ncld/ncld2/ncld3/mcld/mncld). Used to filter
+   *  remote panes before merging into `state.tmuxPanes`. */
+  function looksLikeClaude(pane: TmuxPane): boolean {
+    const cur = (pane.current_command ?? "").toLowerCase();
+    const start = (pane.start_command ?? "").toLowerCase();
+    return (
+      cur.includes("claude") ||
+      cur.includes("cld") ||
+      start.includes("claude") ||
+      start.includes("cld")
+    );
+  }
+
   async function loadTmuxPanes(sessionName: string, windowIndex: number) {
     try {
       const tmuxState = await getTmuxState(sessionName, windowIndex);
@@ -300,57 +326,99 @@ export function AppProvider(props: { children: JSX.Element }) {
       // Suppressed for 2s after a user-initiated tab click to avoid race conditions.
       const activeWin = tmuxState.windows.find((w) => w.active);
       if (activeWin && activeWin.index !== windowIndex && Date.now() > autoFollowSuppressedUntil) {
-        // tmux's active window differs — switch to it and load its panes
         setState("tmuxSessions", tmuxState.sessions);
         setState("tmuxWindows", tmuxState.windows);
         setState("selectedTmuxWindow", activeWin.index);
-        // Re-fetch panes for the newly active window
         const freshState = await getTmuxState(sessionName, activeWin.index);
+        const remote = await loadRemotePanes();
         batch(() => {
-          setState("tmuxPanes", freshState.panes);
+          setState("tmuxPanes", [...freshState.panes, ...remote]);
         });
         loadPaneAssignments();
         pollPaneStatuses();
         return;
       }
 
+      // Render local panes immediately so the grid doesn't wait on SSH.
       batch(() => {
         setState("tmuxSessions", tmuxState.sessions);
         setState("tmuxWindows", tmuxState.windows);
         setState("tmuxPanes", tmuxState.panes);
       });
+
+      // Then fetch remote panes and merge. Keeps the grid responsive
+      // even when a Mac is slow to answer — the Mac section appears
+      // ~50-500 ms later without blocking the local render path.
+      const remote = await loadRemotePanes();
+      if (remote.length > 0) {
+        setState("tmuxPanes", [...tmuxState.panes, ...remote]);
+      }
     } catch (e) {
       console.error("[AppContext] loadTmuxPanes error:", e);
       setState("tmuxPanes", []);
     }
   }
 
-  async function loadPaneAssignments() {
-    const session = state.selectedTmuxSession;
-    const window = state.selectedTmuxWindow;
-    if (session == null || window == null) {
-      setState("paneAssignments", reconcile({}));
-      setState("paneAssignmentsFull", reconcile({}));
-      return;
+  /** Fetch every pane on every remote host and filter to the ones that
+   *  should appear in the grid: panes running Claude AND panes with an
+   *  active assignment. Shell-only Mac sessions the user spun up for
+   *  unrelated work stay hidden, matching the plan's "running Claude
+   *  OR has assignment" discovery rule. */
+  async function loadRemotePanes(): Promise<TmuxPane[]> {
+    const hosts = state.remoteHosts;
+    if (hosts.length === 0) return [];
+    const assigned = state.paneAssignmentsFull;
+    const out: TmuxPane[] = [];
+    for (const host of hosts) {
+      try {
+        const panes = await listTmuxPanesAllOn(host);
+        for (const p of panes) {
+          const assignKey = `${p.host}|${p.session_name}|${p.window_index}|${p.pane_index}`;
+          if (looksLikeClaude(p) || assignKey in assigned) {
+            out.push(p);
+          }
+        }
+      } catch (e) {
+        console.warn(`[AppContext] loadRemotePanes ${host} failed:`, e);
+      }
     }
+    return out;
+  }
+
+  async function loadPaneAssignments() {
     try {
-      const assignments = await getPaneAssignments(session, window);
-      // reconcile replaces the entire object — without it, removed keys
-      // (e.g. after unassign) would persist because setState merges by default.
-      setState("paneAssignments", reconcile(assignments));
+      // Fetch every assignment at once. 4-segment keys mean one flat map
+      // covers every (host, session, window, pane) slot across the grid.
+      // `reconcile` replaces the entire object so removed keys actually
+      // disappear instead of lingering as stale entries.
+      const full = await getAllPaneAssignmentsFull();
+      const flat: Record<string, string> = {};
+      for (const [key, entry] of Object.entries(full)) {
+        flat[key] = entry.encoded_project;
+      }
+      batch(() => {
+        setState("paneAssignments", reconcile(flat));
+        setState("paneAssignmentsFull", reconcile(full));
+      });
     } catch (e) {
       console.error("[AppContext] loadPaneAssignments error:", e);
+      batch(() => {
+        setState("paneAssignments", reconcile({}));
+        setState("paneAssignmentsFull", reconcile({}));
+      });
     }
-    // Fetch the struct-shape sibling so PaneSlot can read host/account.
-    // Separate round-trip keeps existing callers of `paneAssignments`
-    // untouched and lets the struct load fail independently.
+  }
+
+  /** Seed the remoteHosts state at mount so `loadRemotePanes` has targets
+   *  to poll. Static for MVP (`["mac"]`); future work may migrate this
+   *  into a user-editable `remote_hosts` Tauri store key. */
+  async function loadRemoteHosts() {
     try {
-      const { getPaneAssignmentsFull } = await import("../lib/tauri-commands");
-      const full = await getPaneAssignmentsFull(session, window);
-      setState("paneAssignmentsFull", reconcile(full));
+      const hosts = await listRemoteHosts();
+      setState("remoteHosts", hosts);
     } catch (e) {
-      console.error("[AppContext] loadPaneAssignmentsFull error:", e);
-      setState("paneAssignmentsFull", reconcile({}));
+      console.warn("[AppContext] loadRemoteHosts failed:", e);
+      setState("remoteHosts", []);
     }
   }
 
@@ -360,15 +428,6 @@ export function AppProvider(props: { children: JSX.Element }) {
       setState("panePresets", presets);
     } catch (e) {
       console.error("[AppContext] loadPanePresets error:", e);
-    }
-  }
-
-  async function pollActiveSessions() {
-    try {
-      const result = await getActiveSessions();
-      setState("activeSessions", result);
-    } catch (e) {
-      console.error("[AppContext] pollActiveSessions error:", e);
     }
   }
 
@@ -596,22 +655,28 @@ export function AppProvider(props: { children: JSX.Element }) {
   }
 
   function isProjectActive(encodedName: string): boolean {
-    for (const [paneIdx, assignedProject] of Object.entries(state.paneAssignments)) {
+    for (const [key, assignedProject] of Object.entries(state.paneAssignments)) {
       if (assignedProject !== encodedName) continue;
-      const pane = state.tmuxPanes.find((p) => p.pane_index === Number(paneIdx));
-      if (pane && pane.current_command.toLowerCase().includes("claude")) {
-        return true;
-      }
+      // 4-segment key: "host|session|window|pane" — find the matching
+      // pane by full coord so a local `main:0.3` and a Mac `main:0.3`
+      // don't alias against each other.
+      const parts = key.split("|");
+      if (parts.length !== 4) continue;
+      const [host, sessionName, winStr, paneStr] = parts;
+      const windowIdx = Number(winStr);
+      const paneIdx = Number(paneStr);
+      if (Number.isNaN(windowIdx) || Number.isNaN(paneIdx)) continue;
+      const pane = state.tmuxPanes.find(
+        (p) =>
+          p.pane_index === paneIdx &&
+          (p.host || "local") === host &&
+          p.session_name === sessionName &&
+          p.window_index === windowIdx,
+      );
+      if (!pane) continue;
+      const cmd = pane.current_command.toLowerCase();
+      if (cmd.includes("claude") || cmd.includes("cld")) return true;
     }
-    return false;
-  }
-
-  /** Match a project's path against an active pane path (handles WSL/Windows formats). */
-  function pathMatchesProject(activePath: string, actualPath: string): boolean {
-    const actualLower = actualPath.toLowerCase().replace(/[\\/]+$/, "");
-    const pathLower = activePath.toLowerCase().replace(/\/+$/, "");
-    if (actualLower === pathLower) return true;
-    if (actualLower === fromWslPath(activePath).toLowerCase().replace(/[\\/]+$/, "")) return true;
     return false;
   }
 
@@ -670,12 +735,15 @@ export function AppProvider(props: { children: JSX.Element }) {
   // -- Lifecycle ------------------------------------------------------------
 
   let tmuxPollInterval: ReturnType<typeof setInterval> | undefined;
-  let activeSessionInterval: ReturnType<typeof setInterval> | undefined;
   let statusPollInterval: ReturnType<typeof setInterval> | undefined;
   let unlistenSessionChanged: UnlistenFn | undefined;
 
   onMount(async () => {
-    // Load initial data in parallel
+    // Load initial data in parallel. `loadRemoteHosts` feeds
+    // `loadTmuxPanes` → `loadRemotePanes`, so it must be one of the
+    // first fetches — otherwise the first tmux poll sees
+    // `state.remoteHosts = []` and skips Mac pane discovery for one
+    // tick, flashing the grid as local-only.
     await Promise.all([
       loadProjectsWithMeta(),
       loadTmuxSessions(),
@@ -683,24 +751,27 @@ export function AppProvider(props: { children: JSX.Element }) {
       loadPanePresets(),
       loadSessionOrder(),
       loadPinnedOrder(),
+      loadRemoteHosts(),
     ]);
 
     // F-61: Backfill inodes + scan for orphaned projects (runs in background)
     reconcileProjectInodes();
 
-    // Main tmux poll — combines refresh + status check + project reload in
-    // one interval. Cadence bumped from 3s to 10s after observing that
-    // triple-polling every 3s saturated the Rust backend with wsl.exe
-    // invocations (each ~150-200ms of CPU on Windows) and starved the
-    // companion's HTTP runtime under concurrent mobile load. Live updates
-    // on the desktop come primarily from tmux-poller's WebSocket broadcast;
-    // this interval is now a 10s fallback.
+    // Main tmux poll — 10s fallback for tmux state + project list. Live
+    // updates on the desktop come primarily from tmux-poller's WebSocket
+    // broadcast; this interval catches drift (e.g. a pane assigned from
+    // the phone) that the watcher misses. `pollPaneStatuses` was removed
+    // from this cycle — the 1.5s interval below already fires it, and
+    // piggybacking it on the 10s tick just doubled the wsl.exe load
+    // without changing observed latency.
     const runPollCycle = () => {
       refreshTmuxState();
       loadProjectsWithMeta();
-      pollPaneStatuses();
     };
     runPollCycle();
+    // Still call pollPaneStatuses once on mount so the initial chips
+    // reflect real state before the first 1.5s tick fires.
+    pollPaneStatuses();
     tmuxPollInterval = setInterval(runPollCycle, 10000);
 
     // Fast status poll — pane active/waiting detection runs every 1.5s so

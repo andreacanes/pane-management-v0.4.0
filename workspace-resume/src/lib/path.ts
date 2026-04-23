@@ -35,3 +35,31 @@ export function deriveName(path: string): string {
   const parts = path.replace(/\\/g, "/").split("/").filter(Boolean);
   return parts[parts.length - 1] || path;
 }
+
+/**
+ * Match a pane's current-path against a project's actual_path, tolerating
+ * the Windows/WSL divide. Panes report a POSIX-style path from inside WSL
+ * (`/mnt/c/Users/...`) while projects store native Windows paths
+ * (`C:\Users\...`); compare both normalized forms with trailing slashes
+ * stripped. Case-insensitive because Windows filesystems are.
+ */
+export function pathMatchesProject(panePath: string, actualPath: string): boolean {
+  const actualLower = actualPath.toLowerCase().replace(/[\\/]+$/, "");
+  const paneLower = panePath.toLowerCase().replace(/\/+$/, "");
+  if (actualLower === paneLower) return true;
+  if (actualLower === fromWslPath(panePath).toLowerCase().replace(/[\\/]+$/, "")) return true;
+  return false;
+}
+
+/**
+ * Find the project in `projects` whose `actual_path` matches the given
+ * pane path. Composed on top of [`pathMatchesProject`]. Generic over the
+ * project shape so we don't force `lib/path.ts` to depend on `lib/types.ts`.
+ */
+export function matchProjectByPath<T extends { actual_path: string }>(
+  panePath: string,
+  projects: readonly T[],
+): T | null {
+  if (!panePath) return null;
+  return projects.find((p) => pathMatchesProject(panePath, p.actual_path)) ?? null;
+}

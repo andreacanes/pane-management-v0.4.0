@@ -2,6 +2,7 @@
 //! store and emits state-change / output-change events.
 
 use std::collections::{HashMap, HashSet};
+use std::sync::{LazyLock, Mutex};
 use std::time::{Duration, Instant};
 
 use sha2::{Digest, Sha256};
@@ -15,6 +16,34 @@ use super::{
 const POLL_INTERVAL: Duration = Duration::from_millis(1000);
 const IDLE_TIMEOUT: Duration = Duration::from_secs(3);
 const PROJECT_CACHE_TTL: Duration = Duration::from_secs(30);
+
+/// How long an assignment's slot must be continuously missing from the
+/// live pane set before we evict it from the store. Long enough that
+/// brief tmux reshuffles (renumber-windows, swap-pane) don't trip it;
+/// short enough that "I killed this pane 2 minutes ago" is visible as
+/// a cleared slot.
+const STALE_GRACE: Duration = Duration::from_secs(60);
+
+/// Max age of a successful remote-host poll before we refuse to
+/// evict that host's assignments. If the Mac has been unreachable
+/// for more than this, we assume the missing panes are a transport
+/// problem, not user intent. The sweep then waits for a successful
+/// remote poll to re-establish ground truth before resuming.
+const REMOTE_HOST_STALE: Duration = Duration::from_secs(30);
+
+/// How often the sweep runs, measured in main-loop ticks. 10 × 1s =
+/// every ~10 s — roughly 6× inside the 60 s grace window, so an
+/// actually-missing slot gets 5-6 consecutive observations before
+/// eviction.
+const SWEEP_EVERY_N_TICKS: u32 = 10;
+
+/// Per-assignment first-observed-missing timestamps, accumulated across
+/// sweep cycles so the grace-period clock persists between ticks.
+/// Entries for slots that come back alive are removed; entries that
+/// cross the grace threshold are evicted and also removed. Module-local
+/// because the sweep is the sole reader/writer.
+static MISSING_SINCE: LazyLock<Mutex<HashMap<String, Instant>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
 
 /// Normalize a path for cross-format matching: lowercase, strip trailing
 /// slashes, convert backslashes to forward slashes. Used to compare a
@@ -138,23 +167,15 @@ fn detect_account_from_ssh_context(
     None
 }
 
-fn is_claude_like(current_cmd: &str, start_cmd: &str) -> bool {
-    let cc = current_cmd.trim();
-    if cc == "claude" || cc == "ncld" || cc.starts_with("cli-ncld") {
-        return true;
-    }
-    // start_command is the full invocation, e.g. "claude --resume <uuid>"
-    // or "ncld --resume <uuid>". Match on a whole-word basis so `bash` panes
-    // whose history contains "claude" don't match.
-    let sc = start_cmd.trim();
-    for tok in sc.split_whitespace().take(2) {
-        let stripped = tok.rsplit('/').next().unwrap_or(tok);
-        if stripped == "claude" || stripped == "ncld" || stripped.starts_with("cli-ncld") {
-            return true;
-        }
-    }
-    false
-}
+// Former `is_claude_like` has been removed. It was intentionally stricter
+// than `commands::tmux::pane_is_claude` to avoid enabling pipe-pane on
+// shell panes whose start_command history happened to contain "claude" —
+// but `pane_is_claude` already gates its indirect-start branch on
+// `!is_shell`, so the shell false-positive case it defended against does
+// not actually fire there. And `is_claude_like` itself missed Andrea's
+// `mncld`, `cld2`, `cld3` wrappers (they don't match the `claude`/`ncld`/
+// `cli-ncld` token allow-list), which resulted in those panes silently
+// going without pipe-pane logging. Use `pane_is_claude` everywhere.
 
 /// Refresh the project cache if older than `PROJECT_CACHE_TTL`. Returns
 /// a clone of the current map (small enough to clone — under a few hundred
@@ -218,8 +239,95 @@ fn lookup_project<'a>(
 /// fallback without flooding the Mac.
 const REMOTE_POLL_INTERVAL: Duration = Duration::from_secs(3);
 
+/// Clear per-Claude-lifecycle fields on a pane when `claude_alive` is
+/// false. Shared between the local and remote poll functions so that
+/// remote panes stop accumulating stale `claude_account`,
+/// `claude_session_id`, and `claude_effort` after Claude exits on the
+/// far host. Also drops any pending attention flag since no one on the
+/// exited process can respond to it.
+///
+/// Idempotent: safe to call on every tick where `claude_alive` is
+/// false — after the first effective clear, subsequent calls see empty
+/// fields and skip. Returns true if the pane had an attention flag
+/// that was just cleared, so the caller can override its local
+/// `in_attention` value before state derivation.
+pub(super) fn apply_claude_exit_cleanup(
+    rec: &mut PaneRecord,
+    pane_id: &str,
+    pane_pid: &str,
+    attention_snapshot: &HashMap<String, WaitingReason>,
+    cleared_attention: &mut Vec<String>,
+    state: &AppState,
+) -> bool {
+    if rec.claude_account.is_some() {
+        if !pane_pid.is_empty() {
+            crate::commands::tmux::invalidate_account_cache(pane_pid);
+        }
+        rec.claude_account = None;
+        rec.dto.claude_account = None;
+    }
+
+    if rec.binding_confidence != BindingConfidence::None {
+        rec.dto.claude_session_id = None;
+        rec.binding_confidence = BindingConfidence::None;
+    }
+
+    if rec.dto.claude_effort.is_some() {
+        rec.dto.claude_effort = None;
+        let _ = state.events.send(EventDto::PaneUpdated {
+            pane: rec.dto.clone(),
+        });
+    }
+
+    let had_attention = attention_snapshot.contains_key(pane_id);
+    if had_attention {
+        cleared_attention.push(pane_id.to_string());
+        state.audit_log(AuditEvent::Cancelled {
+            pane_id: pane_id.to_string(),
+            notification_type: "attention".into(),
+            reason: "claude_exited".into(),
+        });
+    }
+    had_attention
+}
+
+/// Flush cleared attention flags from the three parallel attention maps
+/// in [`AppState`] (`attention_panes`, `attention_details`,
+/// `last_attention_notif`) and mark any ntfy backlog entries for the
+/// cleared panes as resolved so they don't replay on SSE reconnect.
+/// One call per poll tick per function, after the per-pane loop, so we
+/// grab each write lock once. No-op if `cleared` is empty.
+pub(super) async fn flush_cleared_attention(state: &AppState, cleared: &[String]) {
+    if cleared.is_empty() {
+        return;
+    }
+    {
+        let mut att = state.attention_panes.write().await;
+        for pid in cleared {
+            att.remove(pid);
+        }
+    }
+    {
+        let mut det = state.attention_details.write().await;
+        for pid in cleared {
+            det.remove(pid);
+        }
+    }
+    {
+        let mut lan = state.last_attention_notif.write().await;
+        for pid in cleared {
+            lan.remove(pid);
+        }
+    }
+    for pid in cleared {
+        super::hook_sink::mark_ntfy_resolved_by_pane(state, pid).await;
+    }
+}
+
 pub async fn run(state: AppState) {
     let mut remote_last: HashMap<String, Instant> = HashMap::new();
+    let mut remote_last_ok: HashMap<String, Instant> = HashMap::new();
+    let mut tick: u32 = 0;
     loop {
         let t0 = std::time::Instant::now();
 
@@ -239,10 +347,25 @@ pub async fn run(state: AppState) {
                 .map(|t| t.elapsed() >= REMOTE_POLL_INTERVAL)
                 .unwrap_or(true);
             if due {
-                if let Err(e) = poll_once_remote(&state, &alias).await {
-                    tracing::debug!(alias = %alias, "tmux poll error (remote): {e}");
+                match poll_once_remote(&state, &alias).await {
+                    Ok(()) => {
+                        remote_last_ok.insert(alias.clone(), Instant::now());
+                    }
+                    Err(e) => {
+                        tracing::debug!(alias = %alias, "tmux poll error (remote): {e}");
+                    }
                 }
                 remote_last.insert(alias, Instant::now());
+            }
+        }
+
+        // Periodic sweep of stale pane_assignment entries. Gated on
+        // tick count so we don't serialize/deserialize the store on
+        // every 1 s tick.
+        tick = tick.wrapping_add(1);
+        if tick % SWEEP_EVERY_N_TICKS == 0 {
+            if let Err(e) = sweep_stale_assignments(&state, &remote_last_ok).await {
+                tracing::debug!("stale-assignment sweep error: {e}");
             }
         }
 
@@ -252,6 +375,123 @@ pub async fn run(state: AppState) {
         }
         tokio::time::sleep(POLL_INTERVAL).await;
     }
+}
+
+/// Garbage-collect `pane_assignments` whose keys no longer correspond to
+/// any live pane. Runs every [`SWEEP_EVERY_N_TICKS`] ticks; an entry
+/// must be continuously missing for [`STALE_GRACE`] before eviction.
+///
+/// Remote assignments are only considered when their host has been
+/// successfully polled within [`REMOTE_HOST_STALE`] — a Mac that's
+/// currently unreachable should not cause its assignments to disappear
+/// while the user isn't even aware the link is down.
+///
+/// Race window: `state.panes` and `pane_assignments` are read a few
+/// microseconds apart. A pane that winks out of existence between the
+/// two reads looks missing this tick; it gets picked up again and
+/// ignored next tick once the `pane_assignments` read sees the next
+/// state. The 60 s grace period absorbs single-tick flicker like that.
+async fn sweep_stale_assignments(
+    state: &AppState,
+    remote_last_ok: &HashMap<String, Instant>,
+) -> anyhow::Result<()> {
+    let live_keys: HashSet<String> = {
+        let panes = state.panes.read().await;
+        panes.keys().cloned().collect()
+    };
+
+    let assignments =
+        crate::commands::project_meta::get_pane_assignments_full_sync(&state.app)
+            .map_err(|e| anyhow::anyhow!(e))?;
+
+    let now = Instant::now();
+    let mut to_evict: Vec<String> = Vec::new();
+
+    {
+        let mut missing = MISSING_SINCE.lock().expect("MISSING_SINCE poisoned");
+        for key in assignments.keys() {
+            // 4-segment assignment key: "host|session|window|pane". The
+            // parse_key helper also tolerates a stray legacy 3-segment
+            // key if migration hasn't landed yet (promotes to
+            // host="local"), so we stay forward/backward safe.
+            let Some((host, session, window, pane)) =
+                crate::models::pane_assignment::parse_key(key)
+            else {
+                // Malformed key — drop any grace record and skip.
+                missing.remove(key);
+                continue;
+            };
+
+            let is_remote = host != "local" && !host.is_empty();
+
+            if is_remote {
+                let host_recently_ok = remote_last_ok
+                    .get(&host)
+                    .map(|t| t.elapsed() < REMOTE_HOST_STALE)
+                    .unwrap_or(false);
+                if !host_recently_ok {
+                    // Host offline or never seen: skip eviction consideration,
+                    // reset any prior grace timer so a recovered host doesn't
+                    // inherit partial credit.
+                    missing.remove(key);
+                    continue;
+                }
+            }
+
+            // poll_once gives local panes id = "<session>:<window>.<pane>".
+            // poll_once_remote gives remote panes id = "<alias>/<session>:<window>.<pane>".
+            let coord = format!("{}:{}.{}", session, window, pane);
+            let live_key = if is_remote {
+                format!("{}/{}", host, coord)
+            } else {
+                coord
+            };
+
+            if live_keys.contains(&live_key) {
+                missing.remove(key);
+            } else {
+                let since = missing.entry(key.clone()).or_insert(now);
+                if now.duration_since(*since) > STALE_GRACE {
+                    to_evict.push(key.clone());
+                }
+            }
+        }
+
+        for k in &to_evict {
+            missing.remove(k);
+        }
+    }
+
+    if to_evict.is_empty() {
+        return Ok(());
+    }
+
+    // RMW the store. Read a fresh snapshot: the pane_assignments key may
+    // have been mutated (drag-drop, dropdown change) between the read
+    // above and now. Only evict keys that (a) we flagged for eviction
+    // AND (b) still look stale at write time — any key that's been
+    // overwritten has a fresh value and should be kept.
+    let mut current =
+        crate::commands::project_meta::get_pane_assignments_full_sync(&state.app)
+            .map_err(|e| anyhow::anyhow!(e))?;
+    let mut changed = false;
+    for k in &to_evict {
+        if let Some(prior) = assignments.get(k) {
+            if let Some(now_entry) = current.get(k) {
+                if now_entry == prior {
+                    current.remove(k);
+                    tracing::info!(key = %k, "evicted stale pane_assignment");
+                    changed = true;
+                }
+            }
+        }
+    }
+    if changed {
+        crate::services::store::save_store(&state.app, "pane_assignments", &current)
+            .map_err(|e| anyhow::anyhow!(e))?;
+    }
+
+    Ok(())
 }
 
 /// Enumerate distinct non-local host aliases currently assigned to any
@@ -281,6 +521,12 @@ async fn discover_remote_hosts(state: &AppState) -> HashSet<String> {
 /// account for every pane assignment targeting `alias`. Used by
 /// [`poll_once_remote`] to synthesize `claude_account` on the DTO
 /// since /proc isn't reachable across SSH.
+///
+/// Returns a map keyed on the 3-segment coord `session|window|pane`
+/// (not the full 4-segment assignment key) so the remote pane loop
+/// can look up accounts with the tmux-native coord it already parsed
+/// out of list-panes output. Only entries whose host matches `alias`
+/// are included.
 async fn remote_account_map_for_alias(
     state: &AppState,
     alias: &str,
@@ -291,10 +537,16 @@ async fn remote_account_map_for_alias(
     };
     let mut out = HashMap::new();
     for (key, assignment) in full {
-        if assignment.host == alias {
-            // Strip the session|window|pane key shape — pane_assignment
-            // keys are literally that already.
-            out.insert(key, assignment.account);
+        if assignment.host != alias {
+            continue;
+        }
+        // Drop the host segment from the 4-segment key so the coord
+        // matches what poll_once_remote builds from tmux format fields.
+        if let Some((_h, session, window, pane)) =
+            crate::models::pane_assignment::parse_key(&key)
+        {
+            let coord = format!("{}|{}|{}", session, window, pane);
+            out.insert(coord, assignment.account);
         }
     }
     out
@@ -357,6 +609,11 @@ async fn poll_once_remote(state: &AppState, alias: &str) -> anyhow::Result<()> {
     // Linux /proc walk. Collected during the main loop, spawned as a
     // background task after the panes write lock is released.
     let mut remote_session_queue: Vec<(String, String)> = Vec::new();
+    // Pane ids whose attention flag was cleared this tick (either because
+    // Claude exited or for another reason). Flushed from the three
+    // attention maps in one pass at the end — matches the local poll's
+    // pattern via `flush_cleared_attention`.
+    let mut cleared_attention: Vec<String> = Vec::new();
 
     // Snapshots used by the state-derivation rule (same source of truth
     // as local poll — phone hook flags + pending approvals).
@@ -392,7 +649,10 @@ async fn poll_once_remote(state: &AppState, alias: &str) -> anyhow::Result<()> {
         let pane_width: u16 = parts[9].parse().unwrap_or(0);
         let start_cmd = parts[10..].join("|");
 
-        // pane_assignment key format is "<session>|<window>|<pane>".
+        // Coord-only key (host stripped) matching what
+        // `remote_account_map_for_alias` populates. The pane_assignment
+        // store itself uses 4-segment keys ("<host>|<session>|<window>|<pane>")
+        // but here we already know the host via `alias`, so we drop it.
         let coord_key = format!("{}|{}|{}", session, window_index, pane_index);
         let synthesized_account = account_map.get(&coord_key).cloned();
 
@@ -452,6 +712,8 @@ async fn poll_once_remote(state: &AppState, alias: &str) -> anyhow::Result<()> {
             claude_account: synthesized_account.clone(),
             pane_uid: pane_uid.clone(),
             pane_width,
+            pane_pid: pane_pid.clone(),
+            first_seen_at: Instant::now(),
         });
 
         // Field updates — synthesized_account can change if the user
@@ -464,6 +726,7 @@ async fn poll_once_remote(state: &AppState, alias: &str) -> anyhow::Result<()> {
         rec.dto.current_path = current_path.clone();
         rec.pane_width = pane_width;
         rec.pane_uid = pane_uid.clone();
+        rec.pane_pid = pane_pid.clone();
         if rec.dto.claude_account != synthesized_account {
             rec.dto.claude_account = synthesized_account.clone();
             rec.claude_account = synthesized_account.clone();
@@ -505,6 +768,24 @@ async fn poll_once_remote(state: &AppState, alias: &str) -> anyhow::Result<()> {
         // exits or output stales; Waiting when an approval/attention flag
         // is set; Running when output moves).
         let claude_alive = crate::commands::tmux::pane_is_claude(&current_cmd, &start_cmd);
+        // Close the post-exit cleanup gap. Without this the remote pane
+        // record accumulates stale `claude_account`, `claude_session_id`,
+        // `claude_effort`, and attention flags after Claude exits on the
+        // Mac — symptom: remote panes keep displaying their last-session
+        // chip after the process is gone. Shared helper with the local
+        // poll so both hosts get identical cleanup semantics.
+        let cleared_exit_attention = if !claude_alive {
+            apply_claude_exit_cleanup(
+                rec,
+                &id,
+                &pane_pid,
+                &attention_snapshot,
+                &mut cleared_attention,
+                state,
+            )
+        } else {
+            false
+        };
         // Queue a session-binding resolve via lsof-over-SSH when Claude
         // is alive and we haven't bound a session id yet. `BindingConfidence`
         // is `Explicit` only when we parsed `--resume <uuid>` from the
@@ -517,7 +798,7 @@ async fn poll_once_remote(state: &AppState, alias: &str) -> anyhow::Result<()> {
             remote_session_queue.push((id.clone(), pane_pid.clone()));
         }
         let has_pending = pending_approval_panes.contains(&id);
-        let in_attention = attention_snapshot.contains_key(&id);
+        let in_attention = !cleared_exit_attention && attention_snapshot.contains_key(&id);
         let output_stale = rec
             .last_output_change
             .map(|t| t.elapsed() > IDLE_TIMEOUT)
@@ -598,9 +879,30 @@ async fn poll_once_remote(state: &AppState, alias: &str) -> anyhow::Result<()> {
         let bg_alias = alias.to_string();
         tokio::spawn(async move {
             for (pane_id, shell_pid) in remote_session_queue {
-                if let Some((session_id, encoded_project, _is_mru)) =
+                if let Some((session_id, encoded_project, is_mru)) =
                     detect_claude_session_remote(&bg_alias, &shell_pid).await
                 {
+                    // Same MRU grace-window guard as the local poller.
+                    // See tmux_poller::poll_once's session_detect_queue.
+                    const MRU_GRACE: Duration = Duration::from_secs(5);
+                    if is_mru {
+                        let too_young = {
+                            let panes = bg_state.panes.read().await;
+                            panes
+                                .get(&pane_id)
+                                .map(|rec| rec.first_seen_at.elapsed() < MRU_GRACE)
+                                .unwrap_or(false)
+                        };
+                        if too_young {
+                            tracing::info!(
+                                target: "mpdiag",
+                                pane = %pane_id,
+                                session = %session_id,
+                                "rejected remote MRU binding — pane still in grace window"
+                            );
+                            continue;
+                        }
+                    }
                     let updated_dto = {
                         let mut panes = bg_state.panes.write().await;
                         if let Some(rec) = panes.get_mut(&pane_id) {
@@ -626,6 +928,9 @@ async fn poll_once_remote(state: &AppState, alias: &str) -> anyhow::Result<()> {
             }
         });
     }
+
+    // Flush cleared attention flags — same pattern as the local poll.
+    flush_cleared_attention(state, &cleared_attention).await;
 
     Ok(())
 }
@@ -836,6 +1141,8 @@ async fn poll_once(state: &AppState) -> anyhow::Result<()> {
             claude_account: None,
             pane_uid: pane_uid.clone(),
             pane_width,
+            pane_pid: pane_pid.clone(),
+            first_seen_at: Instant::now(),
         });
 
         // Detect pane renumbering: if the same tmux coordinate (session:window.pane)
@@ -857,6 +1164,11 @@ async fn poll_once(state: &AppState) -> anyhow::Result<()> {
             rec.dto.claude_account = None;
             rec.dto.claude_effort = None;
             rec.output_hash = [0u8; 32]; // force next hash compare to re-emit
+            // Reset the grace window — the record still exists but now
+            // hosts a different underlying pane. MRU fallback should be
+            // gated off for the first few seconds of this new identity
+            // just as it would be for a fresh PaneRecord.
+            rec.first_seen_at = Instant::now();
         }
 
         // Update mutable fields
@@ -870,6 +1182,7 @@ async fn poll_once(state: &AppState) -> anyhow::Result<()> {
         rec.dto.project_display_name = project_display.clone();
         rec.pane_width = pane_width;
         rec.pane_uid = pane_uid.clone();
+        rec.pane_pid = pane_pid.clone();
         if claude_session_id.is_some() && rec.binding_confidence != BindingConfidence::Explicit {
             rec.dto.claude_session_id = claude_session_id.clone();
             rec.binding_confidence = BindingConfidence::Explicit;
@@ -878,7 +1191,7 @@ async fn poll_once(state: &AppState) -> anyhow::Result<()> {
         // Compute the desired pipe-pane target based on the NEW session id
         // (post-update) and queue an action if something needs changing.
         let new_session_id = rec.dto.claude_session_id.clone();
-        let is_claude = is_claude_like(&cur_cmd, &start_cmd);
+        let is_claude = crate::commands::tmux::pane_is_claude(&cur_cmd, &start_cmd);
         if is_claude {
             let target = match &new_session_id {
                 Some(sid) => super::pane_log::LogTarget::Session(sid.clone()),
@@ -970,44 +1283,24 @@ async fn poll_once(state: &AppState) -> anyhow::Result<()> {
         {
             session_detect_queue.push((id.clone(), pane_pid.clone()));
         }
-        // When Claude exits from a pane, clear the cached account so that
-        // if a different account's Claude is launched in the same shell,
-        // detection re-runs instead of returning the stale cached result.
-        if !claude_alive && rec.claude_account.is_some() {
-            if !pane_pid.is_empty() {
-                crate::commands::tmux::invalidate_account_cache(&pane_pid);
-            }
-            rec.claude_account = None;
-            rec.dto.claude_account = None;
-        }
-        // Same for the session binding — when Claude exits, the bound
-        // session_id is no longer authoritative for the pane.
-        if !claude_alive && rec.binding_confidence != BindingConfidence::None {
-            rec.dto.claude_session_id = None;
-            rec.binding_confidence = BindingConfidence::None;
-        }
-        // And the effort setting is per-Claude-session — clear it so the
-        // next Claude invocation in this pane starts with no stale value
-        // while its banner is being detected.
-        if !claude_alive && rec.dto.claude_effort.is_some() {
-            rec.dto.claude_effort = None;
-            let _ = state.events.send(EventDto::PaneUpdated {
-                pane: rec.dto.clone(),
-            });
-        }
+        // When Claude exits, clear per-Claude-lifecycle fields (account,
+        // session_id binding, effort) and drop any pending attention flag.
+        // See `apply_claude_exit_cleanup` for the full rationale. Shared
+        // with the remote poll path so both hosts get identical cleanup.
+        let cleared_exit_attention = if !claude_alive {
+            apply_claude_exit_cleanup(
+                rec,
+                &id,
+                &pane_pid,
+                &attention_snapshot,
+                &mut cleared_attention,
+                &state,
+            )
+        } else {
+            false
+        };
         let has_pending = pending_approval_panes.contains(&id);
-        let mut in_attention = attention_snapshot.contains_key(&id);
-        // If Claude has exited but the pane is still in the attention
-        // set, drop the flag — no one is there to respond any more.
-        if !claude_alive && in_attention {
-            cleared_attention.push(id.clone());
-            in_attention = false;
-            state.audit_log(AuditEvent::Cancelled {
-                pane_id: id.clone(),
-                notification_type: "attention".into(),
-                reason: "claude_exited".into(),
-            });
-        }
+        let mut in_attention = !cleared_exit_attention && attention_snapshot.contains_key(&id);
         // Output-stale detection: if Claude is alive but the pane's output
         // hash hasn't changed for IDLE_TIMEOUT, Claude is sitting at its
         // input prompt — not actively working. That's Idle, not Running.
@@ -1166,30 +1459,8 @@ async fn poll_once(state: &AppState) -> anyhow::Result<()> {
         });
     }
 
-    // Flush cleared attention flags in one write. Done after the per-pane
-    // loop so we only grab the attention write lock once per tick.
-    if !cleared_attention.is_empty() {
-        let mut att = state.attention_panes.write().await;
-        for pid in &cleared_attention {
-            att.remove(pid);
-        }
-        drop(att);
-        let mut det = state.attention_details.write().await;
-        for pid in &cleared_attention {
-            det.remove(pid);
-        }
-        drop(det);
-        let mut lan = state.last_attention_notif.write().await;
-        for pid in &cleared_attention {
-            lan.remove(pid);
-        }
-        drop(lan);
-        // Mark ntfy backlog entries for cleared panes as resolved so they
-        // won't replay on SSE reconnect.
-        for pid in &cleared_attention {
-            super::hook_sink::mark_ntfy_resolved_by_pane(&state, pid).await;
-        }
-    }
+    // Flush cleared attention flags in one pass. See `flush_cleared_attention`.
+    flush_cleared_attention(&state, &cleared_attention).await;
 
     // Claude account + session detection both shell out via wsl.exe and
     // can take 500ms-1s per pane. Running them sequentially inside the poll
@@ -1232,6 +1503,34 @@ async fn poll_once(state: &AppState) -> anyhow::Result<()> {
         if let Some((session_id, encoded_project, is_mru)) =
             detect_claude_session(&shell_pid).await
         {
+            // Overlap-prevention grace window: a brand-new pane hasn't
+            // had time to open its jsonl in write mode, so detection's
+            // MRU fallback is very likely to hand us a sibling pane's
+            // active transcript. Reject MRU bindings until the pane has
+            // been alive for 5s — by then the primary fd-scan path
+            // should have succeeded with the pane's real session id.
+            // Non-MRU bindings (write-mode fd found) are authoritative
+            // and pass through immediately.
+            const MRU_GRACE: Duration = Duration::from_secs(5);
+            if is_mru {
+                let too_young = {
+                    let panes = state.panes.read().await;
+                    match panes.get(&pane_id) {
+                        Some(rec) => rec.first_seen_at.elapsed() < MRU_GRACE,
+                        None => false,
+                    }
+                };
+                if too_young {
+                    tracing::info!(
+                        target: "mpdiag",
+                        pane = %pane_id,
+                        session = %session_id,
+                        "rejected MRU binding — pane still in grace window"
+                    );
+                    continue;
+                }
+            }
+
             // Migration info captured while holding the lock, acted on
             // after we drop it — avoids awaiting inside the write guard.
             let mut migrate_info: Option<(String, String)> = None; // (pane_uid, session_id)
@@ -1292,9 +1591,28 @@ async fn poll_once(state: &AppState) -> anyhow::Result<()> {
                         // migrate pending/<pane_uid>.log into
                         // sessions/<session_id>.log and re-target pipe-pane.
                         let was_pending = rec.dto.claude_session_id.is_none();
+                        let prev_session = rec.dto.claude_session_id.clone();
                         if was_pending && !rec.pane_uid.is_empty() {
                             migrate_info =
                                 Some((rec.pane_uid.clone(), session_id.clone()));
+                        }
+                        // Log the transition. Silent Some(A) → Some(B) rebinds
+                        // (where prev_session is Some but != new) are the most
+                        // likely cause of "pane A shows pane B's transcript"
+                        // in multi-pane setups, because no migration fires to
+                        // move the pipe-pane log and the old binding is
+                        // dropped without notice.
+                        if prev_session.as_deref() != Some(session_id.as_str()) {
+                            tracing::info!(
+                                target: "mpdiag",
+                                pane = %pane_id,
+                                prev_session = ?prev_session,
+                                new_session = %session_id,
+                                was_pending,
+                                is_mru,
+                                pane_uid = %rec.pane_uid,
+                                "session-id rebind"
+                            );
                         }
                         rec.dto.claude_session_id = Some(session_id.clone());
                         rec.binding_confidence = BindingConfidence::Heuristic;
@@ -1658,7 +1976,10 @@ walk() {{
   return 1
 }}
 claude_pid=$(walk {pid} 0)
-[ -z "$claude_pid" ] && exit 1
+if [ -z "$claude_pid" ]; then
+  echo "REASON:no_claude_in_tree"
+  exit 0
+fi
 
 # First-choice: lsof-based open-file scan. Default lsof columns are:
 #   COMMAND PID USER FD TYPE DEVICE SIZE/OFF NODE NAME
@@ -1677,7 +1998,10 @@ fi
 # Fallback: lsof cwd → MRU .jsonl in the matching project dir.
 cwd=$(lsof -p "$claude_pid" -a -d cwd 2>/dev/null \
   | awk 'NR > 1 {{ print $NF; exit }}')
-[ -z "$cwd" ] && exit 1
+if [ -z "$cwd" ]; then
+  echo "REASON:no_cwd_for_claude_pid"
+  exit 0
+fi
 encoded=$(echo "$cwd" | tr '/. ' '-')
 for cfg in ".claude" ".claude-b" ".claude-c"; do
   proj_dir="$HOME/$cfg/projects/$encoded"
@@ -1688,7 +2012,8 @@ for cfg in ".claude" ".claude-b" ".claude-c"; do
     exit 0
   fi
 done
-exit 1
+echo "REASON:no_write_fd_no_mru_encoded_${{encoded}}"
+exit 0
 "#,
         pid = shell_pid
     );
@@ -1700,6 +2025,16 @@ exit 1
     .ok()?;
     let first = out.lines().next()?.trim();
     if first.is_empty() {
+        return None;
+    }
+    if let Some(reason) = first.strip_prefix("REASON:") {
+        tracing::info!(
+            target: "mpdiag",
+            alias = %alias,
+            pid = %shell_pid,
+            reason = %reason,
+            "detect_claude_session_remote returned None"
+        );
         return None;
     }
     let (path, is_mru) = if let Some(rest) = first.strip_prefix("MRU:") {
@@ -1717,6 +2052,27 @@ pub(super) async fn detect_claude_session(shell_pid: &str) -> Option<(String, St
     if shell_pid.is_empty() {
         return None;
     }
+    // The shell script emits exactly one of:
+    //   <abs-path>           — primary write-mode fd found
+    //   MRU:<abs-path>       — mru-fallback (caller treats as low-confidence)
+    //   REASON:<short-tag>   — detection failed; tag surfaced so Rust/log can
+    //                          distinguish "no claude pid in process tree"
+    //                          from "walked tree but no jsonl fd" etc.
+    //
+    // Config-dir list covers all three accounts currently in use:
+    //   .claude   → andrea (primary, default)
+    //   .claude-b → bravura
+    //   .claude-c → sully
+    // Adding a new account means a line here AND a line in the MRU fallback
+    // AND a row in companion/accounts.rs::ACCOUNTS.
+    //
+    // Walk's case statement matches every wrapper-family Andrea has used
+    // (cld/cld2/cld3 aren't binaries themselves — they're bash functions
+    // that exec into claude/ncld/mncld, so the subprocess side is what the
+    // walker sees). mncld is the patched-binary wrapper that mirrors ncld
+    // for .claude-c sessions; before this patch the walker missed it and
+    // fell through to the node-cmdline grep, which worked only when
+    // /proc/$pid/cmdline was already populated (race during exec).
     let script = format!(
         r#"
 walk() {{
@@ -1728,7 +2084,7 @@ walk() {{
   # comm is truncated to 15 chars by the kernel (TASK_COMM_LEN), so
   # `cli-ncld-114.bin` appears as `cli-ncld-114.bi`. Match a prefix.
   case "$comm" in
-    claude|cli-ncld-*|ncld|ncld2)
+    claude|cli-ncld-*|cli-mncld-*|ncld|ncld2|ncld3|mncld|mncld2|mncld3)
       echo "$pid"
       return 0
       ;;
@@ -1746,7 +2102,10 @@ walk() {{
   return 1
 }}
 claude_pid=$(walk {pid} 0)
-[ -z "$claude_pid" ] && exit 1
+if [ -z "$claude_pid" ]; then
+  echo "REASON:no_claude_in_tree"
+  exit 0
+fi
 
 # First-choice signal: catch a JSONL file descriptor Claude has open for
 # WRITING while it's active. The write-mode filter is load-bearing — when
@@ -1762,7 +2121,7 @@ for i in $(seq 1 15); do
   for fd in /proc/$claude_pid/fd/*; do
     target=$(readlink "$fd" 2>/dev/null) || continue
     case "$target" in
-      "$HOME/.claude/projects/"*/*.jsonl|"$HOME/.claude-b/projects/"*/*.jsonl) ;;
+      "$HOME/.claude/projects/"*/*.jsonl|"$HOME/.claude-b/projects/"*/*.jsonl|"$HOME/.claude-c/projects/"*/*.jsonl) ;;
       *) continue ;;
     esac
     fdnum=$(basename "$fd")
@@ -1782,9 +2141,12 @@ done
 # low-confidence and skip binding if a sibling pane already claims
 # this session_id. Prefix `MRU:` flags it as the weak path.
 cwd=$(readlink "/proc/$claude_pid/cwd" 2>/dev/null)
-[ -z "$cwd" ] && exit 1
+if [ -z "$cwd" ]; then
+  echo "REASON:no_cwd_for_claude_pid"
+  exit 0
+fi
 encoded=$(echo "$cwd" | tr '/. ' '-')
-for cfg in ".claude" ".claude-b"; do
+for cfg in ".claude" ".claude-b" ".claude-c"; do
   proj_dir="$HOME/$cfg/projects/$encoded"
   [ -d "$proj_dir" ] || continue
   mru=$(ls -t "$proj_dir"/*.jsonl 2>/dev/null | head -1)
@@ -1793,7 +2155,8 @@ for cfg in ".claude" ".claude-b"; do
     exit 0
   fi
 done
-exit 1
+echo "REASON:no_write_fd_no_mru_encoded_${{encoded}}"
+exit 0
 "#,
         pid = shell_pid
     );
@@ -1804,12 +2167,24 @@ exit 1
     if first.is_empty() {
         return None;
     }
+    // Surface the specific failure reason into mpdiag so stuck panes can
+    // be diagnosed from logs. One line per failure per tick is fine — the
+    // caller rate-limits by only queueing when binding_confidence is None.
+    if let Some(reason) = first.strip_prefix("REASON:") {
+        tracing::info!(
+            target: "mpdiag",
+            pid = %shell_pid,
+            reason = %reason,
+            "detect_claude_session returned None"
+        );
+        return None;
+    }
     let (path, is_mru) = if let Some(rest) = first.strip_prefix("MRU:") {
         (rest, true)
     } else {
         (first, false)
     };
-    // Path: /home/<user>/.claude[-b]/projects/<encoded_project>/<session_id>.jsonl
+    // Path: /home/<user>/.claude[-b|-c]/projects/<encoded_project>/<session_id>.jsonl
     let p = std::path::Path::new(path);
     let session_id = p.file_stem()?.to_str()?.to_string();
     let encoded_project = p.parent()?.file_name()?.to_str()?.to_string();

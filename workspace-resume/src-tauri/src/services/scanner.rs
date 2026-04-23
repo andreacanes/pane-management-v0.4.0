@@ -16,6 +16,12 @@ pub struct SessionMeta {
 const MAX_PARSE_SIZE: u64 = 100 * 1024 * 1024; // 100 MB
 const WARN_SIZE: u64 = 50 * 1024 * 1024; // 50 MB
 const MAX_MESSAGE_LEN: usize = 200;
+/// How far into a JSONL file's header to scan for `sessionId` and
+/// `timestamp`. Was 5; compacted sessions and sessions that open with
+/// a large meta block blew past that and silently yielded
+/// `first_timestamp: None` + `session_id: None` (surfaces as an
+/// "unresolved" project or a session with no date). 100 is ample.
+const HEADER_SCAN_CAP: usize = 100;
 
 /// Check if a user record's content represents a real human message
 /// (not a tool result, command output, or meta message).
@@ -59,13 +65,22 @@ pub fn parse_session_metadata(path: &Path) -> Result<SessionMeta, String> {
         });
     }
 
-    // Very large file -- return stub without parsing
+    // Very large file -- return stub without parsing. Leave
+    // last_user_message as None rather than the old bracketed literal
+    // that rendered verbatim in session lists; the empty slot is more
+    // honest than "[large file - skipped parsing]" masquerading as
+    // user content.
     if file_size > MAX_PARSE_SIZE {
+        eprintln!(
+            "[scanner] session log exceeds {} MB, skipping parse: {}",
+            MAX_PARSE_SIZE / 1024 / 1024,
+            path.display()
+        );
         return Ok(SessionMeta {
             session_id: None,
             first_timestamp: None,
             last_timestamp: None,
-            last_user_message: Some("[large file - skipped parsing]".to_string()),
+            last_user_message: None,
             is_corrupted: false,
         });
     }
@@ -82,7 +97,17 @@ pub fn parse_session_metadata(path: &Path) -> Result<SessionMeta, String> {
     {
         let file = File::open(path).map_err(|e| format!("Cannot open file: {}", e))?;
         let reader = BufReader::new(file);
-        for line in reader.lines().take(5) {
+        let mut scanned = 0usize;
+        for line in reader.lines() {
+            scanned += 1;
+            if scanned > HEADER_SCAN_CAP {
+                eprintln!(
+                    "[scanner] gave up after {} header lines without sessionId+timestamp in {}",
+                    HEADER_SCAN_CAP,
+                    path.display()
+                );
+                break;
+            }
             if let Ok(line) = line {
                 if let Ok(val) = serde_json::from_str::<serde_json::Value>(&line) {
                     any_valid_record = true;

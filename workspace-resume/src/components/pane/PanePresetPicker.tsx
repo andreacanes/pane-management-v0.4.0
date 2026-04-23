@@ -49,9 +49,35 @@ export function PanePresetPicker() {
   const window = () => state.selectedTmuxWindow;
   const currentPaneCount = () => state.tmuxPanes.length;
 
-  /** Look up the encoded-project name assigned to a pane index in the current window. */
+  /** Look up the encoded-project name assigned to a pane index in the
+   *  current window. Uses the 4-segment key format; PanePresetPicker
+   *  only operates on the local view, so we fix the host at "local".
+   *  (Mac sessions are managed through CreatePaneModal, not this grid
+   *  preset picker.) */
   function projectForIndex(idx: number): string | null {
-    return state.paneAssignments[String(idx)] ?? null;
+    const sess = session();
+    const win = window();
+    if (sess == null || win == null) return null;
+    return state.paneAssignments[`local|${sess}|${win}|${idx}`] ?? null;
+  }
+
+  /** Local-only pane_index set drawn from assignments — used by reduce()
+   *  and resetGrid() to iterate pane indices belonging to the current
+   *  local session+window. Remote assignments live under different
+   *  prefixes and aren't touched by layout presets. */
+  function localAssignedIndicesInView(): number[] {
+    const sess = session();
+    const win = window();
+    if (sess == null || win == null) return [];
+    const prefix = `local|${sess}|${win}|`;
+    const out: number[] = [];
+    for (const key of Object.keys(state.paneAssignments)) {
+      if (key.startsWith(prefix)) {
+        const idx = Number(key.slice(prefix.length));
+        if (!Number.isNaN(idx)) out.push(idx);
+      }
+    }
+    return out;
   }
 
   /** Non-destructive path: same count or growth. Reflows or appends without killing. */
@@ -79,12 +105,10 @@ export function PanePresetPicker() {
     try {
       const newCount = cols * rows;
       await reducePaneGrid(sess, win, cols, rows);
-      const staleKeys = Object.keys(state.paneAssignments).filter(
-        (idx) => Number(idx) >= newCount,
-      );
-      if (staleKeys.length > 0) {
+      const stale = localAssignedIndicesInView().filter((idx) => idx >= newCount);
+      if (stale.length > 0) {
         await Promise.all(
-          staleKeys.map((idx) => setPaneAssignment(sess, win, Number(idx), null)),
+          stale.map((idx) => setPaneAssignment("local", sess, win, idx, null)),
         );
       }
       refreshTmuxState();
@@ -95,7 +119,9 @@ export function PanePresetPicker() {
     }
   }
 
-  /** Full destructive reset: kills every pane but one, wipes every assignment for (sess, win). */
+  /** Full destructive reset: kills every pane but one, wipes every
+   *  assignment for (local, sess, win). Remote hosts' assignments stay
+   *  untouched — this preset picker is a local-view operation. */
   async function resetGrid() {
     const sess = session();
     const win = window();
@@ -103,10 +129,10 @@ export function PanePresetPicker() {
     setBusy(true);
     try {
       await setupPaneGrid(sess, win, 1, 1);
-      const allKeys = Object.keys(state.paneAssignments);
-      if (allKeys.length > 0) {
+      const indices = localAssignedIndicesInView();
+      if (indices.length > 0) {
         await Promise.all(
-          allKeys.map((idx) => setPaneAssignment(sess, win, Number(idx), null)),
+          indices.map((idx) => setPaneAssignment("local", sess, win, idx, null)),
         );
       }
       refreshTmuxState();
@@ -169,31 +195,44 @@ export function PanePresetPicker() {
               // Wait for tmux to finish restoring panes
               await new Promise((r) => setTimeout(r, 2000));
 
-              // Re-launch Claude sessions across ALL sessions+windows from saved assignments
-              // Keys are "session|window|pane" format — get all from the raw store
-              const { getPaneAssignmentsRaw } = await import("../../lib/tauri-commands");
+              // Re-launch Claude sessions across every saved assignment.
+              // Keys are 4-segment "host|session|window|pane" — group by
+              // (host, session, window) so we list-panes once per group,
+              // then route each launch via pane coords (host included).
+              const { getPaneAssignmentsRaw, listTmuxPanesOn } = await import("../../lib/tauri-commands");
               const allAssignments = await getPaneAssignmentsRaw();
 
-              // Group by session+window
-              const groups = new Map<string, { sess: string; win: number; panes: { idx: number; project: string }[] }>();
+              const groups = new Map<
+                string,
+                { host: string; sess: string; win: number; panes: { idx: number; project: string }[] }
+              >();
               for (const [key, encodedProject] of Object.entries(allAssignments)) {
                 const parts = key.split("|");
-                if (parts.length !== 3) continue;
-                const [sessName, winStr, paneStr] = parts;
-                const groupKey = `${sessName}|${winStr}`;
+                if (parts.length !== 4) continue;
+                const [hostName, sessName, winStr, paneStr] = parts;
+                const groupKey = `${hostName}|${sessName}|${winStr}`;
                 if (!groups.has(groupKey)) {
-                  groups.set(groupKey, { sess: sessName, win: Number(winStr), panes: [] });
+                  groups.set(groupKey, {
+                    host: hostName,
+                    sess: sessName,
+                    win: Number(winStr),
+                    panes: [],
+                  });
                 }
-                groups.get(groupKey)!.panes.push({ idx: Number(paneStr), project: encodedProject });
+                groups.get(groupKey)!.panes.push({
+                  idx: Number(paneStr),
+                  project: encodedProject,
+                });
               }
 
-              // Launch in each session+window
               for (const group of groups.values()) {
                 let panes;
                 try {
-                  panes = await listTmuxPanes(group.sess, group.win);
+                  panes = await listTmuxPanesOn(group.host, group.sess, group.win);
                 } catch (e) {
-                  console.warn(`[Resurrect] window ${group.sess}:${group.win} not found, skipping`);
+                  console.warn(
+                    `[Resurrect] ${group.host} ${group.sess}:${group.win} not found, skipping`,
+                  );
                   continue;
                 }
                 for (const { idx: paneIndex, project: encodedProject } of group.panes) {
@@ -211,9 +250,13 @@ export function PanePresetPicker() {
                       projectPath: project.actual_path,
                       boundSession: project.meta.bound_session,
                       targetPaneIndex: paneIndex,
+                      host: group.host,
                     });
                   } catch (e) {
-                    console.error(`[Resurrect] failed to resume pane ${paneIndex} in ${group.sess}:${group.win}:`, e);
+                    console.error(
+                      `[Resurrect] failed to resume pane ${paneIndex} in ${group.host} ${group.sess}:${group.win}:`,
+                      e,
+                    );
                   }
                 }
               }

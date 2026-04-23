@@ -17,7 +17,7 @@ import type { TmuxWindow } from "../../lib/types";
 import { Activity, Settings as SettingsIcon, Plus, ChevronDown } from "../ui/icons";
 import { accountForPane, ACCOUNT_COLORS } from "../../lib/account";
 import { StatusOrb } from "../ui/StatusOrb";
-import { deriveName, fromWslPath } from "../../lib/path";
+import { deriveName, matchProjectByPath } from "../../lib/path";
 
 // Window tab reorder prefix (only remaining drag type in top bar)
 export const WINDOW_TAB_PREFIX = "window-tab:";
@@ -107,12 +107,7 @@ export function TopBar() {
     const paths = status?.active_paths ?? [];
     for (const panePath of paths) {
       if (!panePath) continue;
-      const asWsl = panePath.toLowerCase().replace(/\/+$/, "");
-      const asWin = fromWslPath(panePath).toLowerCase().replace(/[\\/]+$/, "");
-      const project = state.projects.find((p) => {
-        const actual = p.actual_path.toLowerCase().replace(/[\\/]+$/, "");
-        return actual === asWsl || actual === asWin;
-      });
+      const project = matchProjectByPath(panePath, state.projects);
       if (project) return project.meta.display_name || deriveName(project.actual_path);
       return deriveName(panePath);
     }
@@ -192,7 +187,9 @@ export function TopBar() {
       await createSession(name);
       refreshTmuxState();
       selectTmuxSession(name);
-    } catch {}
+    } catch (e) {
+      console.error("[TopBar] createSession error:", e);
+    }
   }
 
   async function handleKillSession(sessionName: string) {
@@ -209,7 +206,9 @@ export function TopBar() {
       await renameSession(oldName, newName);
       refreshTmuxState();
       if (state.selectedTmuxSession === oldName) selectTmuxSession(newName);
-    } catch {}
+    } catch (e) {
+      console.error("[TopBar] renameSession error:", e);
+    }
   }
 
   // Window actions
@@ -223,7 +222,9 @@ export function TopBar() {
         const newest = windows.reduce((a, b) => (b.index > a.index ? b : a));
         selectTmuxWindow(newest.index);
       }
-    } catch {}
+    } catch (e) {
+      console.error("[TopBar] createWindow error:", e);
+    }
   }
 
   function startRenameWindow(windowIndex: number, windowName: string) {
@@ -239,7 +240,12 @@ export function TopBar() {
     if (!newName) return;
     const sess = state.selectedTmuxSession;
     if (!sess) return;
-    try { await renameWindow(sess, windowIndex, newName); refreshTmuxState(); } catch {}
+    try {
+      await renameWindow(sess, windowIndex, newName);
+      refreshTmuxState();
+    } catch (e) {
+      console.error("[TopBar] renameWindow error:", e);
+    }
   }
 
   function requestKillWindow(e: MouseEvent, windowIndex: number, windowName: string) {
@@ -258,7 +264,11 @@ export function TopBar() {
   async function executeKill() {
     const pending = confirmKill();
     if (!pending) return;
-    try { await pending.action(); } catch {}
+    try {
+      await pending.action();
+    } catch (e) {
+      console.error("[TopBar] confirmKill action error:", e);
+    }
     setConfirmKill(null);
   }
 

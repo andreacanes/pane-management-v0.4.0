@@ -2,7 +2,7 @@ import { createSignal, createMemo, For, Show, onMount, onCleanup } from "solid-j
 import { createDroppable } from "@thisbeyond/solid-dnd";
 import { useApp } from "../../contexts/AppContext";
 import { setProjectTier, sendToPane } from "../../lib/tauri-commands";
-import { deriveName, fromWslPath } from "../../lib/path";
+import { deriveName, pathMatchesProject } from "../../lib/path";
 import type { ProjectWithMeta } from "../../lib/types";
 
 /** Prefix for pin-bar draggable IDs to avoid collisions with sidebar cards. */
@@ -29,15 +29,12 @@ function PinnedPill(props: {
   function findWaitingPane(): [number, number] | null {
     const proj = state.projects.find((p) => p.encoded_name === props.project.encoded_name);
     if (!proj) return null;
-    const actualLower = proj.actual_path.toLowerCase().replace(/[\\/]+$/, "");
     for (const [winIdx, status] of Object.entries(state.windowStatuses)) {
       const paths = status.active_paths ?? [];
       const panes = status.active_panes ?? [];
       const waiting = status.waiting_panes ?? [];
       for (let i = 0; i < paths.length; i++) {
-        const pathLower = paths[i].toLowerCase().replace(/\/+$/, "");
-        const pathMatch = actualLower === pathLower || actualLower === fromWslPath(paths[i]).toLowerCase().replace(/[\\/]+$/, "");
-        if (pathMatch && waiting.includes(panes[i])) {
+        if (pathMatchesProject(paths[i], proj.actual_path) && waiting.includes(panes[i])) {
           return [Number(winIdx), panes[i]];
         }
       }

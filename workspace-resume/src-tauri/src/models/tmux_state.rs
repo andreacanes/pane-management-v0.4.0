@@ -52,6 +52,29 @@ pub struct TmuxPane {
     /// True when current_path is a linked (non-primary) git worktree.
     #[serde(default)]
     pub is_worktree: bool,
+    /// Host the pane lives on: `"local"` for WSL tmux, `"mac"` (or any
+    /// SSH alias) for a remote tmux server. Stamped by the list-panes
+    /// caller. The host + session + window + pane_index tuple uniquely
+    /// identifies the pane across all reachable tmux servers; this is
+    /// the coordinate used by `pane_assignments` keys and by every
+    /// operation that routes through `HostTarget`.
+    #[serde(default = "default_local_host")]
+    pub host: String,
+    /// tmux session this pane belongs to — stamped by the caller since
+    /// the per-session `list_tmux_panes` format string omits it. Empty
+    /// when a parser without context produces the pane (callers should
+    /// always stamp before returning to the wire).
+    #[serde(default)]
+    pub session_name: String,
+}
+
+// Used by `#[serde(default = "...")]` on `TmuxPane::host`. Only fires
+// on deserialize, which TmuxPane doesn't currently derive — kept for
+// the day we add Deserialize (the migration plan leaves that door open
+// without needing another model tweak).
+#[allow(dead_code)]
+fn default_local_host() -> String {
+    "local".to_string()
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -127,6 +150,8 @@ mod tests {
             window_index: 0,
             git_branch: None,
             is_worktree: false,
+            host: "local".to_string(),
+            session_name: "main".to_string(),
         };
         let json = serde_json::to_string(&pane).unwrap();
         assert!(json.contains("\"pane_id\":\"%5\""));
@@ -166,6 +191,8 @@ mod tests {
                 window_index: 0,
                 git_branch: None,
                 is_worktree: false,
+                host: "local".to_string(),
+                session_name: "test".to_string(),
             }],
         };
         let json = serde_json::to_string(&state).unwrap();

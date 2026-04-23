@@ -1,10 +1,13 @@
-//! Tauri commands for Mac-side project integration.
+//! Tauri commands for remote-host integration (currently Mac-only).
 //!
-//! Two concerns live here:
-//! 1. Kicking off Mutagen syncs from WSL when a pane targets the Mac for
-//!    a project not yet mirrored there ([`sync_project_to_mac`]).
+//! Four concerns live here:
+//! 1. Kicking off Mutagen syncs from WSL when a pane targets a remote host
+//!    for a project not yet mirrored there ([`sync_project_to_mac`]).
 //! 2. Enumerating known remote hosts for the UI host-picker
 //!    ([`list_remote_hosts`]).
+//! 3. Pre-flight checks before enabling a remote host on a pane
+//!    ([`check_remote_path_exists`]).
+//! 4. SSH ControlMaster health visibility ([`check_ssh_master`]).
 //!
 //! Error dialect: `Result<T, String>` per `.claude/rules/error-handling-dialects.md`.
 
@@ -44,6 +47,54 @@ pub async fn list_remote_hosts() -> Result<Vec<String>, String> {
     Ok(vec!["mac".to_string()])
 }
 
+/// Check whether `path` exists as a directory on `host`. Used by the UI
+/// to gate the Host=Mac dropdown: if the project hasn't been mirrored to
+/// the Mac yet, the launch would silently fail with "no such file or
+/// directory" inside the pane. Better to disable the option up front
+/// with a tooltip.
+///
+/// The trick: run `test -d <path> && echo yes || echo no` so the exit
+/// status is always 0 and our caller can read the result from stdout
+/// without muddling genuine SSH/transport errors (which still surface
+/// as `Err`).
+///
+/// `host` accepts the same values as [`HostTarget::from_str`]:
+/// `"local"` / `""` / `None` → local WSL, anything else → SSH alias.
+#[tauri::command]
+pub async fn check_remote_path_exists(
+    host: String,
+    path: String,
+) -> Result<bool, String> {
+    use crate::services::host_target::HostTarget;
+    let script = format!(
+        "test -d {} && echo yes || echo no",
+        shell_quote(&path),
+    );
+    let host_t = HostTarget::from_str(Some(&host));
+    let out = crate::commands::tmux::run_tmux_command_async_on(host_t, script).await?;
+    Ok(out.trim() == "yes")
+}
+
+/// Poll the OpenSSH ControlMaster for `alias` and return whether the
+/// multiplexed socket is live. Uses `ssh -O check` which exits 0 when
+/// the master is running and non-zero otherwise — we translate to a
+/// bool and swallow the stderr so a dead master isn't reported as a
+/// hard error up the Tauri bridge.
+///
+/// The frontend polls this every ~15 s to show a health dot next to
+/// the host dropdown. A dead master means the *next* remote tmux call
+/// will pay the full SSH handshake cost (~200-500 ms) rather than the
+/// multiplexed ~10-30 ms, so this is a soft indicator, not a blocker.
+#[tauri::command]
+pub async fn check_ssh_master(alias: String) -> Result<bool, String> {
+    let script = format!(
+        "ssh -O check {} >/dev/null 2>&1 && echo live || echo dead",
+        shell_quote(&alias),
+    );
+    let out = crate::commands::tmux::run_tmux_command_async(script).await?;
+    Ok(out.trim() == "live")
+}
+
 /// Single-quote a bash script fragment for safe nesting inside another
 /// bash `-c` invocation. Mirrors [`crate::services::host_target::ssh_shell_quote`]
 /// but kept local to avoid a dependency inversion — this module is a
@@ -65,4 +116,9 @@ mod tests {
     fn shell_quote_with_single_quote() {
         assert_eq!(shell_quote("a'b"), r"'a'\''b'");
     }
+
+    // check_remote_path_exists / check_ssh_master are integration-tested by
+    // running the real commands during the end-to-end verification — they
+    // are pure wrappers around a small shell script + the existing
+    // run_tmux_command_async helpers, which have their own tests.
 }

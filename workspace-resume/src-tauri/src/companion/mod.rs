@@ -82,14 +82,27 @@ pub async fn spawn(app: AppHandle) -> anyhow::Result<()> {
         tracing::debug!("pre-boot pipe cleanup failed: {e}");
     }
 
-    // Spin up the notification audit log writer. Use the Roaming AppData
-    // directory (same as the Tauri store) since app_data_dir() may resolve
-    // to Local or require the path plugin.
-    let audit_dir = std::path::PathBuf::from(r"C:\Users\Andrea\AppData\Roaming\com.pane-management.app");
-    if audit_dir.exists() {
-        let audit = audit_log::AuditLog::spawn(audit_dir.clone());
-        state.audit = Some(Arc::new(audit));
-        state.audit_data_dir = Some(audit_dir);
+    // Spin up the notification audit log writer in the Tauri app-data
+    // directory (same root the store plugin uses for settings.json). On
+    // Windows this resolves to Roaming\<identifier>; on macOS and Linux
+    // it resolves to the platform-appropriate app-data root. If path
+    // resolution fails or the directory doesn't exist yet (first launch
+    // before the store has saved anything), audit logging stays off.
+    match app.path().app_data_dir() {
+        Ok(audit_dir) if audit_dir.exists() => {
+            let audit = audit_log::AuditLog::spawn(audit_dir.clone());
+            state.audit = Some(Arc::new(audit));
+            state.audit_data_dir = Some(audit_dir);
+        }
+        Ok(audit_dir) => {
+            tracing::debug!(
+                dir = %audit_dir.display(),
+                "app_data_dir does not exist yet — audit log will stay disabled until the store writes first"
+            );
+        }
+        Err(e) => {
+            tracing::warn!("failed to resolve app_data_dir — audit log disabled: {e}");
+        }
     }
 
     // Register as Tauri managed state so commands (e.g. rotate_companion_token)

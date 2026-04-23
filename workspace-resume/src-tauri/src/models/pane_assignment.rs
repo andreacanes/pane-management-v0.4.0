@@ -43,6 +43,49 @@ impl PaneAssignment {
     }
 }
 
+/// Build a `pane_assignments` store key from its four coordinate parts.
+/// The 4-segment key `"<host>|<session>|<window>|<pane>"` replaces the
+/// legacy 3-segment form that implicitly assumed `host = "local"`.
+/// Local keys now get an explicit `"local"` prefix so a local pane at
+/// `main:0.3` and a Mac pane at `main:0.3` (different tmux servers)
+/// don't collide.
+pub fn build_key(host: &str, session: &str, window: u32, pane: u32) -> String {
+    format!("{}|{}|{}|{}", host, session, window, pane)
+}
+
+/// Inverse of [`build_key`] that tolerates both the current 4-segment
+/// form and the pre-refactor 3-segment form (legacy stores written
+/// before the host-aware coordinate system landed). Legacy keys are
+/// promoted to host `"local"` so callers never see the distinction.
+///
+/// Returns `None` for any key that parses into neither shape — e.g.
+/// hand-corrupted store contents. The caller should skip-and-log
+/// rather than abort load.
+pub fn parse_key(key: &str) -> Option<(String, String, u32, u32)> {
+    let parts: Vec<&str> = key.splitn(4, '|').collect();
+    match parts.len() {
+        4 => Some((
+            parts[0].to_string(),
+            parts[1].to_string(),
+            parts[2].parse().ok()?,
+            parts[3].parse().ok()?,
+        )),
+        3 => Some((
+            "local".to_string(),
+            parts[0].to_string(),
+            parts[1].parse().ok()?,
+            parts[2].parse().ok()?,
+        )),
+        _ => None,
+    }
+}
+
+/// Return `true` when a raw store key uses the legacy 3-segment form.
+/// Drives the one-time migration rewrite in `load_pane_assignments`.
+pub fn is_legacy_key(key: &str) -> bool {
+    key.matches('|').count() == 2
+}
+
 /// Deserialization shim tolerating both the legacy string-only shape
 /// (`pane_assignments: { "main|0|0": "C--..." }`) and the modern struct
 /// shape. Converts to `PaneAssignment` via [`From`] / [`Into`] so callers
@@ -126,5 +169,52 @@ mod tests {
         assert_eq!(a.encoded_project, "enc");
         assert_eq!(a.host, "local");
         assert_eq!(a.account, "andrea");
+    }
+
+    #[test]
+    fn build_key_four_segments() {
+        assert_eq!(build_key("local", "main", 0, 3), "local|main|0|3");
+        assert_eq!(build_key("mac", "akamai", 0, 0), "mac|akamai|0|0");
+    }
+
+    #[test]
+    fn parse_key_round_trip_four_segments() {
+        let (h, s, w, p) = parse_key("mac|akamai-v3-bestbuy|0|2").unwrap();
+        assert_eq!(h, "mac");
+        assert_eq!(s, "akamai-v3-bestbuy");
+        assert_eq!(w, 0);
+        assert_eq!(p, 2);
+    }
+
+    #[test]
+    fn parse_key_legacy_three_segments_promotes_to_local() {
+        let (h, s, w, p) = parse_key("main|0|3").unwrap();
+        assert_eq!(h, "local");
+        assert_eq!(s, "main");
+        assert_eq!(w, 0);
+        assert_eq!(p, 3);
+    }
+
+    #[test]
+    fn parse_key_rejects_garbage() {
+        assert!(parse_key("nope").is_none());
+        assert!(parse_key("one|two").is_none());
+        assert!(parse_key("mac|main|not-a-number|3").is_none());
+    }
+
+    #[test]
+    fn is_legacy_key_only_three_segments() {
+        assert!(is_legacy_key("main|0|3"));
+        assert!(!is_legacy_key("local|main|0|3"));
+        assert!(!is_legacy_key("one|two"));
+    }
+
+    #[test]
+    fn parse_key_malformed_extra_segment_rejects() {
+        // tmux forbids `|` inside session names, so we treat any extra
+        // segment as corruption rather than trying to round-trip it.
+        // `splitn(4)` keeps the overflow in the last segment, making
+        // the pane-index parse fail → parse_key returns None.
+        assert!(parse_key("local|weird|session|0|3").is_none());
     }
 }

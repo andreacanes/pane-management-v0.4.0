@@ -228,7 +228,7 @@ async fn capture_pane(
     // the right per-session log file. Logs are keyed by session uuid (stable
     // across tmux renumbers, `/clear`, and companion restarts) or by the
     // tmux pane uid when no session has been detected yet (pending).
-    let (session_id, pane_uid, pane_width) = {
+    let (session_id, pane_uid, cached_width) = {
         let panes = state.panes.read().await;
         match panes.get(&id) {
             Some(rec) => (
@@ -240,6 +240,23 @@ async fn capture_pane(
         }
     };
 
+    // Live-query the pane's actual width at capture time when the cached
+    // value is 0 (fresh pane — poller hasn't stamped it yet) or when a
+    // client-visible resize might have raced the poll. A stale width
+    // causes the VT replay to wrap at the wrong column boundary, which
+    // produces character-level mixing in the rendered output. Tight
+    // wsl.exe call (one tmux display-message) so the amortized cost is
+    // fine for capture requests that happen orders of magnitude less
+    // often than the poll tick.
+    let pane_width = if cached_width == 0 {
+        match query_pane_width_live(&id).await {
+            Some(w) => w,
+            None => 0, // replay_to_lines falls back to REPLAY_COLS_FALLBACK internally
+        }
+    } else {
+        cached_width
+    };
+
     let log_path = match (session_id.as_ref(), pane_uid.is_empty()) {
         (Some(sid), _) => Some(pane_log::log_path_for_session(sid)),
         (None, false) => Some(pane_log::log_path_for_pending(&pane_uid)),
@@ -249,10 +266,14 @@ async fn capture_pane(
     let tail_bytes = if q.lines == 0 {
         pane_log::DEFAULT_TAIL_BYTES
     } else {
-        // When the client asks for a specific line count, size the tail budget
-        // accordingly: 200 bytes/line is a loose over-estimate that covers
-        // long ANSI-decorated lines without pulling the whole log.
-        (q.lines as u64).saturating_mul(200)
+        // When the client asks for a specific line count, size the tail
+        // budget accordingly. Bumped from 200 → 500 bytes/line after
+        // observing that dense cell-diff frames frequently emit >1 KB
+        // per visible line (SGR color runs + cursor positioning), which
+        // caused `q.lines = 1000` to under-shoot to ~100 rendered frames
+        // in practice. 500 covers the observed upper bound without
+        // pulling the whole log for a small `lines` request.
+        (q.lines as u64).saturating_mul(500)
     };
 
     // Read the tail and replay it through a VT emulator on the blocking
@@ -320,12 +341,19 @@ async fn pane_conversation(
     Query(q): Query<ConversationQuery>,
 ) -> Result<Json<ConversationResponse>, AppError> {
     // Look up the pane to get session_id, project path, and account.
-    let panes = state.panes.read().await;
-    let rec = panes.get(&id).ok_or(AppError::NotFound)?;
-    let bound_session = rec.dto.claude_session_id.clone();
-    let encoded_project = rec.dto.project_encoded_name.clone();
-    let account_key = rec.dto.claude_account.clone();
-    drop(panes);
+    // `pane_pid` lives on `PaneRecord` (not PaneDto) because it's only
+    // meaningful to the server — the Tauri UI and APK never consume it.
+    let (mut bound_session, encoded_project, account_key, pane_pid, pane_host) = {
+        let panes = state.panes.read().await;
+        let rec = panes.get(&id).ok_or(AppError::NotFound)?;
+        (
+            rec.dto.claude_session_id.clone(),
+            rec.dto.project_encoded_name.clone(),
+            rec.dto.claude_account.clone(),
+            rec.pane_pid.clone(),
+            rec.dto.host.clone(),
+        )
+    };
 
     // Each Claude account keeps its transcripts under its own config
     // directory (`.claude` for Andrea, `.claude-b` for Bravura). Resolve
@@ -336,19 +364,102 @@ async fn pane_conversation(
         .map(|a| a.config_dir)
         .unwrap_or(".claude");
 
+    // Sync detection fallback — when the pane has a project but no bound
+    // session_id, try to resolve it NOW before falling through to the
+    // MRU-unclaimed heuristic. The MRU heuristic is the prime suspect for
+    // "pane A shows pane B's chat" in multi-pane setups: background
+    // detection runs on a 1-3s poll, and a user who opens /conversation
+    // inside that window gets an educated guess. Running detection inline
+    // here costs ~100-300ms (one wsl.exe /proc walk for local, one SSH
+    // lsof for remote) but the answer is authoritative. Only kicks in
+    // when bound_session is None AND we have a pid to walk from.
+    if bound_session.is_none() && !pane_pid.is_empty() {
+        let is_remote_pane = matches!(pane_host.as_deref(), Some(h) if h != "local" && !h.is_empty());
+        let detected = if is_remote_pane {
+            match pane_host.as_deref() {
+                Some(alias) => {
+                    super::tmux_poller::detect_claude_session_remote(alias, &pane_pid).await
+                }
+                None => None,
+            }
+        } else {
+            super::tmux_poller::detect_claude_session(&pane_pid).await
+        };
+        // Apply the same MRU grace-window check as the poller: if the
+        // pane is <5s old and detection only produced an MRU result,
+        // don't commit — the MRU pick during the startup window is the
+        // most common cross-wiring source. Non-MRU (write-mode fd)
+        // results pass through regardless of age.
+        const SYNC_MRU_GRACE: std::time::Duration = std::time::Duration::from_secs(5);
+        let should_reject_mru = detected
+            .as_ref()
+            .map(|(_, _, is_mru)| *is_mru)
+            .unwrap_or(false)
+            && {
+                let panes = state.panes.read().await;
+                panes
+                    .get(&id)
+                    .map(|rec| rec.first_seen_at.elapsed() < SYNC_MRU_GRACE)
+                    .unwrap_or(false)
+            };
+        let detected = if should_reject_mru {
+            tracing::info!(
+                target: "mpdiag",
+                pane = %id,
+                "conversation sync-detect: rejected MRU (pane within grace window)"
+            );
+            None
+        } else {
+            detected
+        };
+
+        if let Some((sid, _encoded_project, _is_mru)) = detected {
+            tracing::info!(
+                target: "mpdiag",
+                pane = %id,
+                session = %sid,
+                is_remote = is_remote_pane,
+                "conversation: inline session detection bound pane"
+            );
+            // Write through to the pane record so subsequent /conversation
+            // calls and the poller skip the detect queue. Use Heuristic
+            // confidence (matches the background path) so an explicit
+            // --resume parse can still override it.
+            {
+                let mut panes = state.panes.write().await;
+                if let Some(rec) = panes.get_mut(&id) {
+                    if rec.binding_confidence != super::state::BindingConfidence::Explicit {
+                        rec.dto.claude_session_id = Some(sid.clone());
+                        rec.binding_confidence = super::state::BindingConfidence::Heuristic;
+                        rec.dto.updated_at = super::models::now_ms();
+                    }
+                }
+            }
+            bound_session = Some(sid);
+        }
+    }
+
     // Resolve which JSONL to read:
-    // 1. Pane has an explicit session_id (from --resume <uuid> in start cmd or hooks)
+    // 1. Pane has an explicit session_id (from --resume <uuid> in start cmd or hooks,
+    //    or just set inline above by the sync detection fallback)
     // 2. Pane has a project but no bound session — pick the most recently
     //    modified .jsonl in that dir that is NOT already claimed by a
     //    sibling pane. Without that filter two panes sharing a project
     //    (e.g. `ncld` + split) would briefly swap transcripts while the
     //    poller's /proc walk catches up.
     // 3. Otherwise, no way to find a transcript
-    let (session_id, jsonl_path) = match (bound_session, encoded_project) {
-        (Some(sid), Some(proj)) => (
-            sid.clone(),
-            format!("$HOME/{}/projects/{}/{}.jsonl", config_dir, proj, sid),
-        ),
+    let (session_id, jsonl_path, pick_path) = match (bound_session, encoded_project) {
+        (Some(sid), Some(proj)) => {
+            let path = format!("$HOME/{}/projects/{}/{}.jsonl", config_dir, proj, sid);
+            tracing::info!(
+                target: "mpdiag",
+                pane = %id,
+                session = %sid,
+                path = %path,
+                "conversation pick: bound_session"
+            );
+            (sid.clone(), path, "bound_session")
+        }
         (Some(sid), None) => {
             return Err(AppError::BadRequest(format!(
                 "pane has session {} but no project binding",
@@ -373,6 +484,7 @@ async fn pane_conversation(
             let listing = crate::commands::tmux::run_tmux_command_async(script)
                 .await
                 .map_err(tmux_err)?;
+            let listing_count = listing.lines().filter(|l| !l.trim().is_empty()).count();
             let pick = listing.lines().map(|l| l.trim()).find(|path| {
                 if path.is_empty() {
                     return false;
@@ -385,14 +497,34 @@ async fn pane_conversation(
             });
             let path = match pick {
                 Some(p) => p.to_string(),
-                None => return Err(AppError::NotFound),
+                None => {
+                    tracing::warn!(
+                        target: "mpdiag",
+                        pane = %id,
+                        project = %proj,
+                        sibling_sids = sibling_sids.len(),
+                        listing_count,
+                        "conversation pick: MRU exhausted (all JSONLs claimed by siblings)"
+                    );
+                    return Err(AppError::NotFound);
+                }
             };
             let sid = std::path::Path::new(&path)
                 .file_stem()
                 .and_then(|s| s.to_str())
                 .unwrap_or("")
                 .to_string();
-            (sid, path)
+            tracing::info!(
+                target: "mpdiag",
+                pane = %id,
+                project = %proj,
+                sibling_sids = sibling_sids.len(),
+                listing_count,
+                chosen_session = %sid,
+                path = %path,
+                "conversation pick: MRU unclaimed"
+            );
+            (sid, path, "mru_unclaimed")
         }
         (None, None) => {
             return Err(AppError::BadRequest(
@@ -401,17 +533,7 @@ async fn pane_conversation(
         }
     };
 
-    let script = format!(
-        "cat \"{}\" 2>/dev/null || echo '__FILE_NOT_FOUND__'",
-        jsonl_path
-    );
-    let raw = crate::commands::tmux::run_tmux_command_async(script)
-        .await
-        .map_err(tmux_err)?;
-
-    if raw.trim() == "__FILE_NOT_FOUND__" || raw.is_empty() {
-        return Err(AppError::NotFound);
-    }
+    let raw = read_jsonl_with_retry(&jsonl_path, &id, &session_id, pick_path).await?;
 
     let messages = parse_jsonl_conversation(&raw, q.after.as_deref());
 
@@ -419,6 +541,73 @@ async fn pane_conversation(
         session_id,
         messages,
     }))
+}
+
+/// Read a Claude Code JSONL transcript via `cat`-over-wsl, retrying once
+/// if the last non-empty line fails to parse as JSON — the hallmark of a
+/// partial read landing in the middle of Claude's write-append-fsync
+/// cycle. parse_jsonl_conversation silently drops invalid lines, which
+/// surfaces to the user as "the last message is missing"; a 100ms sleep
+/// is long enough to clear Claude's write buffer in practice.
+async fn read_jsonl_with_retry(
+    jsonl_path: &str,
+    pane_id: &str,
+    session_id: &str,
+    pick_path: &'static str,
+) -> Result<String, AppError> {
+    let script = format!(
+        "cat \"{}\" 2>/dev/null || echo '__FILE_NOT_FOUND__'",
+        jsonl_path
+    );
+
+    let mut attempt = 0u8;
+    loop {
+        attempt += 1;
+        let raw = crate::commands::tmux::run_tmux_command_async(script.clone())
+            .await
+            .map_err(tmux_err)?;
+
+        if raw.trim() == "__FILE_NOT_FOUND__" || raw.is_empty() {
+            tracing::warn!(
+                target: "mpdiag",
+                pane = %pane_id,
+                session = %session_id,
+                pick_path,
+                raw_len = raw.len(),
+                attempt,
+                "conversation cat: file not found or empty"
+            );
+            return Err(AppError::NotFound);
+        }
+
+        let last_line_valid_json = raw
+            .lines()
+            .filter(|l| !l.trim().is_empty())
+            .last()
+            .map(|l| serde_json::from_str::<serde_json::Value>(l).is_ok())
+            .unwrap_or(true);
+
+        tracing::info!(
+            target: "mpdiag",
+            pane = %pane_id,
+            session = %session_id,
+            pick_path,
+            bytes = raw.len(),
+            lines = raw.lines().filter(|l| !l.trim().is_empty()).count(),
+            last_line_valid_json,
+            attempt,
+            "conversation cat result"
+        );
+
+        if last_line_valid_json || attempt >= 2 {
+            return Ok(raw);
+        }
+
+        // Partial-write race: wait for Claude to finish its current fsync,
+        // then read again. One retry is enough in practice — Claude's turn
+        // commit is microseconds once it starts.
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    }
 }
 
 const MAX_TOOL_RESULT_CHARS: usize = 2000;
@@ -1235,4 +1424,17 @@ async fn send_text_to_pane(id: &str, text: &str, submit: bool) -> Result<(), App
         .await
         .map_err(tmux_err)?;
     Ok(())
+}
+
+/// Query a pane's real `#{pane_width}` from tmux — bypasses the poller's
+/// cached value for capture requests that might race a recent pane
+/// resize. Returns None on failure; caller treats that as width=0 and
+/// lets replay_to_lines use REPLAY_COLS_FALLBACK.
+async fn query_pane_width_live(pane_id: &str) -> Option<usize> {
+    let script = format!(
+        "tmux display-message -p -t {} '#{{pane_width}}' 2>/dev/null",
+        pane_id
+    );
+    let out = crate::commands::tmux::run_tmux_command_async(script).await.ok()?;
+    out.trim().parse::<usize>().ok().filter(|&w| w > 0)
 }

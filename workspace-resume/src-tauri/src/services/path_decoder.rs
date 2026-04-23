@@ -2,6 +2,13 @@ use std::path::Path;
 use std::io::{BufRead, BufReader};
 use std::fs::File;
 
+/// How far into a JSONL file to scan for the `cwd` field before giving up.
+/// Was 10; compacted sessions can prepend dozens of metadata records and
+/// silently yielded `None`, which downstream marked the project as
+/// `[unresolved]`. 100 covers every compacted header observed in the
+/// wild while still bounding worst-case IO on a pathological file.
+const CWD_SCAN_CAP: usize = 100;
+
 /// Extract the `cwd` field from the first valid JSONL record in a project directory.
 /// This is the authoritative source for a project's actual filesystem path.
 /// DO NOT attempt to decode the encoded directory name algorithmically -- the encoding is lossy.
@@ -13,9 +20,17 @@ pub fn extract_cwd_from_first_record(project_dir: &Path) -> Option<String> {
         if path.extension().map(|e| e == "jsonl").unwrap_or(false) && path.is_file() {
             let file = File::open(&path).ok()?;
             let reader = BufReader::new(file);
-            // Try the first 10 lines to find a record with cwd
-            // (first 2+ lines are often metadata without cwd)
-            for line in reader.lines().take(10) {
+            let mut scanned = 0usize;
+            for line in reader.lines() {
+                scanned += 1;
+                if scanned > CWD_SCAN_CAP {
+                    eprintln!(
+                        "[path_decoder] gave up after {} lines without finding cwd in {}",
+                        CWD_SCAN_CAP,
+                        path.display()
+                    );
+                    break;
+                }
                 if let Ok(line) = line {
                     if let Ok(val) = serde_json::from_str::<serde_json::Value>(&line) {
                         if let Some(cwd) = val.get("cwd").and_then(|v| v.as_str()) {

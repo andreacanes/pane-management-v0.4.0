@@ -2,8 +2,6 @@ import { invoke } from "@tauri-apps/api/core";
 import type {
   ProjectInfo,
   SessionInfo,
-  ResumeResult,
-  ActiveSession,
   TerminalSettings,
   ErrorLogEntry,
   TmuxSession,
@@ -17,7 +15,10 @@ import type {
   UsageSummary,
   GitInfo,
   ActivePane,
+  CompanionConfig,
 } from "./types";
+
+export type { CompanionConfig };
 
 export async function listProjects(): Promise<ProjectInfo[]> {
   return invoke("list_projects");
@@ -45,26 +46,8 @@ export async function deleteSession(encodedProject: string, sessionId: string): 
   return invoke("delete_session", { encodedProject, sessionId });
 }
 
-// Phase 2: Resume commands
-
-export async function resumeSession(
-  encodedProject: string,
-  sessionId: string,
-  projectPath: string,
-): Promise<ResumeResult> {
-  return invoke("resume_session", { encodedProject, sessionId, projectPath });
-}
-
-export async function getActiveSessions(): Promise<ActiveSession[]> {
-  return invoke("get_active_sessions");
-}
-
 export async function getTerminalSettings(): Promise<TerminalSettings> {
   return invoke("get_terminal_settings");
-}
-
-export async function updateTerminalSettings(backend: string): Promise<TerminalSettings> {
-  return invoke("update_terminal_settings", { backend });
 }
 
 export async function updateTmuxSessionName(sessionName: string): Promise<TerminalSettings> {
@@ -99,14 +82,6 @@ export async function listActiveClaudePanes(): Promise<ActivePane[]> {
 }
 
 // Companion admin: bearer token / QR / rotation
-export interface CompanionConfig {
-  bearer_token: string;
-  hook_secret: string;
-  ntfy_topic: string;
-  port: number;
-  bind: string;
-  suggested_url: string;
-}
 
 export async function getCompanionConfig(): Promise<CompanionConfig> {
   return invoke("get_companion_config");
@@ -134,12 +109,32 @@ export async function listTmuxSessions(): Promise<TmuxSession[]> {
   return invoke("list_tmux_sessions");
 }
 
+/** Host-aware tmux session list. `host = "local"` matches legacy
+ *  `listTmuxSessions`; any other value is an SSH alias (e.g. `"mac"`). */
+export async function listTmuxSessionsOn(host: string): Promise<TmuxSession[]> {
+  return invoke("list_tmux_sessions_on", { host });
+}
+
 export async function listTmuxWindows(sessionName: string): Promise<TmuxWindow[]> {
   return invoke("list_tmux_windows", { sessionName });
 }
 
 export async function listTmuxPanes(sessionName: string, windowIndex: number): Promise<TmuxPane[]> {
   return invoke("list_tmux_panes", { sessionName, windowIndex });
+}
+
+/** Host-aware per-window pane list. For the grid's remote-host rows,
+ *  callers typically prefer `listTmuxPanesAllOn(host)` since remote
+ *  sessions + windows aren't usually pre-selected in the UI. */
+export async function listTmuxPanesOn(host: string, sessionName: string, windowIndex: number): Promise<TmuxPane[]> {
+  return invoke("list_tmux_panes_on", { host, sessionName, windowIndex });
+}
+
+/** Every pane on one host in a single SSH round-trip. Used to populate
+ *  Mac-side rows in the unified pane grid — the frontend then filters
+ *  to "running Claude OR has an assignment" before rendering. */
+export async function listTmuxPanesAllOn(host: string): Promise<TmuxPane[]> {
+  return invoke("list_tmux_panes_all_on", { host });
 }
 
 export async function getTmuxState(sessionName: string, windowIndex: number): Promise<TmuxState> {
@@ -150,6 +145,12 @@ export async function createPane(sessionName: string, windowIndex: number, direc
   return invoke("create_pane", { sessionName, windowIndex, direction });
 }
 
+/** Host-aware tmux split. Routes `tmux split-window` to the named
+ *  host via SSH when `host !== "local"`. */
+export async function createPaneOn(host: string, sessionName: string, windowIndex: number, direction: string): Promise<TmuxPane[]> {
+  return invoke("create_pane_on", { host, sessionName, windowIndex, direction });
+}
+
 export async function applyLayout(sessionName: string, windowIndex: number, layout: string): Promise<TmuxPane[]> {
   return invoke("apply_layout", { sessionName, windowIndex, layout });
 }
@@ -158,12 +159,30 @@ export async function sendToPane(sessionName: string, windowIndex: number, paneI
   return invoke("send_to_pane", { sessionName, windowIndex, paneIndex, command });
 }
 
+/** Host-aware `tmux send-keys` — routes to the named host's tmux over
+ *  SSH when `host !== "local"`. Used by assignToPane / forkPaneSession
+ *  for the `cd` step that precedes a launch on a Mac pane. */
+export async function sendToPaneOn(host: string, sessionName: string, windowIndex: number, paneIndex: number, command: string): Promise<void> {
+  return invoke("send_to_pane_on_host", { host, sessionName, windowIndex, paneIndex, command });
+}
+
 export async function cancelPaneCommand(sessionName: string, windowIndex: number, paneIndex: number): Promise<void> {
   return invoke("cancel_pane_command", { sessionName, windowIndex, paneIndex });
 }
 
+/** Host-aware Ctrl-C: routes the two-shot cancel to the pane's actual
+ *  host so Mac panes get their Ctrl-C on the Mac tmux server. */
+export async function cancelPaneCommandOn(host: string, sessionName: string, windowIndex: number, paneIndex: number): Promise<void> {
+  return invoke("cancel_pane_command_on", { host, sessionName, windowIndex, paneIndex });
+}
+
 export async function killPane(sessionName: string, windowIndex: number, paneIndex: number): Promise<TmuxPane[]> {
   return invoke("kill_pane", { sessionName, windowIndex, paneIndex });
+}
+
+/** Host-aware `tmux kill-pane`. Routes to the pane's actual host. */
+export async function killPaneOn(host: string, sessionName: string, windowIndex: number, paneIndex: number): Promise<TmuxPane[]> {
+  return invoke("kill_pane_on", { host, sessionName, windowIndex, paneIndex });
 }
 
 export async function createWindow(sessionName: string): Promise<TmuxWindow[]> {
@@ -192,6 +211,13 @@ export async function renameWindow(sessionName: string, windowIndex: number, new
 
 export async function createSession(sessionName: string): Promise<TmuxSession[]> {
   return invoke("create_session", { sessionName });
+}
+
+/** Host-aware `tmux new-session -d`. Used by CreatePaneModal when the
+ *  user picks a brand-new Mac session. Returns the post-creation
+ *  session list for the host. */
+export async function createSessionOn(host: string, sessionName: string): Promise<TmuxSession[]> {
+  return invoke("create_session_on", { host, sessionName });
 }
 
 export async function killSession(sessionName: string): Promise<TmuxSession[]> {
@@ -264,6 +290,17 @@ export async function setSessionBinding(encodedName: string, sessionId: string |
   return invoke("set_session_binding", { encodedName, sessionId });
 }
 
+export async function getSessionNames(encodedProject: string): Promise<Record<string, string>> {
+  return invoke("get_session_names", { encodedProject });
+}
+
+export async function setSessionNames(
+  encodedProject: string,
+  names: Record<string, string>,
+): Promise<void> {
+  return invoke("set_session_names", { encodedProject, names });
+}
+
 // Phase 3: pane preset commands
 
 export async function getPanePresets(): Promise<PanePreset[]> {
@@ -278,29 +315,47 @@ export async function deletePanePreset(name: string): Promise<void> {
   return invoke("delete_pane_preset", { name });
 }
 
-export async function getPaneAssignments(sessionName: string, windowIndex: number): Promise<Record<string, string>> {
-  return invoke("get_pane_assignments", { sessionName, windowIndex });
+/** Scoped pane_index → encoded_project map for one `(host, session, window)`.
+ *  Host became a required coordinate after the refactor — pass `"local"`
+ *  for the WSL scope. */
+export async function getPaneAssignments(host: string, sessionName: string, windowIndex: number): Promise<Record<string, string>> {
+  return invoke("get_pane_assignments", { host, sessionName, windowIndex });
 }
 
+/** Entire pane-assignment map, keyed on the full 4-segment coord
+ *  `"host|session|window|pane"`. Resurrect and the multi-host grid
+ *  both consume this shape. */
 export async function getPaneAssignmentsRaw(): Promise<Record<string, string>> {
   return invoke("get_pane_assignments_raw");
 }
 
-export async function setPaneAssignment(sessionName: string, windowIndex: number, paneIndex: number, encodedProject: string | null): Promise<Record<string, string>> {
-  return invoke("set_pane_assignment", { sessionName, windowIndex, paneIndex, encodedProject });
+/** Create / update / delete one assignment slot. Host is part of the
+ *  coordinate — pass `"mac"` for Mac-side slots. `encodedProject = null`
+ *  deletes the slot. Returns the post-mutation pane_index → encoded_project
+ *  map for the same `(host, session, window)` scope. */
+export async function setPaneAssignment(host: string, sessionName: string, windowIndex: number, paneIndex: number, encodedProject: string | null): Promise<Record<string, string>> {
+  return invoke("set_pane_assignment", { host, sessionName, windowIndex, paneIndex, encodedProject });
 }
 
-/** Read pane assignments for one session+window as the full struct
- *  (encoded_project + host + account). Sibling of `getPaneAssignments`,
- *  which returns only the encoded_project for legacy callers. */
-export async function getPaneAssignmentsFull(sessionName: string, windowIndex: number): Promise<Record<string, import("./types").PaneAssignment>> {
-  return invoke("get_pane_assignments_full", { sessionName, windowIndex });
+/** Scoped full-struct map for one `(host, session, window)`. Drives
+ *  per-slot host badge + account dropdown in the grid. */
+export async function getPaneAssignmentsFull(host: string, sessionName: string, windowIndex: number): Promise<Record<string, import("./types").PaneAssignment>> {
+  return invoke("get_pane_assignments_full", { host, sessionName, windowIndex });
 }
 
-/** Update just the host + account on an existing pane assignment.
- *  Errors if the slot has no project assigned. */
-export async function setPaneAssignmentMeta(sessionName: string, windowIndex: number, paneIndex: number, host: string, account: string): Promise<void> {
-  return invoke("set_pane_assignment_meta", { sessionName, windowIndex, paneIndex, host, account });
+/** Every assignment as `{ "host|session|window|pane": PaneAssignment }`.
+ *  Used by AppContext to merge local and remote assignments in a
+ *  single reactive store without one round-trip per slot. */
+export async function getAllPaneAssignmentsFull(): Promise<Record<string, import("./types").PaneAssignment>> {
+  return invoke("get_all_pane_assignments_full");
+}
+
+/** Change the `account` on an existing assignment at `(host, session, window, pane)`.
+ *  Host is the lookup key — to move a slot between hosts, delete the
+ *  old coord via `setPaneAssignment(..., null)` and create the new one.
+ *  Errors when the slot has no project. */
+export async function setPaneAssignmentMeta(host: string, sessionName: string, windowIndex: number, paneIndex: number, account: string): Promise<void> {
+  return invoke("set_pane_assignment_meta", { host, sessionName, windowIndex, paneIndex, account });
 }
 
 /** Assemble + send the Claude launch command to a pane on the given host.
@@ -342,6 +397,23 @@ export async function syncProjectToMac(encodedProject: string): Promise<string> 
 /** SSH aliases of currently-supported remote hosts (static ["mac"] for MVP). */
 export async function listRemoteHosts(): Promise<string[]> {
   return invoke("list_remote_hosts");
+}
+
+/** Does `path` exist as a directory on `host`? Used by PaneSlot to gate
+ *  the Host=Mac dropdown: if the project hasn't been mirrored yet, a
+ *  Host=Mac launch would silently fail inside the pane. `host = "local"`
+ *  checks WSL; any other value is treated as an SSH alias. */
+export async function checkRemotePathExists(host: string, path: string): Promise<boolean> {
+  return invoke("check_remote_path_exists", { host, path });
+}
+
+/** Is the OpenSSH ControlMaster socket for `alias` currently live?
+ *  Returned bool drives the health dot next to the host dropdown. A
+ *  dead master doesn't prevent launching — just means the next remote
+ *  call pays a full SSH handshake (~500 ms) instead of the multiplexed
+ *  fast path (~15 ms). */
+export async function checkSshMaster(alias: string): Promise<boolean> {
+  return invoke("check_ssh_master", { alias });
 }
 
 export async function checkPaneStatuses(sessionName: string): Promise<Record<string, WindowPaneStatus>> {

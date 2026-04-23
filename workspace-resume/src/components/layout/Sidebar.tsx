@@ -3,6 +3,7 @@ import { useApp } from "../../contexts/AppContext";
 import { ProjectCard } from "../project/ProjectCard";
 import { NewProjectFlow } from "../project/NewProjectFlow";
 import type { ProjectTier, ProjectWithMeta } from "../../lib/types";
+import { deriveName } from "../../lib/path";
 import { Plus, Search, X } from "../ui/icons";
 import { SkeletonProjectCard } from "../ui/Skeleton";
 
@@ -14,11 +15,6 @@ const FILTER_OPTIONS: { value: FilterOption; label: string }[] = [
   { value: "active", label: "Active" },
   { value: "paused", label: "Paused" },
 ];
-
-function deriveName(path: string): string {
-  const parts = path.replace(/\\/g, "/").split("/").filter(Boolean);
-  return parts[parts.length - 1] || path;
-}
 
 export function Sidebar(props: { width?: number }) {
   const { state, projectsByTier, isProjectActive, findProjectWindow, selectTmuxSession, selectTmuxWindow, openProjectSettings } = useApp();

@@ -85,7 +85,7 @@ done
     let mut child = match cmd.spawn() {
         Ok(c) => c,
         Err(e) => {
-            tracing::debug!("git batch spawn failed: {}", e);
+            eprintln!("[git] batch spawn failed: {}", e);
             return out;
         }
     };

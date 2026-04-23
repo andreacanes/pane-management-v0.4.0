@@ -11,6 +11,7 @@ import {
 } from "../../lib/tauri-commands";
 import { open } from "@tauri-apps/plugin-dialog";
 import { launchToPane, newSessionInPane } from "../../lib/launch";
+import { deriveName } from "../../lib/path";
 import type { ProjectWithMeta, ProjectTier } from "../../lib/types";
 import { GitBranch, Link, Plus } from "../ui/icons";
 
@@ -26,15 +27,6 @@ function fmtUSD(n: number): string {
   if (n >= 100) return `$${n.toFixed(0)}`;
   if (n >= 10) return `$${n.toFixed(1)}`;
   return `$${n.toFixed(2)}`;
-}
-
-/**
- * Derive a display name from the project's actual path.
- * Shows the last path segment (the folder name).
- */
-function deriveName(path: string): string {
-  const parts = path.replace(/\\/g, "/").split("/").filter(Boolean);
-  return parts[parts.length - 1] || path;
 }
 
 export function ProjectCard(props: { project: ProjectWithMeta }) {

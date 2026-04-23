@@ -323,6 +323,11 @@ pub fn parse_pane_line(line: &str) -> Option<TmuxPane> {
         window_index: 0,
         git_branch: None,
         is_worktree: false,
+        // Host + session are stamped by the caller — the per-window
+        // `list_tmux_panes` format string doesn't include them, so we
+        // leave sane defaults here and let the command layer fill them in.
+        host: "local".to_string(),
+        session_name: String::new(),
     })
 }
 
@@ -500,9 +505,20 @@ pub async fn list_active_claude_panes() -> Result<Vec<ActivePane>, String> {
 
 #[tauri::command]
 pub async fn list_tmux_sessions() -> Result<Vec<TmuxSession>, String> {
+    list_tmux_sessions_on("local".to_string()).await
+}
+
+/// Host-aware tmux session list. Used by the Create Pane modal to
+/// show existing Mac sessions in the session picker. Returns empty
+/// when the remote tmux server has no sessions or the host is
+/// unreachable (both are "nothing to show" from the UI's perspective).
+#[tauri::command]
+pub async fn list_tmux_sessions_on(host: String) -> Result<Vec<TmuxSession>, String> {
+    use crate::services::host_target::HostTarget;
+    let host_t = HostTarget::from_str(Some(&host));
     let script =
         "tmux list-sessions -F '#{session_name}|#{session_windows}|#{session_attached}' 2>/dev/null";
-    let output = run_tmux_command_async(script.to_string()).await?;
+    let output = run_tmux_command_async_on(host_t, script.to_string()).await?;
     if output.is_empty() {
         return Ok(vec![]);
     }
@@ -527,21 +543,92 @@ pub async fn list_tmux_panes(
     session_name: String,
     window_index: u32,
 ) -> Result<Vec<TmuxPane>, String> {
+    list_tmux_panes_on("local".to_string(), session_name, window_index).await
+}
+
+/// Host-aware pane list. Local hosts get full enrichment
+/// (`populate_claude_accounts` walks `/proc/<pid>/environ`,
+/// `populate_git_info` shells `git`); remote hosts skip both because
+/// those helpers don't work across SSH — the companion's
+/// `poll_once_remote` handles remote account synthesis separately
+/// using an lsof-over-SSH fallback, and git probes for Mac panes are
+/// out of scope for this command.
+#[tauri::command]
+pub async fn list_tmux_panes_on(
+    host: String,
+    session_name: String,
+    window_index: u32,
+) -> Result<Vec<TmuxPane>, String> {
+    use crate::services::host_target::HostTarget;
+    let host_t = HostTarget::from_str(Some(&host));
     let script = format!(
         "tmux list-panes -t '{}:{}' -F '#{{pane_index}}|#{{pane_id}}|#{{pane_width}}|#{{pane_height}}|#{{pane_top}}|#{{pane_left}}|#{{pane_active}}|#{{pane_pid}}|#{{pane_current_command}}|#{{pane_current_path}}|#{{pane_start_command}}' 2>/dev/null",
         session_name, window_index
     );
-    let output = run_tmux_command_async(script).await?;
+    let output = run_tmux_command_async_on(host_t.clone(), script).await?;
     if output.is_empty() {
         return Ok(vec![]);
     }
     let mut panes = parse_lines(&output, parse_pane_line);
     for pane in panes.iter_mut() {
         pane.window_index = window_index;
+        pane.session_name = session_name.clone();
+        pane.host = host.clone();
     }
-    populate_claude_accounts(&mut panes).await;
-    populate_git_info(&mut panes).await;
+    if host_t.is_local() {
+        populate_claude_accounts(&mut panes).await;
+        populate_git_info(&mut panes).await;
+    }
     Ok(panes)
+}
+
+/// Batched "every pane on one host" query — used by the frontend to
+/// populate remote panes in the unified grid without enumerating
+/// sessions + windows separately. Uses `tmux list-panes -a` so a single
+/// SSH round-trip gets the entire tmux server's state; then we parse
+/// session and window coords from `#{session_name}` + `#{window_index}`
+/// fields embedded in the format string.
+///
+/// Local-host callers can use this too but the per-window
+/// [`list_tmux_panes_on`] is a cheaper path when you already have the
+/// session + window selected. This batched variant shines for the Mac
+/// case where we want all sessions' panes at once.
+#[tauri::command]
+pub async fn list_tmux_panes_all_on(host: String) -> Result<Vec<TmuxPane>, String> {
+    use crate::services::host_target::HostTarget;
+    let host_t = HostTarget::from_str(Some(&host));
+    // Leading `session_name|window_index|` prefix on each line so we can
+    // stamp coordinates after parsing. The rest matches `parse_pane_line`'s
+    // expected 11-field shape exactly.
+    let script =
+        "tmux list-panes -a -F '#{session_name}|#{window_index}|#{pane_index}|#{pane_id}|#{pane_width}|#{pane_height}|#{pane_top}|#{pane_left}|#{pane_active}|#{pane_pid}|#{pane_current_command}|#{pane_current_path}|#{pane_start_command}' 2>/dev/null";
+    let output = run_tmux_command_async_on(host_t.clone(), script.to_string()).await?;
+    if output.is_empty() {
+        return Ok(vec![]);
+    }
+    let mut out: Vec<TmuxPane> = Vec::new();
+    for line in output.lines() {
+        let parts: Vec<&str> = line.split('|').collect();
+        if parts.len() < 13 {
+            continue;
+        }
+        let session = parts[0].to_string();
+        let window_index: u32 = parts[1].parse().unwrap_or(0);
+        // Rejoin parts[2..] into the shape parse_pane_line expects
+        // (the 11-field "pane_index|pane_id|...|start_command" layout).
+        let remainder = parts[2..].join("|");
+        if let Some(mut pane) = parse_pane_line(&remainder) {
+            pane.session_name = session;
+            pane.window_index = window_index;
+            pane.host = host.clone();
+            out.push(pane);
+        }
+    }
+    if host_t.is_local() {
+        populate_claude_accounts(&mut out).await;
+        populate_git_info(&mut out).await;
+    }
+    Ok(out)
 }
 
 #[tauri::command]
@@ -614,6 +701,8 @@ pub async fn get_tmux_state(
 
     for pane in panes.iter_mut() {
         pane.window_index = window_index;
+        pane.session_name = session_name.clone();
+        // host already defaults to "local" in parse_pane_line.
     }
     populate_claude_accounts(&mut panes).await;
     populate_git_info(&mut panes).await;
@@ -635,21 +724,36 @@ pub async fn create_pane(
     window_index: u32,
     direction: String,
 ) -> Result<Vec<TmuxPane>, String> {
-    // direction is "h" or "v" for horizontal/vertical split
+    create_pane_on("local".to_string(), session_name, window_index, direction).await
+}
+
+/// Host-aware pane split. `host = "local"` keeps the pre-refactor
+/// behaviour (split on WSL tmux). Any other value is treated as an
+/// SSH alias: the `tmux split-window` runs on the remote tmux server
+/// via `ssh <alias>`. Requires the remote session:window to already
+/// exist; create the session first via `create_session_on` if needed.
+#[tauri::command]
+pub async fn create_pane_on(
+    host: String,
+    session_name: String,
+    window_index: u32,
+    direction: String,
+) -> Result<Vec<TmuxPane>, String> {
+    use crate::services::host_target::HostTarget;
     let dir_flag = match direction.as_str() {
         "h" => "-h",
         "v" => "-v",
         _ => return Err(format!("Invalid direction '{}': must be 'h' or 'v'", direction)),
     };
 
+    let host_t = HostTarget::from_str(Some(&host));
     let script = format!(
         "tmux split-window {} -t '{}:{}'",
         dir_flag, session_name, window_index
     );
-    run_tmux_command_async(script).await?;
+    run_tmux_command_async_on(host_t, script).await?;
 
-    // Re-query panes and return updated list
-    list_tmux_panes(session_name, window_index).await
+    list_tmux_panes_on(host, session_name, window_index).await
 }
 
 #[tauri::command]
@@ -690,14 +794,49 @@ pub async fn send_to_pane(
     pane_index: u32,
     command: String,
 ) -> Result<(), String> {
-    // Escape single quotes in command by replacing ' with '\''
+    send_to_pane_on_host(
+        "local".to_string(),
+        session_name,
+        window_index,
+        pane_index,
+        command,
+    )
+    .await
+}
+
+/// Host-aware `tmux send-keys`. Routes the send to the named host's
+/// tmux server via SSH when `host != "local"`. The command string is
+/// single-quote-escaped here so callers can pass shell fragments
+/// verbatim (`cd "..." && mncld -r <sid>` etc.).
+///
+/// Named `_on_host` to avoid a symbol collision with the lower-level
+/// `send_to_pane_on(&HostTarget, ...)` helper in this module that
+/// `launch_in_pane` calls directly (can't be a tauri::command due to
+/// the `&HostTarget` borrow in its signature).
+#[tauri::command]
+pub async fn send_to_pane_on_host(
+    host: String,
+    session_name: String,
+    window_index: u32,
+    pane_index: u32,
+    command: String,
+) -> Result<(), String> {
+    use crate::services::host_target::HostTarget;
+    let host_t = HostTarget::from_str(Some(&host));
     let escaped = command.replace('\'', "'\\''");
     let script = format!(
         "tmux send-keys -t '{}:{}.{}' '{}' Enter",
         session_name, window_index, pane_index, escaped
     );
-    eprintln!("[send_to_pane] target={}:{}.{} command={}", session_name, window_index, pane_index, command);
-    run_tmux_command_async(script).await?;
+    eprintln!(
+        "[send_to_pane_on_host] host={} target={}:{}.{} command={}",
+        host_t.wire_str(),
+        session_name,
+        window_index,
+        pane_index,
+        command
+    );
+    run_tmux_command_async_on(host_t, script).await?;
     Ok(())
 }
 
@@ -709,13 +848,38 @@ pub async fn cancel_pane_command(
     window_index: u32,
     pane_index: u32,
 ) -> Result<(), String> {
+    cancel_pane_command_on(
+        "local".to_string(),
+        session_name,
+        window_index,
+        pane_index,
+    )
+    .await
+}
+
+/// Host-aware Ctrl-C: same two-shot pattern as [`cancel_pane_command`]
+/// but routes through `HostTarget` so a Mac pane gets its Ctrl-C on
+/// the Mac tmux server, not the local one.
+#[tauri::command]
+pub async fn cancel_pane_command_on(
+    host: String,
+    session_name: String,
+    window_index: u32,
+    pane_index: u32,
+) -> Result<(), String> {
+    use crate::services::host_target::HostTarget;
+    let host_t = HostTarget::from_str(Some(&host));
     let target = format!("{}:{}.{}", session_name, window_index, pane_index);
     let script = format!(
         "tmux send-keys -t '{t}' C-c; sleep 0.3; tmux send-keys -t '{t}' C-c",
         t = target
     );
-    eprintln!("[cancel_pane_command] target={}", target);
-    run_tmux_command_async(script).await?;
+    eprintln!(
+        "[cancel_pane_command_on] host={} target={}",
+        host_t.wire_str(),
+        target
+    );
+    run_tmux_command_async_on(host_t, script).await?;
     Ok(())
 }
 
@@ -725,14 +889,27 @@ pub async fn kill_pane(
     window_index: u32,
     pane_index: u32,
 ) -> Result<Vec<TmuxPane>, String> {
+    kill_pane_on("local".to_string(), session_name, window_index, pane_index).await
+}
+
+/// Host-aware `tmux kill-pane`. Sends the kill to the pane's actual
+/// host via `HostTarget` — critical for killing a Mac-side pane, which
+/// otherwise would silently try to kill a same-coordinate local pane.
+#[tauri::command]
+pub async fn kill_pane_on(
+    host: String,
+    session_name: String,
+    window_index: u32,
+    pane_index: u32,
+) -> Result<Vec<TmuxPane>, String> {
+    use crate::services::host_target::HostTarget;
+    let host_t = HostTarget::from_str(Some(&host));
     let script = format!(
         "tmux kill-pane -t '{}:{}.{}'",
         session_name, window_index, pane_index
     );
-    run_tmux_command_async(script).await?;
-
-    // Re-query panes and return updated list
-    list_tmux_panes(session_name, window_index).await
+    run_tmux_command_async_on(host_t, script).await?;
+    list_tmux_panes_on(host, session_name, window_index).await
 }
 
 #[tauri::command]
@@ -860,14 +1037,25 @@ pub async fn rename_window(
 
 #[tauri::command]
 pub async fn create_session(session_name: String) -> Result<Vec<TmuxSession>, String> {
-    // -d = detached so it doesn't steal focus from the current terminal
-    let script = format!(
-        "tmux new-session -d -s '{}'",
-        session_name
-    );
-    run_tmux_command_async(script).await?;
+    create_session_on("local".to_string(), session_name).await
+}
 
-    list_tmux_sessions().await
+/// Host-aware `tmux new-session -d`. Used by the CreatePaneModal on
+/// the frontend when the user picks "new session" on Mac — a fresh
+/// session starts with one pane (index 0) that the caller can then
+/// split further or immediately drop an assignment onto.
+#[tauri::command]
+pub async fn create_session_on(
+    host: String,
+    session_name: String,
+) -> Result<Vec<TmuxSession>, String> {
+    use crate::services::host_target::HostTarget;
+    let host_t = HostTarget::from_str(Some(&host));
+    // -d = detached so it doesn't steal focus from any currently-attached
+    // client on the target tmux server.
+    let script = format!("tmux new-session -d -s '{}'", session_name);
+    run_tmux_command_async_on(host_t, script).await?;
+    list_tmux_sessions_on(host).await
 }
 
 /// Set up a pane grid with exactly `cols` columns and `rows` rows.

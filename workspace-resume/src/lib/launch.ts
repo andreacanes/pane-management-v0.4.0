@@ -1,9 +1,12 @@
 import {
   sendToPane,
+  sendToPaneOn,
   setPaneAssignment,
   createPane,
+  createPaneOn,
   listSessions,
   cancelPaneCommand,
+  cancelPaneCommandOn,
   launchInPane,
 } from "./tauri-commands";
 import type { TmuxPane } from "./types";
@@ -39,6 +42,12 @@ const CLAUDE_CMD = "ncld";
 
 /**
  * Find or create an available pane. Returns the pane index.
+ *
+ * Host-aware: when `opts.host === "local"` (or omitted) it keeps the
+ * pre-refactor auto-create behavior — split the local tmux window if no
+ * unassigned pane exists. For `host !== "local"` a `targetPaneIndex` is
+ * required; we won't implicitly create a Mac pane here because that
+ * needs an explicit Mac session choice which the modal flow provides.
  */
 async function resolvePaneIndex(opts: {
   tmuxSession: string;
@@ -46,12 +55,28 @@ async function resolvePaneIndex(opts: {
   tmuxPanes: TmuxPane[];
   paneAssignments: Record<string, string>;
   targetPaneIndex?: number;
+  host?: string;
 }): Promise<number> {
   if (opts.targetPaneIndex != null) return opts.targetPaneIndex;
 
-  const assignedIndices = new Set(
-    Object.keys(opts.paneAssignments).map((k) => Number(k)),
-  );
+  const host = opts.host ?? "local";
+  if (host !== "local") {
+    throw new Error(
+      `resolvePaneIndex: auto-create not supported for host=${host} — pass targetPaneIndex or use CreatePaneModal first`,
+    );
+  }
+
+  // paneAssignments keys are now the full 4-segment coord
+  // "host|session|window|pane". Pull out just the pane indices that
+  // belong to the local session+window we're operating on.
+  const prefix = `local|${opts.tmuxSession}|${opts.tmuxWindow}|`;
+  const assignedIndices = new Set<number>();
+  for (const k of Object.keys(opts.paneAssignments)) {
+    if (k.startsWith(prefix)) {
+      const pIdx = Number(k.slice(prefix.length));
+      if (!Number.isNaN(pIdx)) assignedIndices.add(pIdx);
+    }
+  }
 
   let targetPane = opts.tmuxPanes.find(
     (p) => !assignedIndices.has(p.pane_index),
@@ -89,23 +114,37 @@ export async function assignToPane(opts: {
   encodedProject: string;
   projectPath: string;
   targetPaneIndex?: number;
+  /** Optional host override. When not given, derives from the target pane
+   *  (a TmuxPane in `tmuxPanes` matching `targetPaneIndex`) or defaults
+   *  to "local". Drag-to-local panes never need to pass this. */
+  host?: string;
 }): Promise<number> {
   const paneIndex = await resolvePaneIndex(opts);
 
   // If a process is running in this pane, cancel it first so the cd
   // goes to the shell, not to the running program.
   const targetPane = opts.tmuxPanes.find((p) => p.pane_index === paneIndex);
+  const host = opts.host ?? targetPane?.host ?? "local";
+  const session = targetPane?.session_name ?? opts.tmuxSession;
+  const windowIndex = targetPane?.window_index ?? opts.tmuxWindow;
   const cmd = targetPane?.current_command?.toLowerCase() ?? "";
   if (cmd && cmd !== "bash" && cmd !== "zsh" && cmd !== "sh" && cmd !== "-") {
-    await cancelPaneCommand(opts.tmuxSession, opts.tmuxWindow, paneIndex);
+    await cancelPaneCommandOn(host, session, windowIndex, paneIndex);
     // Small delay for the process to exit and shell prompt to return
     await new Promise((r) => setTimeout(r, 500));
   }
 
-  await setPaneAssignment(opts.tmuxSession, opts.tmuxWindow, paneIndex, opts.encodedProject);
+  await setPaneAssignment(host, session, windowIndex, paneIndex, opts.encodedProject);
 
-  const wslPath = toWslPath(opts.projectPath);
-  await sendToPane(opts.tmuxSession, opts.tmuxWindow, paneIndex, `cd "${wslPath}"`);
+  // `cd` runs on the pane's actual host, so the path must be in that
+  // host's filesystem — WSL POSIX for local, `/Users/admin/projects/...`
+  // for Mac. The caller passes `projectPath` in WSL form; for Mac slots
+  // we translate. Routing: `sendToPaneOn` so the keys land on the right
+  // tmux server; plain `sendToPane` would hit local tmux regardless.
+  const pathForHost = host === "local"
+    ? toWslPath(opts.projectPath)
+    : toMacPath(opts.projectPath);
+  await sendToPaneOn(host, session, windowIndex, paneIndex, `cd "${pathForHost}"`);
 
   return paneIndex;
 }
@@ -125,18 +164,34 @@ export async function launchToPane(opts: {
   boundSession?: string | null;
   targetPaneIndex?: number;
   yolo?: boolean;
-  /** `"local"` (default, unchanged behaviour) or an SSH alias like `"mac"`. */
+  /** `"local"` (default) or an SSH alias like `"mac"`. When the target
+   *  pane is known (targetPaneIndex + tmuxPanes match), its `host` field
+   *  is the authoritative source; this arg is the fallback for
+   *  auto-resolved panes. */
   host?: string;
   /** `"andrea"` (default) | `"bravura"` | `"sully"`. */
   account?: string;
 }): Promise<number> {
   const paneIndex = await resolvePaneIndex(opts);
 
-  // Always cancel first — Ctrl-C twice, then wait for shell prompt
-  await cancelPaneCommand(opts.tmuxSession, opts.tmuxWindow, paneIndex);
+  // Find the actual target pane in the grid so we can route all ops
+  // (cancel / assign / send) to its own tmux server, not the ambient
+  // `opts.tmuxSession/Window` which is only meaningful for local panes.
+  // Disambiguate by host + pane_index since Local main:0.3 and Mac
+  // main:0.3 can coexist in a unified grid.
+  const requestedHost = opts.host ?? "local";
+  const targetPane = opts.tmuxPanes.find(
+    (p) => p.pane_index === paneIndex && (p.host ?? "local") === requestedHost,
+  ) ?? opts.tmuxPanes.find((p) => p.pane_index === paneIndex);
+  const host = (targetPane?.host ?? requestedHost) || "local";
+  const session = targetPane?.session_name ?? opts.tmuxSession;
+  const windowIndex = targetPane?.window_index ?? opts.tmuxWindow;
+
+  // Always cancel first — Ctrl-C twice on the correct host, then wait.
+  await cancelPaneCommandOn(host, session, windowIndex, paneIndex);
   await new Promise((r) => setTimeout(r, 800));
 
-  await setPaneAssignment(opts.tmuxSession, opts.tmuxWindow, paneIndex, opts.encodedProject);
+  await setPaneAssignment(host, session, windowIndex, paneIndex, opts.encodedProject);
 
   // Determine which session ID to use: explicit > bound > most-recent
   let resumeId: string | null | undefined = opts.sessionId || opts.boundSession;
@@ -153,15 +208,14 @@ export async function launchToPane(opts: {
     }
   }
 
-  const host = opts.host ?? "local";
   const account = opts.account ?? "andrea";
 
   if (host !== "local") {
     // Remote host: Rust-side launch_in_pane assembles the cd-then-mncld
     // string and routes it over SSH to the target host's tmux.
     await launchInPane({
-      session: opts.tmuxSession,
-      window: opts.tmuxWindow,
+      session,
+      window: windowIndex,
       pane: paneIndex,
       host,
       account,
@@ -172,7 +226,10 @@ export async function launchToPane(opts: {
     return paneIndex;
   }
 
-  // Local path (unchanged pre-integration behaviour).
+  // Local path — explicit session/window from the target pane so a
+  // caller who hands us a non-currently-selected local pane still
+  // routes correctly (e.g. a future grid view that spans multiple
+  // local windows).
   const wslPath = toWslPath(opts.projectPath);
   const yoloFlag = opts.yolo ? " --dangerously-skip-permissions" : "";
   const envPrefix = account === "bravura"
@@ -184,8 +241,7 @@ export async function launchToPane(opts: {
     ? `${envPrefix}${CLAUDE_CMD} -r ${resumeId}${yoloFlag}`
     : `${envPrefix}${CLAUDE_CMD} -r${yoloFlag}`;
 
-  // Chain cd + claude as a single command so claude only starts after cd completes
-  await sendToPane(opts.tmuxSession, opts.tmuxWindow, paneIndex, `cd "${wslPath}" && ${claudeCmd}`);
+  await sendToPane(session, windowIndex, paneIndex, `cd "${wslPath}" && ${claudeCmd}`);
 
   return paneIndex;
 }
@@ -231,6 +287,19 @@ export async function forkPaneSession(opts: {
   sourcePaneIndex: number;
   sessionId?: string | null;
   boundSession?: string | null;
+  /** The pane we're forking lives on which host? Derived from the
+   *  source TmuxPane when possible; the caller usually has the full
+   *  pane object and just passes `sourcePane.host` here. */
+  host?: string;
+  /** Session name on the pane's host — for local panes this is usually
+   *  the selected tmux session; for Mac panes it's the pane's own
+   *  session (per-project under the `cc` convention). */
+  sourceSession?: string;
+  /** Window index on the pane's host. */
+  sourceWindow?: number;
+  /** Claude account the forked session should resume under. Defaults
+   *  to "andrea" to match the local pre-refactor behavior. */
+  account?: string;
 }): Promise<{ branchPaneIndex: number; originalPaneIndex: number; sessionId: string }> {
   let resolvedSid: string | null = opts.sessionId || opts.boundSession || null;
 
@@ -250,39 +319,79 @@ export async function forkPaneSession(opts: {
     );
   }
 
-  // 1. Let Claude fork itself in-place via slash command.
-  await sendToPane(opts.tmuxSession, opts.tmuxWindow, opts.sourcePaneIndex, "/branch");
+  // Prefer explicit host/session/window from the caller; otherwise look
+  // them up from the source pane in the grid. The fallback to opts.tmux*
+  // preserves pre-refactor behavior when neither is supplied.
+  const sourcePane = opts.tmuxPanes.find(
+    (p) => p.pane_index === opts.sourcePaneIndex,
+  );
+  const host = opts.host ?? sourcePane?.host ?? "local";
+  const session = opts.sourceSession ?? sourcePane?.session_name ?? opts.tmuxSession;
+  const windowIndex = opts.sourceWindow ?? sourcePane?.window_index ?? opts.tmuxWindow;
+  const account = opts.account ?? "andrea";
+
+  // 1. Let Claude fork itself in-place via slash command. Must land on
+  //    the pane's actual tmux server — `/branch` over SSH for Mac panes.
+  await sendToPaneOn(host, session, windowIndex, opts.sourcePaneIndex, "/branch");
 
   // 2. Give Claude time to mint Y, flush its last turn into X, and swap
-  //    its open file descriptor to Y. After this window, pane A is
-  //    writing Y and X.jsonl is no longer being appended to.
+  //    its open file descriptor to Y. After this window, the source pane
+  //    writes Y and the forked-from X.jsonl is no longer appended to.
   await new Promise((r) => setTimeout(r, 1500));
 
-  // Record the *immutable* pane ids (%N form) of all panes before the
-  // split. After split-window, tmux renumbers remaining panes by spatial
-  // layout (splitting pane 1 in a window with {1, 2} gives {1, 2, 3}
-  // where the NEW pane becomes 2 and old pane 2 becomes 3). Comparing
-  // by pane_index would mis-identify the new pane; comparing by pane_id
-  // (tmux's %N, which never changes for the life of the pane) is
-  // reliable.
-  const preExistingPaneIds = new Set(opts.tmuxPanes.map((p) => p.pane_id));
+  // Record the *immutable* pane ids (%N form) of panes on this host's
+  // same session/window before the split. Comparing by pane_id (stable)
+  // rather than pane_index (re-numbered on split) reliably identifies
+  // the new pane after tmux re-lays out.
+  const preExistingPaneIds = new Set(
+    opts.tmuxPanes
+      .filter(
+        (p) =>
+          (p.host ?? "local") === host &&
+          p.session_name === session &&
+          p.window_index === windowIndex,
+      )
+      .map((p) => p.pane_id),
+  );
 
-  // 3. Split to create pane B.
-  const newPanes = await createPane(opts.tmuxSession, opts.tmuxWindow, "h");
+  // 3. Split on the pane's host. createPaneOn returns all panes for the
+  //    host's session+window after the split.
+  const newPanes = await createPaneOn(host, session, windowIndex, "h");
 
   const newPane = newPanes.find((p) => !preExistingPaneIds.has(p.pane_id));
   if (!newPane || newPane.pane_index === opts.sourcePaneIndex) {
     throw new Error("fork: split-window produced no identifiable new pane");
   }
 
-  // 4. Resume the original session in the new pane.
-  const wslPath = toWslPath(opts.projectPath);
-  await sendToPane(
-    opts.tmuxSession,
-    opts.tmuxWindow,
-    newPane.pane_index,
-    `cd "${wslPath}" && ${CLAUDE_CMD} -r ${resolvedSid}`,
-  );
+  // 4. Resume the original session in the new pane. For remote hosts we
+  //    route via the backend `launchInPane` so the same assembly rules
+  //    (mncld, env prefix, yolo) apply as a normal Mac launch. For local
+  //    we keep the inline `cd ... && ncld` send to preserve the fast path.
+  if (host !== "local") {
+    await launchInPane({
+      session,
+      window: windowIndex,
+      pane: newPane.pane_index,
+      host,
+      account,
+      projectPath: toMacPath(opts.projectPath),
+      resumeSid: resolvedSid,
+      yolo: false,
+    });
+  } else {
+    const wslPath = toWslPath(opts.projectPath);
+    const envPrefix = account === "bravura"
+      ? `CLAUDE_CONFIG_DIR="$HOME/.claude-b" `
+      : account === "sully"
+        ? `CLAUDE_CONFIG_DIR="$HOME/.claude-c" `
+        : "";
+    await sendToPane(
+      session,
+      windowIndex,
+      newPane.pane_index,
+      `cd "${wslPath}" && ${envPrefix}${CLAUDE_CMD} -r ${resolvedSid}`,
+    );
+  }
 
   return {
     branchPaneIndex: opts.sourcePaneIndex,
@@ -308,19 +417,25 @@ export async function newSessionInPane(opts: {
 }): Promise<number> {
   const paneIndex = await resolvePaneIndex(opts);
 
-  // Always cancel first — Ctrl-C twice, then wait for shell prompt
-  await cancelPaneCommand(opts.tmuxSession, opts.tmuxWindow, paneIndex);
+  const requestedHost = opts.host ?? "local";
+  const targetPane = opts.tmuxPanes.find(
+    (p) => p.pane_index === paneIndex && (p.host ?? "local") === requestedHost,
+  ) ?? opts.tmuxPanes.find((p) => p.pane_index === paneIndex);
+  const host = (targetPane?.host ?? requestedHost) || "local";
+  const session = targetPane?.session_name ?? opts.tmuxSession;
+  const windowIndex = targetPane?.window_index ?? opts.tmuxWindow;
+
+  await cancelPaneCommandOn(host, session, windowIndex, paneIndex);
   await new Promise((r) => setTimeout(r, 800));
 
-  await setPaneAssignment(opts.tmuxSession, opts.tmuxWindow, paneIndex, opts.encodedProject);
+  await setPaneAssignment(host, session, windowIndex, paneIndex, opts.encodedProject);
 
-  const host = opts.host ?? "local";
   const account = opts.account ?? "andrea";
 
   if (host !== "local") {
     await launchInPane({
-      session: opts.tmuxSession,
-      window: opts.tmuxWindow,
+      session,
+      window: windowIndex,
       pane: paneIndex,
       host,
       account,
@@ -338,7 +453,7 @@ export async function newSessionInPane(opts: {
     : account === "sully"
       ? `CLAUDE_CONFIG_DIR="$HOME/.claude-c" `
       : "";
-  await sendToPane(opts.tmuxSession, opts.tmuxWindow, paneIndex, `cd "${wslPath}" && ${envPrefix}${CLAUDE_CMD}${yoloFlag}`);
+  await sendToPane(session, windowIndex, paneIndex, `cd "${wslPath}" && ${envPrefix}${CLAUDE_CMD}${yoloFlag}`);
 
   return paneIndex;
 }

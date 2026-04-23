@@ -1,121 +1,101 @@
 use std::collections::HashMap;
 
-use crate::models::pane_assignment::{PaneAssignment, RawAssignment};
+use crate::models::pane_assignment::{
+    build_key, is_legacy_key, parse_key, PaneAssignment, RawAssignment,
+};
 use crate::models::pane_preset::PanePreset;
 use crate::models::project_meta::{ProjectMeta, ProjectTier};
+use crate::services::store::{load_store, load_store_or_default, save_store};
 
 // ---------------------
 // Store helpers
 // ---------------------
 
 fn load_project_meta(app: &tauri::AppHandle) -> Result<HashMap<String, ProjectMeta>, String> {
-    use tauri_plugin_store::StoreExt;
-
-    let store = app
-        .store("settings.json")
-        .map_err(|e| format!("Failed to open settings store: {}", e))?;
-
-    match store.get("project_meta") {
-        Some(value) => serde_json::from_value::<HashMap<String, ProjectMeta>>(value.clone())
-            .map_err(|e| format!("Failed to parse project_meta: {}", e)),
-        None => Ok(HashMap::new()),
-    }
+    load_store_or_default(app, "project_meta")
 }
 
 fn save_project_meta(
     app: &tauri::AppHandle,
     data: &HashMap<String, ProjectMeta>,
 ) -> Result<(), String> {
-    use tauri_plugin_store::StoreExt;
-
-    let store = app
-        .store("settings.json")
-        .map_err(|e| format!("Failed to open settings store: {}", e))?;
-
-    let value = serde_json::to_value(data)
-        .map_err(|e| format!("Failed to serialize project_meta: {}", e))?;
-
-    store.set("project_meta", value);
-    store
-        .save()
-        .map_err(|e| format!("Failed to save store: {}", e))?;
-    Ok(())
+    save_store(app, "project_meta", data)
 }
 
 fn load_pane_presets(app: &tauri::AppHandle) -> Result<HashMap<String, PanePreset>, String> {
-    use tauri_plugin_store::StoreExt;
-
-    let store = app
-        .store("settings.json")
-        .map_err(|e| format!("Failed to open settings store: {}", e))?;
-
-    match store.get("pane_presets") {
-        Some(value) => serde_json::from_value::<HashMap<String, PanePreset>>(value.clone())
-            .map_err(|e| format!("Failed to parse pane_presets: {}", e)),
-        None => Ok(HashMap::new()),
-    }
+    load_store_or_default(app, "pane_presets")
 }
 
 fn save_pane_presets(
     app: &tauri::AppHandle,
     data: &HashMap<String, PanePreset>,
 ) -> Result<(), String> {
-    use tauri_plugin_store::StoreExt;
-
-    let store = app
-        .store("settings.json")
-        .map_err(|e| format!("Failed to open settings store: {}", e))?;
-
-    let value = serde_json::to_value(data)
-        .map_err(|e| format!("Failed to serialize pane_presets: {}", e))?;
-
-    store.set("pane_presets", value);
-    store
-        .save()
-        .map_err(|e| format!("Failed to save store: {}", e))?;
-    Ok(())
+    save_store(app, "pane_presets", data)
 }
 
-/// Load pane assignments, tolerating the legacy shape where each value
-/// was a bare `String` (encoded project). Values are normalized into
-/// [`PaneAssignment`] via the [`RawAssignment`] untagged-enum shim.
-/// The next [`save_pane_assignments`] call migrates the store to the
-/// modern shape automatically.
+/// Load pane assignments with two layered migrations:
+///
+/// 1. Value-shape: legacy bare-string values (`"C--..."`) get promoted
+///    to full [`PaneAssignment`] structs via [`RawAssignment`]. Default
+///    host = `"local"`, default account = `"andrea"`.
+/// 2. Key-shape: legacy 3-segment keys (`"main|0|3"`) get rewritten to
+///    4-segment (`"local|main|0|3"`) so local and remote panes that
+///    share a coord cannot collide. The rewrite happens in-memory and
+///    is flushed to the store only when at least one key changed; the
+///    caller's next `save_pane_assignments` keeps it idempotent.
+///
+/// Corrupted keys (parse_key returns None) are dropped with a warning
+/// rather than aborting load — losing one malformed entry beats an app
+/// that won't start.
 fn load_pane_assignments(app: &tauri::AppHandle) -> Result<HashMap<String, PaneAssignment>, String> {
-    use tauri_plugin_store::StoreExt;
+    let raw: Option<HashMap<String, RawAssignment>> = load_store(app, "pane_assignments")?;
+    let src: HashMap<String, PaneAssignment> = raw
+        .unwrap_or_default()
+        .into_iter()
+        .map(|(k, v)| (k, v.into()))
+        .collect();
 
-    let store = app
-        .store("settings.json")
-        .map_err(|e| format!("Failed to open settings store: {}", e))?;
-
-    match store.get("pane_assignments") {
-        Some(value) => {
-            let raw: HashMap<String, RawAssignment> = serde_json::from_value(value.clone())
-                .map_err(|e| format!("Failed to parse pane_assignments: {}", e))?;
-            Ok(raw.into_iter().map(|(k, v)| (k, v.into())).collect())
+    let mut needs_migration = false;
+    let mut migrated: HashMap<String, PaneAssignment> = HashMap::with_capacity(src.len());
+    for (k, v) in src {
+        if is_legacy_key(&k) {
+            needs_migration = true;
+            match parse_key(&k) {
+                Some((host, session, window, pane)) => {
+                    let new_k = build_key(&host, &session, window, pane);
+                    migrated.insert(new_k, v);
+                }
+                None => {
+                    eprintln!("[project_meta] dropping malformed pane_assignment key: {}", k);
+                }
+            }
+        } else if parse_key(&k).is_some() {
+            migrated.insert(k, v);
+        } else {
+            eprintln!("[project_meta] dropping malformed pane_assignment key: {}", k);
+            needs_migration = true;
         }
-        None => Ok(HashMap::new()),
     }
+
+    if needs_migration {
+        // One-shot rewrite so future loads skip the migration path and
+        // the sweep + frontend both see consistent 4-segment keys.
+        if let Err(e) = save_pane_assignments(app, &migrated) {
+            eprintln!(
+                "[project_meta] pane_assignments migration save failed: {} (continuing with in-memory copy)",
+                e
+            );
+        }
+    }
+
+    Ok(migrated)
 }
 
 fn save_pane_assignments(
     app: &tauri::AppHandle,
     data: &HashMap<String, PaneAssignment>,
 ) -> Result<(), String> {
-    use tauri_plugin_store::StoreExt;
-
-    let store = app
-        .store("settings.json")
-        .map_err(|e| format!("Failed to open settings store: {}", e))?;
-
-    let value = serde_json::to_value(data)
-        .map_err(|e| format!("Failed to serialize pane_assignments: {}", e))?;
-
-    store.set("pane_assignments", value);
-    store
-        .save()
-        .map_err(|e| format!("Failed to save store: {}", e))?;
-    Ok(())
+    save_store(app, "pane_assignments", data)
 }
 
 /// Flatten the full-struct map down to the legacy `encoded_project`-only
@@ -135,34 +115,11 @@ fn flatten_assignments(
 // ---------------------
 
 fn load_session_order(app: &tauri::AppHandle) -> Result<Vec<String>, String> {
-    use tauri_plugin_store::StoreExt;
-
-    let store = app
-        .store("settings.json")
-        .map_err(|e| format!("Failed to open settings store: {}", e))?;
-
-    match store.get("session_order") {
-        Some(value) => serde_json::from_value::<Vec<String>>(value.clone())
-            .map_err(|e| format!("Failed to parse session_order: {}", e)),
-        None => Ok(vec![]),
-    }
+    load_store_or_default(app, "session_order")
 }
 
 fn save_session_order(app: &tauri::AppHandle, order: &[String]) -> Result<(), String> {
-    use tauri_plugin_store::StoreExt;
-
-    let store = app
-        .store("settings.json")
-        .map_err(|e| format!("Failed to open settings store: {}", e))?;
-
-    let value = serde_json::to_value(order)
-        .map_err(|e| format!("Failed to serialize session_order: {}", e))?;
-
-    store.set("session_order", value);
-    store
-        .save()
-        .map_err(|e| format!("Failed to save store: {}", e))?;
-    Ok(())
+    save_store(app, "session_order", &order)
 }
 
 #[tauri::command]
@@ -183,34 +140,11 @@ pub async fn set_session_order(
 // ---------------------
 
 fn load_pinned_order(app: &tauri::AppHandle) -> Result<Vec<String>, String> {
-    use tauri_plugin_store::StoreExt;
-
-    let store = app
-        .store("settings.json")
-        .map_err(|e| format!("Failed to open settings store: {}", e))?;
-
-    match store.get("pinned_order") {
-        Some(value) => serde_json::from_value::<Vec<String>>(value.clone())
-            .map_err(|e| format!("Failed to parse pinned_order: {}", e)),
-        None => Ok(vec![]),
-    }
+    load_store_or_default(app, "pinned_order")
 }
 
 fn save_pinned_order(app: &tauri::AppHandle, order: &[String]) -> Result<(), String> {
-    use tauri_plugin_store::StoreExt;
-
-    let store = app
-        .store("settings.json")
-        .map_err(|e| format!("Failed to open settings store: {}", e))?;
-
-    let value = serde_json::to_value(order)
-        .map_err(|e| format!("Failed to serialize pinned_order: {}", e))?;
-
-    store.set("pinned_order", value);
-    store
-        .save()
-        .map_err(|e| format!("Failed to save store: {}", e))?;
-    Ok(())
+    save_store(app, "pinned_order", &order)
 }
 
 #[tauri::command]
@@ -354,30 +288,92 @@ pub async fn delete_pane_preset(
     Ok(())
 }
 
-/// Build a scoped key for pane assignments: "session|window|pane_index"
-fn pane_key(session: &str, window: u32, pane: u32) -> String {
-    format!("{}|{}|{}", session, window, pane)
+/// Scoped key for pane assignments: "host|session|window|pane_index".
+/// Thin alias over [`build_key`] so every call site in this module has
+/// the same naming as the other pane-coordinate helpers that sit
+/// alongside it.
+fn pane_key(host: &str, session: &str, window: u32, pane: u32) -> String {
+    build_key(host, session, window, pane)
 }
 
-/// Filter the (already-flattened) pane_index → encoded_project map to a
-/// specific session+window. Used by legacy-wire Tauri commands.
+// ---------------------
+// Session-name store helpers
+// ---------------------
+//
+// Top-level key `session_names` holds a map-of-maps keyed on encoded
+// project name, with the inner map mapping session-UUID → user-chosen
+// display name. Pre-cleanup this state lived in localStorage under keys
+// like `session-names:<encoded>`; moving it here brings it under the
+// same read-modify-write discipline as the rest of the settings store
+// and ensures it survives a webview origin change or store backup.
+
+fn load_session_names_all(
+    app: &tauri::AppHandle,
+) -> Result<HashMap<String, HashMap<String, String>>, String> {
+    load_store_or_default(app, "session_names")
+}
+
+fn save_session_names_all(
+    app: &tauri::AppHandle,
+    data: &HashMap<String, HashMap<String, String>>,
+) -> Result<(), String> {
+    save_store(app, "session_names", data)
+}
+
+#[tauri::command]
+pub async fn get_session_names(
+    encoded_project: String,
+    app: tauri::AppHandle,
+) -> Result<HashMap<String, String>, String> {
+    let all = load_session_names_all(&app)?;
+    Ok(all.get(&encoded_project).cloned().unwrap_or_default())
+}
+
+#[tauri::command]
+pub async fn set_session_names(
+    encoded_project: String,
+    names: HashMap<String, String>,
+    app: tauri::AppHandle,
+) -> Result<(), String> {
+    let mut all = load_session_names_all(&app)?;
+    if names.is_empty() {
+        all.remove(&encoded_project);
+    } else {
+        all.insert(encoded_project, names);
+    }
+    save_session_names_all(&app, &all)
+}
+
+/// Filter the (already-flattened) 4-segment-keyed map down to one
+/// `(host, session, window)` scope, returning `pane_index → encoded_project`.
+/// The pane_index is the only distinguishing coordinate left after the
+/// scope is fixed, so callers can continue treating the result as a
+/// per-window map keyed by pane_index (as the pre-refactor wire did).
 fn filter_assignments(
     all: &HashMap<String, String>,
+    host: &str,
     session: &str,
     window: u32,
 ) -> HashMap<String, String> {
-    let prefix = format!("{}|{}|", session, window);
     all.iter()
-        .filter(|(k, _)| k.starts_with(&prefix))
-        .map(|(k, v)| {
-            let pane_idx = k.strip_prefix(&prefix).unwrap_or(k).to_string();
-            (pane_idx, v.clone())
+        .filter_map(|(k, v)| {
+            let (h, s, w, p) = parse_key(k)?;
+            if h == host && s == session && w == window {
+                Some((p.to_string(), v.clone()))
+            } else {
+                None
+            }
         })
         .collect()
 }
 
+/// Per-scope pane-index → encoded_project map for one `(host, session, window)`.
+/// Preserves the pre-refactor wire shape so every caller that used the
+/// old `get_pane_assignments(session, window)` just gains a required
+/// leading `host` arg. For local panes pass `host = "local"`.
 #[tauri::command]
 pub async fn get_pane_assignments(
+    host: String,
     session_name: String,
     window_index: u32,
     app: tauri::AppHandle,
@@ -385,12 +381,15 @@ pub async fn get_pane_assignments(
     let full = load_pane_assignments(&app)?;
     Ok(filter_assignments(
         &flatten_assignments(&full),
+        &host,
         &session_name,
         window_index,
     ))
 }
 
-/// Return ALL pane assignments unfiltered (for resurrect — needs full cross-session state).
+/// Return ALL pane assignments unfiltered, keyed on the full 4-segment
+/// coord (`host|session|window|pane`). Used by resurrect and by the
+/// AppContext grid to know every assigned slot across every host.
 #[tauri::command]
 pub async fn get_pane_assignments_raw(
     app: tauri::AppHandle,
@@ -408,34 +407,55 @@ pub fn get_pane_assignments_full_sync(
     load_pane_assignments(app)
 }
 
-/// Filter the full-struct assignment map to one session+window, keyed
-/// by pane_index (as a string to match the existing flat command's
-/// wire shape). Used by the frontend to populate host/account
-/// dropdowns in PaneSlot without forcing every existing caller of
-/// `get_pane_assignments` to learn the new struct shape.
+/// Per-scope full-struct map for one `(host, session, window)`, keyed
+/// by pane_index. Drives the frontend's per-slot host/account badges
+/// and the launcher's per-slot host/account resolution.
 #[tauri::command]
 pub async fn get_pane_assignments_full(
+    host: String,
     session_name: String,
     window_index: u32,
     app: tauri::AppHandle,
 ) -> Result<HashMap<String, PaneAssignment>, String> {
     let all = load_pane_assignments(&app)?;
-    let prefix = format!("{}|{}|", session_name, window_index);
     Ok(all
         .into_iter()
-        .filter(|(k, _)| k.starts_with(&prefix))
-        .map(|(k, v)| {
-            let pane_idx = k
-                .strip_prefix(&prefix)
-                .unwrap_or(&k)
-                .to_string();
-            (pane_idx, v)
+        .filter_map(|(k, v)| {
+            let (h, s, w, p) = parse_key(&k)?;
+            if h == host && s == session_name && w == window_index {
+                Some((p.to_string(), v))
+            } else {
+                None
+            }
         })
         .collect())
 }
 
+/// All assignments keyed by the full 4-segment coord string. Used by
+/// the frontend to merge local + remote assignments in one reactive
+/// store; reads once and filters per-pane in JS rather than calling
+/// the Tauri bridge once per slot.
+#[tauri::command]
+pub async fn get_all_pane_assignments_full(
+    app: tauri::AppHandle,
+) -> Result<HashMap<String, PaneAssignment>, String> {
+    load_pane_assignments(&app)
+}
+
+/// Create / update / delete the assignment at `(host, session, window, pane)`.
+/// Host must be part of the coordinate now — a pane at `main:0.3` on
+/// Mac is a different slot from a pane at `main:0.3` on local WSL.
+///
+/// When `encoded_project` is `Some`, host and account on an existing
+/// entry are preserved; a new entry starts with the passed host and
+/// `account = "andrea"`. When `None`, the slot is cleared.
+///
+/// Returns the post-mutation pane_index → encoded_project map for the
+/// same `(host, session, window)` scope so the frontend can refresh
+/// state in one round-trip.
 #[tauri::command]
 pub async fn set_pane_assignment(
+    host: String,
     session_name: String,
     window_index: u32,
     pane_index: u32,
@@ -443,24 +463,22 @@ pub async fn set_pane_assignment(
     app: tauri::AppHandle,
 ) -> Result<HashMap<String, String>, String> {
     let mut all = load_pane_assignments(&app)?;
-    let key = pane_key(&session_name, window_index, pane_index);
+    let key = pane_key(&host, &session_name, window_index, pane_index);
 
     match encoded_project {
-        Some(project) => {
-            // Preserve host/account on an existing entry; start from
-            // defaults (local/andrea) for a fresh assignment. This keeps
-            // drag-assign behaviour unchanged while letting the dropdown
-            // path (set_pane_assignment_meta) mutate the other fields
-            // independently.
-            match all.get_mut(&key) {
-                Some(existing) => {
-                    existing.encoded_project = project;
-                }
-                None => {
-                    all.insert(key, PaneAssignment::new_local(project));
-                }
+        Some(project) => match all.get_mut(&key) {
+            Some(existing) => {
+                existing.encoded_project = project;
             }
-        }
+            None => {
+                let mut fresh = PaneAssignment::new_local(project);
+                // Preserve the caller's host intent on first create —
+                // the default of `"local"` only kicks in when the
+                // frontend omits host (legacy callers in transition).
+                fresh.host = if host.is_empty() { "local".to_string() } else { host.clone() };
+                all.insert(key, fresh);
+            }
+        },
         None => {
             all.remove(&key);
         }
@@ -469,34 +487,43 @@ pub async fn set_pane_assignment(
     save_pane_assignments(&app, &all)?;
     Ok(filter_assignments(
         &flatten_assignments(&all),
+        &host,
         &session_name,
         window_index,
     ))
 }
 
-/// Update just the `host` and `account` of an existing pane assignment.
-/// Errors if no project is currently assigned to the slot — the
-/// frontend should only expose host/account dropdowns on assigned slots.
+/// Mutate the `host` / `account` metadata of an existing assignment at
+/// `(host, session, window, pane)`. The `host` param here is part of
+/// the **lookup key**; changing it is only supported via delete+recreate
+/// (this command errors if you try to mutate host to a different value
+/// than the slot already has). Use `set_pane_assignment(None)` then
+/// `set_pane_assignment(Some(project))` with the new host to move a
+/// slot between hosts.
 #[tauri::command]
 pub async fn set_pane_assignment_meta(
+    host: String,
     session_name: String,
     window_index: u32,
     pane_index: u32,
-    host: String,
     account: String,
     app: tauri::AppHandle,
 ) -> Result<(), String> {
     let mut all = load_pane_assignments(&app)?;
-    let key = pane_key(&session_name, window_index, pane_index);
+    let key = pane_key(&host, &session_name, window_index, pane_index);
 
     match all.get_mut(&key) {
         Some(entry) => {
-            entry.host = host;
+            // Host is part of the key, so a found entry already matches
+            // the caller's host. We only mutate account here — the slot's
+            // host is immutable under the host-aware coord model (move
+            // a slot between hosts via delete+recreate in
+            // `set_pane_assignment` instead).
             entry.account = account;
         }
         None => {
             return Err(format!(
-                "no pane assignment at {} — assign a project before setting host/account",
+                "no pane assignment at {} — assign a project before setting account",
                 key
             ));
         }

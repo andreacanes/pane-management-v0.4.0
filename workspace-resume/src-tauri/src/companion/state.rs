@@ -47,6 +47,22 @@ pub struct PaneRecord {
     /// been seen yet by the poller; `replay_to_lines` falls back to a sane
     /// default in that case.
     pub pane_width: u16,
+    /// tmux's `#{pane_pid}` — the shell PID that hosts the pane. For local
+    /// panes this is a Linux pid inside WSL; for remote panes it's a pid
+    /// on the Mac. Stored on the record so the `/conversation` handler
+    /// can run inline session detection when the poller hasn't bound a
+    /// session_id yet. Empty when the pane has not been seen by the
+    /// poller.
+    pub pane_pid: String,
+    /// When this PaneRecord was first created (i.e. when the poller
+    /// first saw this pane id). Used by the session-detection path to
+    /// reject MRU-based bindings during a grace window — a brand-new
+    /// pane hasn't had time to open its jsonl in write mode, so
+    /// `detect_claude_session`'s MRU fallback is extremely likely to
+    /// pick up a sibling pane's active transcript. Waiting a few
+    /// seconds lets the primary fd-scan path succeed with the correct
+    /// session id; if it still fails, we fall back to MRU.
+    pub first_seen_at: Instant,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]

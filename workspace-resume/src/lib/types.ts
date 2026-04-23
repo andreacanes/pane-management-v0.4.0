@@ -69,25 +69,8 @@ export interface SessionInfo {
   file_size_bytes: number;
 }
 
-// Phase 2: Resume types
-export type TerminalBackend = "tmux" | "warp" | "powershell";
-
 export interface TerminalSettings {
-  backend: TerminalBackend;
   tmux_session_name: string;
-}
-
-export interface ResumeResult {
-  pid: number | null;
-  terminal: string;
-  session_id: string;
-}
-
-export interface ActiveSession {
-  session_id: string;
-  pid: number | null;
-  terminal: string;
-  is_alive: boolean;
 }
 
 export interface ErrorLogEntry {
@@ -147,6 +130,18 @@ export interface TmuxPane {
   git_branch?: string | null;
   /** True when current_path is a linked (non-primary) git worktree. */
   is_worktree?: boolean;
+  /**
+   * Host the pane lives on. `"local"` for WSL tmux, any other value is an
+   * SSH alias (typically `"mac"`). Stamped by the backend command. Part
+   * of the full coordinate `(host, session_name, window_index, pane_index)`.
+   */
+  host: string;
+  /**
+   * tmux session this pane belongs to. Stamped by the backend. Local
+   * panes use the selected tmux session name; remote panes can come
+   * from any Mac session (one per project in the `cc` convention).
+   */
+  session_name: string;
 }
 
 export interface TmuxState {
@@ -174,4 +169,13 @@ export interface WindowPaneStatus {
   active_panes: number[];
   active_paths: string[];
   waiting_panes: number[];
+}
+
+export interface CompanionConfig {
+  bearer_token: string;
+  hook_secret: string;
+  ntfy_topic: string;
+  port: number;
+  bind: string;
+  suggested_url: string;
 }

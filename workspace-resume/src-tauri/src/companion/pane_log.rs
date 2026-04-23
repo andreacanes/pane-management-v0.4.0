@@ -434,6 +434,14 @@ pub async fn disable_pipe_pane(pane_id: &str) -> Result<(), String> {
 /// Called when a pane's claude_session_id transitions from None to Some.
 /// Preserves ordering: pending content appears before any session content
 /// written after this call.
+///
+/// Retries the fs IO up to 3 times with 50/200/500ms backoff before
+/// giving up. Transient failures (brief lock contention from the
+/// session-log rotation worker, a momentary read error while Claude
+/// flushes, etc.) are the main failure class in practice; without the
+/// retry the pending log would be orphaned and its bytes silently lost
+/// because the caller (tmux_poller) commits the session_id binding
+/// regardless of migration outcome.
 pub async fn migrate_pending_to_session(
     pane_uid: &str,
     session_id: &str,
@@ -443,32 +451,60 @@ pub async fn migrate_pending_to_session(
     if !pending.exists() {
         return Ok(());
     }
-    // Use tokio::task::spawn_blocking because this is fs IO off the poll
-    // loop's hot path.
-    let pending_clone = pending.clone();
-    let session_clone = session.clone();
-    tokio::task::spawn_blocking(move || -> std::io::Result<()> {
-        if let Some(parent) = session_clone.parent() {
-            std::fs::create_dir_all(parent)?;
+
+    let mut last_err: Option<String> = None;
+    for attempt in 1..=3u8 {
+        let pending_clone = pending.clone();
+        let session_clone = session.clone();
+        let result = tokio::task::spawn_blocking(move || -> std::io::Result<()> {
+            if let Some(parent) = session_clone.parent() {
+                std::fs::create_dir_all(parent)?;
+            }
+            let content = match std::fs::read(&pending_clone) {
+                Ok(b) => b,
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+                Err(e) => return Err(e),
+            };
+            let mut session_file = std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(&session_clone)?;
+            use std::io::Write;
+            session_file.write_all(&content)?;
+            session_file.sync_all()?;
+            let _ = std::fs::remove_file(&pending_clone);
+            Ok(())
+        })
+        .await
+        .map_err(|e| format!("migrate task join: {e}"))
+        .and_then(|r| r.map_err(|e| format!("migrate io: {e}")));
+
+        match result {
+            Ok(()) => {
+                if attempt > 1 {
+                    tracing::info!(
+                        pane_uid,
+                        session_id,
+                        attempt,
+                        "migrate_pending_to_session succeeded on retry"
+                    );
+                }
+                return Ok(());
+            }
+            Err(e) => {
+                last_err = Some(e);
+                if attempt < 3 {
+                    let backoff_ms: u64 = match attempt {
+                        1 => 50,
+                        2 => 200,
+                        _ => 500,
+                    };
+                    tokio::time::sleep(std::time::Duration::from_millis(backoff_ms)).await;
+                }
+            }
         }
-        let content = match std::fs::read(&pending_clone) {
-            Ok(b) => b,
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
-            Err(e) => return Err(e),
-        };
-        let mut session_file = std::fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(&session_clone)?;
-        use std::io::Write;
-        session_file.write_all(&content)?;
-        session_file.sync_all()?;
-        let _ = std::fs::remove_file(&pending_clone);
-        Ok(())
-    })
-    .await
-    .map_err(|e| format!("migrate task join: {e}"))?
-    .map_err(|e| format!("migrate io: {e}"))
+    }
+    Err(last_err.unwrap_or_else(|| "migrate failed after retries".to_string()))
 }
 
 /// Close the existing pipe, rotate the target log if needed, then re-open

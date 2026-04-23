@@ -2,7 +2,7 @@ import { createMemo, createResource, For, Show, createSignal, onCleanup, onMount
 import { listActiveClaudePanes, getUsageSummary, getAllUsage } from "../../lib/tauri-commands";
 import type { ActivePane, UsageSummary, ProjectUsage, ProjectWithMeta } from "../../lib/types";
 import { useApp } from "../../contexts/AppContext";
-import { fromWslPath, deriveName } from "../../lib/path";
+import { deriveName, matchProjectByPath } from "../../lib/path";
 import { Card } from "../ui/Card";
 import { StatusChip } from "../ui/StatusChip";
 import { AccountBadge } from "../ui/AccountBadge";
@@ -69,15 +69,7 @@ export function GlobalActivePanel(props: { onClose: () => void }) {
 
   /** Match an active pane's current_path to a known project. */
   function matchProject(panePath: string): ProjectWithMeta | null {
-    if (!panePath) return null;
-    const paneAsWsl = panePath.toLowerCase().replace(/\/+$/, "");
-    const paneAsWin = fromWslPath(panePath).toLowerCase().replace(/[\\/]+$/, "");
-    return (
-      state.projects.find((p) => {
-        const actual = p.actual_path.toLowerCase().replace(/[\\/]+$/, "");
-        return actual === paneAsWsl || actual === paneAsWin;
-      }) ?? null
-    );
+    return matchProjectByPath(panePath, state.projects);
   }
 
   /** Group active panes by resolved project (or "unknown" bucket). */

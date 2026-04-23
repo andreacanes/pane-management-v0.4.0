@@ -5,4 +5,5 @@ export const STORE_KEYS = {
   PANE_ASSIGNMENTS: "pane_assignments",
   TERMINAL_SETTINGS: "terminal_settings",
   ERROR_LOG: "error_log",
+  SESSION_NAMES: "session_names",
 } as const;

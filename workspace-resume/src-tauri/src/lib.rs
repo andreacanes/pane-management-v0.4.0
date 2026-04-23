@@ -23,15 +23,14 @@ pub fn run() {
             commands::discovery::create_project_folder,
             commands::discovery::get_inode,
             commands::discovery::find_inode_in_tree,
-            commands::launcher::resume_session,
-            commands::launcher::get_active_sessions,
             commands::launcher::get_terminal_settings,
-            commands::launcher::update_terminal_settings,
             commands::launcher::update_tmux_session_name,
             commands::launcher::launch_in_pane,
             commands::launcher::build_launch_command,
             commands::mac_sync::sync_project_to_mac,
             commands::mac_sync::list_remote_hosts,
+            commands::mac_sync::check_remote_path_exists,
+            commands::mac_sync::check_ssh_master,
             commands::usage::get_project_usage,
             commands::usage::get_all_usage,
             commands::usage::get_usage_summary,
@@ -44,14 +43,21 @@ pub fn run() {
             commands::launcher::clear_error_log,
             commands::tmux::list_active_claude_panes,
             commands::tmux::list_tmux_sessions,
+            commands::tmux::list_tmux_sessions_on,
             commands::tmux::list_tmux_windows,
             commands::tmux::list_tmux_panes,
+            commands::tmux::list_tmux_panes_on,
+            commands::tmux::list_tmux_panes_all_on,
             commands::tmux::get_tmux_state,
             commands::tmux::create_pane,
+            commands::tmux::create_pane_on,
             commands::tmux::apply_layout,
             commands::tmux::send_to_pane,
+            commands::tmux::send_to_pane_on_host,
             commands::tmux::cancel_pane_command,
+            commands::tmux::cancel_pane_command_on,
             commands::tmux::kill_pane,
+            commands::tmux::kill_pane_on,
             commands::tmux::create_window,
             commands::tmux::kill_window,
             commands::tmux::swap_tmux_pane,
@@ -63,6 +69,7 @@ pub fn run() {
             commands::tmux::rename_session,
             commands::tmux::rename_window,
             commands::tmux::create_session,
+            commands::tmux::create_session_on,
             commands::tmux::kill_session,
             commands::tmux::setup_pane_grid,
             commands::tmux::reflow_pane_grid,
@@ -84,27 +91,38 @@ pub fn run() {
             commands::project_meta::get_pane_assignments,
             commands::project_meta::get_pane_assignments_raw,
             commands::project_meta::get_pane_assignments_full,
+            commands::project_meta::get_all_pane_assignments_full,
             commands::project_meta::set_pane_assignment,
             commands::project_meta::set_pane_assignment_meta,
+            commands::project_meta::get_session_names,
+            commands::project_meta::set_session_names,
         ])
         .setup(|app| {
-            app.manage(commands::launcher::SessionTracker::new());
-
-            // Register Ctrl+Space global hotkey to toggle window visibility
-            let shortcut: Shortcut = "ctrl+space".parse().expect("valid shortcut");
-            let handle = app.handle().clone();
-            app.global_shortcut().on_shortcut(shortcut, move |_app, _shortcut, event| {
-                if event.state == ShortcutState::Pressed {
-                    if let Some(window) = handle.get_webview_window("main") {
-                        if window.is_minimized().unwrap_or(false) {
-                            let _ = window.unminimize();
-                            let _ = window.set_focus();
-                        } else {
-                            let _ = window.minimize();
+            // Register Ctrl+Space global hotkey to toggle window visibility.
+            // If the string ever fails to parse (e.g. a future shortcut-plugin
+            // change tightens the grammar) we log and move on rather than
+            // panicking the whole setup — the app is still usable without
+            // a global hotkey.
+            match "ctrl+space".parse::<Shortcut>() {
+                Ok(shortcut) => {
+                    let handle = app.handle().clone();
+                    app.global_shortcut().on_shortcut(shortcut, move |_app, _shortcut, event| {
+                        if event.state == ShortcutState::Pressed {
+                            if let Some(window) = handle.get_webview_window("main") {
+                                if window.is_minimized().unwrap_or(false) {
+                                    let _ = window.unminimize();
+                                    let _ = window.set_focus();
+                                } else {
+                                    let _ = window.minimize();
+                                }
+                            }
                         }
-                    }
+                    })?;
                 }
-            })?;
+                Err(e) => {
+                    eprintln!("[lib] failed to parse Ctrl+Space shortcut, skipping hotkey: {}", e);
+                }
+            }
 
             let app_handle = app.handle().clone();
             tauri::async_runtime::spawn(async move {
