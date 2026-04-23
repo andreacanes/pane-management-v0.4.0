@@ -252,6 +252,12 @@ async fn poll_once_remote(state: &AppState, alias: &str) -> anyhow::Result<()> {
 
     let account_map = remote_account_map_for_alias(state, alias).await;
     let mut seen: HashSet<String> = HashSet::new();
+    // Remote session-binding queue — same idea as the local
+    // `session_detect_queue`, but resolved via
+    // `detect_claude_session_remote` (lsof over SSH) instead of the
+    // Linux /proc walk. Collected during the main loop, spawned as a
+    // background task after the panes write lock is released.
+    let mut remote_session_queue: Vec<(String, String)> = Vec::new();
 
     // Snapshots used by the state-derivation rule (same source of truth
     // as local poll — phone hook flags + pending approvals).
@@ -279,7 +285,9 @@ async fn poll_once_remote(state: &AppState, alias: &str) -> anyhow::Result<()> {
         let pane_index: u32 = parts[3].parse().unwrap_or(0);
         let current_cmd = parts[4].to_string();
         let current_path = parts[5].to_string();
-        // pane_pid is remote — unusable for /proc walks; kept as bookkeeping only.
+        // pane_pid on the remote host — used to feed `lsof -p <pid>`
+        // over SSH for session binding (see `remote_session_queue`).
+        let pane_pid = parts[6].to_string();
         // pane_pipe is irrelevant for remote (no pipe-pane on Mac side).
         let pane_uid = parts[8].trim_start_matches('%').to_string();
         let pane_width: u16 = parts[9].parse().unwrap_or(0);
@@ -398,6 +406,17 @@ async fn poll_once_remote(state: &AppState, alias: &str) -> anyhow::Result<()> {
         // exits or output stales; Waiting when an approval/attention flag
         // is set; Running when output moves).
         let claude_alive = crate::commands::tmux::pane_is_claude(&current_cmd, &start_cmd);
+        // Queue a session-binding resolve via lsof-over-SSH when Claude
+        // is alive and we haven't bound a session id yet. `BindingConfidence`
+        // is `Explicit` only when we parsed `--resume <uuid>` from the
+        // start command; anything else — the normal `mcld` path — lands
+        // here.
+        if claude_alive
+            && rec.binding_confidence == BindingConfidence::None
+            && !pane_pid.is_empty()
+        {
+            remote_session_queue.push((id.clone(), pane_pid.clone()));
+        }
         let has_pending = pending_approval_panes.contains(&id);
         let in_attention = attention_snapshot.contains_key(&id);
         let output_stale = rec
@@ -453,18 +472,59 @@ async fn poll_once_remote(state: &AppState, alias: &str) -> anyhow::Result<()> {
 
     // Prune remote panes under THIS alias that disappeared this tick.
     // Other aliases and local panes are untouched.
-    let mut panes = state.panes.write().await;
-    let prefix = format!("{}/", alias);
-    let gone: Vec<String> = panes
-        .keys()
-        .filter(|k| k.starts_with(&prefix) && !seen.contains(*k))
-        .cloned()
-        .collect();
-    for id in &gone {
-        panes.remove(id);
-        let _ = state.events.send(EventDto::PaneRemoved {
-            pane_id: id.clone(),
-            at: now_ms(),
+    {
+        let mut panes = state.panes.write().await;
+        let prefix = format!("{}/", alias);
+        let gone: Vec<String> = panes
+            .keys()
+            .filter(|k| k.starts_with(&prefix) && !seen.contains(*k))
+            .cloned()
+            .collect();
+        for id in &gone {
+            panes.remove(id);
+            let _ = state.events.send(EventDto::PaneRemoved {
+                pane_id: id.clone(),
+                at: now_ms(),
+            });
+        }
+    }
+
+    // Resolve pending session bindings in the background. Each call
+    // is one SSH round-trip running `lsof -p <pid>` on the Mac — cheap
+    // with ControlMaster, expensive without. Serialized rather than
+    // parallel so we don't fan out N concurrent SSH sessions for a
+    // flurry of new Claude panes.
+    if !remote_session_queue.is_empty() {
+        let bg_state = state.clone();
+        let bg_alias = alias.to_string();
+        tokio::spawn(async move {
+            for (pane_id, shell_pid) in remote_session_queue {
+                if let Some((session_id, encoded_project, _is_mru)) =
+                    detect_claude_session_remote(&bg_alias, &shell_pid).await
+                {
+                    let updated_dto = {
+                        let mut panes = bg_state.panes.write().await;
+                        if let Some(rec) = panes.get_mut(&pane_id) {
+                            if rec.binding_confidence != BindingConfidence::Explicit {
+                                rec.dto.claude_session_id = Some(session_id);
+                                rec.binding_confidence = BindingConfidence::Heuristic;
+                                if rec.dto.project_encoded_name.is_none() {
+                                    rec.dto.project_encoded_name = Some(encoded_project);
+                                }
+                                rec.dto.updated_at = now_ms();
+                                Some(rec.dto.clone())
+                            } else {
+                                None
+                            }
+                        } else {
+                            None
+                        }
+                    };
+                    if let Some(pane) = updated_dto {
+                        let _ = bg_state.events.send(EventDto::PaneUpdated { pane });
+                    }
+                }
+            }
         });
     }
 
@@ -1429,6 +1489,109 @@ fn parse_resume_uuid(cmd: &str) -> Option<String> {
 /// turn. Start-time matching does NOT work — Claude resumes existing
 /// sessions, so the JSONL's first record can predate the Claude PID by
 /// hours or days. The cwd lookup ensures we look in the right project.
+/// Remote (Mac) port of [`detect_claude_session`]. macOS has no `/proc`
+/// so the Linux strategy (walking `/proc/<pid>/fd/` + reading fdinfo
+/// flags) is replaced with `lsof -p <pid>`, which lists open file
+/// descriptors with an access-mode letter in column 4 (`w` = write,
+/// `u` = read+write). Same return convention: `Some((session_id,
+/// encoded_project, is_mru))` on hit, `None` on miss.
+///
+/// Executed via SSH through `run_tmux_command_async_on(Remote)`, so
+/// the pgrep / ps / lsof calls resolve against the Mac's real process
+/// tree. Config dir fallback iterates `.claude` / `.claude-b` /
+/// `.claude-c`.
+pub(super) async fn detect_claude_session_remote(
+    alias: &str,
+    shell_pid: &str,
+) -> Option<(String, String, bool)> {
+    use crate::services::host_target::HostTarget;
+
+    if shell_pid.is_empty() {
+        return None;
+    }
+    // Single-quote escaping handled by ssh_shell_quote one layer up —
+    // the script itself is a plain bash body with no ssh-side escapes.
+    let script = format!(
+        r#"
+walk() {{
+  local pid=$1 depth=$2
+  [ "$depth" -gt 5 ] && return 1
+  local comm
+  comm=$(ps -o comm= -p "$pid" 2>/dev/null | tr -d ' ')
+  case "$comm" in
+    */claude|claude|mcld|*/mcld)
+      echo "$pid"
+      return 0
+      ;;
+  esac
+  # Claude on macOS runs as a node process. Inspect full args.
+  if [ "$(basename "${{comm:-}}")" = "node" ]; then
+    if ps -o args= -p "$pid" 2>/dev/null | grep -q claude; then
+      echo "$pid"
+      return 0
+    fi
+  fi
+  for child in $(pgrep -P "$pid" 2>/dev/null); do
+    if walk "$child" $((depth + 1)); then return 0; fi
+  done
+  return 1
+}}
+claude_pid=$(walk {pid} 0)
+[ -z "$claude_pid" ] && exit 1
+
+# First-choice: lsof-based open-file scan. Default lsof columns are:
+#   COMMAND PID USER FD TYPE DEVICE SIZE/OFF NODE NAME
+# FD column ends with `w` or `u` for write-capable handles. Claude
+# writes its active JSONL append-mode, which surfaces as `<num>w`
+# in the FD column. Read-only transients (parent session resolve
+# during a fork resume) are filtered out — matches the Linux fdinfo
+# flags & 3 check.
+hit=$(lsof -p "$claude_pid" 2>/dev/null \
+  | awk '$NF ~ /\.jsonl$/ && $4 ~ /[wu]$/ {{ print $NF; exit }}')
+if [ -n "$hit" ]; then
+  echo "$hit"
+  exit 0
+fi
+
+# Fallback: lsof cwd → MRU .jsonl in the matching project dir.
+cwd=$(lsof -p "$claude_pid" -a -d cwd 2>/dev/null \
+  | awk 'NR > 1 {{ print $NF; exit }}')
+[ -z "$cwd" ] && exit 1
+encoded=$(echo "$cwd" | tr '/. ' '-')
+for cfg in ".claude" ".claude-b" ".claude-c"; do
+  proj_dir="$HOME/$cfg/projects/$encoded"
+  [ -d "$proj_dir" ] || continue
+  mru=$(ls -t "$proj_dir"/*.jsonl 2>/dev/null | head -1)
+  if [ -n "$mru" ]; then
+    echo "MRU:$mru"
+    exit 0
+  fi
+done
+exit 1
+"#,
+        pid = shell_pid
+    );
+    let out = crate::commands::tmux::run_tmux_command_async_on(
+        HostTarget::Remote { alias: alias.to_string() },
+        script,
+    )
+    .await
+    .ok()?;
+    let first = out.lines().next()?.trim();
+    if first.is_empty() {
+        return None;
+    }
+    let (path, is_mru) = if let Some(rest) = first.strip_prefix("MRU:") {
+        (rest, true)
+    } else {
+        (first, false)
+    };
+    let p = std::path::Path::new(path);
+    let session_id = p.file_stem()?.to_str()?.to_string();
+    let encoded_project = p.parent()?.file_name()?.to_str()?.to_string();
+    Some((session_id, encoded_project, is_mru))
+}
+
 pub(super) async fn detect_claude_session(shell_pid: &str) -> Option<(String, String, bool)> {
     if shell_pid.is_empty() {
         return None;

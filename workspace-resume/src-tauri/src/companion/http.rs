@@ -102,27 +102,88 @@ async fn health(State(state): State<AppState>) -> Json<HealthDto> {
     })
 }
 
-async fn list_sessions(State(_state): State<AppState>) -> Result<Json<Vec<SessionDto>>, AppError> {
+async fn list_sessions(State(state): State<AppState>) -> Result<Json<Vec<SessionDto>>, AppError> {
+    use crate::services::host_target::HostTarget;
+
     let script = "tmux list-sessions -F '#{session_name}|#{session_windows}|#{?session_attached,1,0}' 2>/dev/null || true";
-    let out = crate::commands::tmux::run_tmux_command_async(script.to_string())
+
+    // Local first (always).
+    let mut sessions = parse_session_list(
+        &crate::commands::tmux::run_tmux_command_async_on(HostTarget::Local, script.to_string())
+            .await
+            .map_err(tmux_err)?,
+        None,
+    );
+
+    // Then each distinct remote host referenced by a pane assignment. SSH
+    // failures degrade gracefully — a reachable Mac contributes its
+    // sessions; an unreachable one logs and drops out without failing
+    // the whole response.
+    let remote_hosts = collect_remote_hosts(&state);
+    for alias in remote_hosts {
+        match crate::commands::tmux::run_tmux_command_async_on(
+            HostTarget::Remote { alias: alias.clone() },
+            script.to_string(),
+        )
         .await
-        .map_err(tmux_err)?;
-    let sessions: Vec<SessionDto> = out
-        .lines()
+        {
+            Ok(out) => {
+                sessions.extend(parse_session_list(&out, Some(&alias)));
+            }
+            Err(e) => {
+                tracing::debug!(alias = %alias, "remote list-sessions failed: {e}");
+            }
+        }
+    }
+
+    Ok(Json(sessions))
+}
+
+/// Parse `tmux list-sessions -F '...'` output into `SessionDto`s. When
+/// `alias` is set, each session name is prefixed `<alias>/` so remote
+/// sessions don't collide with local ones sharing the same name (both
+/// hosts commonly have `main`, for example).
+fn parse_session_list(out: &str, alias: Option<&str>) -> Vec<SessionDto> {
+    out.lines()
         .filter(|l| !l.trim().is_empty())
         .filter_map(|line| {
             let parts: Vec<&str> = line.split('|').collect();
             if parts.len() < 3 {
                 return None;
             }
+            let name = match alias {
+                Some(a) => format!("{}/{}", a, parts[0]),
+                None => parts[0].to_string(),
+            };
             Some(SessionDto {
-                name: parts[0].to_string(),
+                name,
                 windows: parts[1].parse().unwrap_or(0),
                 attached: parts[2] == "1",
             })
         })
-        .collect();
-    Ok(Json(sessions))
+        .collect()
+}
+
+/// Enumerate distinct non-local SSH aliases currently referenced by any
+/// pane assignment. Matches the poller's `discover_remote_hosts` — kept
+/// inline here rather than imported to avoid a cross-module cycle
+/// (poller is private within the companion).
+fn collect_remote_hosts(state: &AppState) -> Vec<String> {
+    let full = match crate::commands::project_meta::get_pane_assignments_full_sync(&state.app) {
+        Ok(m) => m,
+        Err(e) => {
+            tracing::debug!("pane_assignments read failed for list_sessions: {e}");
+            return Vec::new();
+        }
+    };
+    let mut seen = std::collections::HashSet::new();
+    let mut out = Vec::new();
+    for a in full.values() {
+        if !a.host.is_empty() && a.host != "local" && seen.insert(a.host.clone()) {
+            out.push(a.host.clone());
+        }
+    }
+    out
 }
 
 #[derive(Debug, Deserialize)]
