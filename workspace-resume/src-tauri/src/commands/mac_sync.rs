@@ -128,14 +128,17 @@ pub async fn launch_project_session_on(
         "sully" => "env CLAUDE_CONFIG_DIR=\"$HOME/.claude-c\" ",
         _ => "",
     };
-    // -A = attach if exists; -d = create detached. Together they mean
-    // "create if missing, no-op if exists, don't attach". Safe to call
-    // over SSH without a TTY. `-- env ... mncld` makes mncld the pane's
-    // initial command, matching the `cc` helper's shape.
+    // Idempotent create-or-attach. Can't use `tmux new-session -A -d`:
+    // when the session already exists, `-A` falls back to
+    // `attach-session -d` which requires a PTY, and over SSH without
+    // `-t` tmux errors out with "open terminal failed: not a terminal".
+    // `has-session` returns 0 when present (then we no-op) and non-zero
+    // when missing (then we create). Either path is TTY-free.
     let sess_esc = session_name.replace('\'', r"'\''");
     let path_esc = project_path.replace('\'', r"'\''");
     let script = format!(
-        "tmux new-session -A -d -s '{sess}' -c '{path}' -- {env}mncld",
+        "tmux has-session -t '{sess}' 2>/dev/null || \
+         tmux new-session -d -s '{sess}' -c '{path}' -- {env}mncld",
         sess = sess_esc,
         path = path_esc,
         env = env_prefix,
