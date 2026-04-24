@@ -54,3 +54,13 @@ windows = { version = "0.62", features = ["Win32_System_Threading", "Win32_Found
 
 [dev-dependencies]
 tempfile = "3"
+
+[features]
+# Enables tauri's `custom-protocol` — release builds serve the webview from
+# the embedded `frontendDist` bundle instead of the `devUrl` Vite server.
+# Without this feature, `cargo build --release` produces an exe whose
+# webview tries `http://localhost:1420` and fails with "refused to connect"
+# because no Vite dev server is running. `cargo tauri build` enables this
+# automatically; for plain `cargo build --release` pass `--features custom-protocol`.
+default = ["custom-protocol"]
+custom-protocol = ["tauri/custom-protocol"]
