@@ -123,10 +123,19 @@ pub async fn launch_project_session_on(
     if session_name.is_empty() || project_path.is_empty() {
         return Err("session_name and project_path are required".into());
     }
+    // Always route through `env` — even when the account needs no
+    // CLAUDE_CONFIG_DIR override. Otherwise tmux's `/bin/sh -c
+    // '<shell-command>'` wrapping leaves a `zsh` / `sh` process as the
+    // pane's top-of-tree, which masks the patched Claude binary from
+    // `pane_is_claude` (the check looks for "claude" / "cld" in
+    // `pane_current_command`). `env` is a C program that sets any
+    // given vars then exec-replaces itself with the remaining argv, so
+    // the chain collapses to tmux → env → mncld → cli-mncld-118.bin
+    // and tmux reports `cli-mncld-118.b` as `current_command`.
     let env_prefix = match account.as_str() {
         "bravura" => "env CLAUDE_CONFIG_DIR=\"$HOME/.claude-b\" ",
         "sully" => "env CLAUDE_CONFIG_DIR=\"$HOME/.claude-c\" ",
-        _ => "",
+        _ => "env ",
     };
     // Idempotent create-or-attach. Can't use `tmux new-session -A -d`:
     // when the session already exists, `-A` falls back to
