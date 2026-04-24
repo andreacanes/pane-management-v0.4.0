@@ -68,10 +68,10 @@ pub struct TmuxPane {
     pub session_name: String,
 }
 
-// Used by `#[serde(default = "...")]` on `TmuxPane::host`. Only fires
-// on deserialize, which TmuxPane doesn't currently derive — kept for
-// the day we add Deserialize (the migration plan leaves that door open
-// without needing another model tweak).
+// Used by `#[serde(default = "...")]` on `TmuxPane::host` when we
+// eventually derive Deserialize. Marked dead_code because the macro
+// attribute only fires on deserialize, which TmuxPane doesn't derive
+// today (Tauri IPC is one-way Rust → JS serialization).
 #[allow(dead_code)]
 fn default_local_host() -> String {
     "local".to_string()

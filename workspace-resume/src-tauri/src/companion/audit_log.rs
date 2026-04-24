@@ -25,6 +25,11 @@ pub struct AuditEntry {
 
 #[derive(Debug, Serialize)]
 #[serde(tag = "action", rename_all = "snake_case")]
+#[allow(dead_code)] // `HookReceived` is reserved for a future per-hook
+                    // ingress audit trail that isn't wired yet (we only
+                    // log Fired/Suppressed today). Keep the variant so
+                    // the wire format is forward-compatible when we add
+                    // it — deleting would require a wire-breaking change.
 pub enum AuditEvent {
     HookReceived {
         pane_id: Option<String>,

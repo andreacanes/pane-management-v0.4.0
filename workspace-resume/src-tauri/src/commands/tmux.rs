@@ -364,6 +364,18 @@ pub struct ActivePane {
     pub pane_pid: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub claude_account: Option<String>,
+    /// Host the pane runs on — `"local"` for WSL tmux, any other value
+    /// is an SSH alias (e.g. `"mac"`). Stamped by the cross-host
+    /// scanner so the frontend's "all Claudes" view can route actions
+    /// to the right tmux server. Default `"local"` keeps legacy
+    /// deserializers happy.
+    #[serde(default = "default_active_pane_host")]
+    pub host: String,
+}
+
+#[allow(dead_code)]
+fn default_active_pane_host() -> String {
+    "local".to_string()
 }
 
 /// Fill in `claude_account` for every claude-alive pane in the slice
@@ -458,9 +470,55 @@ pub fn pane_is_claude(current_command: &str, start_command: &str) -> bool {
 
 #[tauri::command]
 pub async fn list_active_claude_panes() -> Result<Vec<ActivePane>, String> {
+    use crate::services::host_target::HostTarget;
+
+    // Local scan: one wsl.exe call, walk every pane via tmux list-panes -a.
+    let mut result = scan_active_claude_panes_on(&HostTarget::Local, "local").await?;
+
+    // Remote scan: fan out across every host we can reach. Remote
+    // discovery is gated on either (a) the host appearing in a
+    // pane_assignment with a non-"local" host, or (b) `list_remote_hosts`
+    // (static `["mac"]` today). We union the two so a host that's
+    // configured but not yet assigned still surfaces its active Claudes.
+    let mut hosts: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+    if let Ok(known) = crate::commands::mac_sync::list_remote_hosts().await {
+        for h in known {
+            hosts.insert(h);
+        }
+    }
+    for alias in hosts {
+        match scan_active_claude_panes_on(
+            &HostTarget::Remote { alias: alias.clone() },
+            &alias,
+        )
+        .await
+        {
+            Ok(mut panes) => result.append(&mut panes),
+            Err(e) => {
+                eprintln!("[commands::tmux] list_active_claude_panes remote {} failed: {}", alias, e);
+            }
+        }
+    }
+
+    Ok(result)
+}
+
+/// Shared per-host scanner for `list_active_claude_panes`. Stamps
+/// `host` on every returned `ActivePane` and prefixes the `id` with
+/// `"<alias>/"` for remote panes so the APK addresses them the same
+/// way `poll_once_remote` does.
+///
+/// Local hosts also run `/proc`-backed `detect_claude_account` per
+/// pane; remote hosts can't reach /proc across SSH, so `claude_account`
+/// is left `None` and the companion's remote-pane state synthesis
+/// (from pane_assignment) fills it later on the APK wire.
+async fn scan_active_claude_panes_on(
+    host: &crate::services::host_target::HostTarget,
+    host_wire: &str,
+) -> Result<Vec<ActivePane>, String> {
     let script = "tmux list-panes -a -F \
         '#{session_name}|#{window_index}|#{window_name}|#{pane_index}|#{pane_pid}|#{pane_current_command}|#{pane_current_path}|#{pane_start_command}' 2>/dev/null";
-    let out = run_tmux_command_async(script.to_string()).await?;
+    let out = run_tmux_command_async_on(host.clone(), script.to_string()).await?;
     let mut result = Vec::new();
     for line in out.lines() {
         let parts: Vec<&str> = line.split('|').collect();
@@ -473,14 +531,19 @@ pub async fn list_active_claude_panes() -> Result<Vec<ActivePane>, String> {
         let pane_index: u32 = parts[3].parse().unwrap_or(0);
         let pane_pid = parts[4].to_string();
         let current_command = parts[5].to_string();
-        // Path can contain literal '|' — start_command is always last.
         let start_command = parts[parts.len() - 1].to_string();
         let current_path = parts[6..parts.len() - 1].join("|");
         if !pane_is_claude(&current_command, &start_command) {
             continue;
         }
+        let coord = format!("{}:{}.{}", session, window_index, pane_index);
+        let id = if host.is_local() {
+            coord
+        } else {
+            format!("{}/{}", host_wire, coord)
+        };
         result.push(ActivePane {
-            id: format!("{}:{}.{}", session, window_index, pane_index),
+            id,
             session_name: session,
             window_index,
             window_name,
@@ -490,15 +553,16 @@ pub async fn list_active_claude_panes() -> Result<Vec<ActivePane>, String> {
             start_command,
             pane_pid,
             claude_account: None,
+            host: host_wire.to_string(),
         });
     }
-    // Populate claude_account for each entry — cached helper so repeat
-    // calls are cheap.
-    for entry in result.iter_mut() {
-        if entry.pane_pid.is_empty() {
-            continue;
+    if host.is_local() {
+        for entry in result.iter_mut() {
+            if entry.pane_pid.is_empty() {
+                continue;
+            }
+            entry.claude_account = detect_claude_account(&entry.pane_pid).await;
         }
-        entry.claude_account = detect_claude_account(&entry.pane_pid).await;
     }
     Ok(result)
 }

@@ -111,6 +111,10 @@ interface AppContextValue {
   pendingLaunch: () => PendingLaunch | null;
   startPanePick: (launch: PendingLaunch) => void;
   cancelPanePick: () => void;
+  /** Resolve a pending launch against the user-picked target pane.
+   *  Pane carries host/session/window so the launch routes to the
+   *  right tmux server (local or Mac). */
+  completePanePick: (pane: TmuxPane) => void;
   // Notification muting
   mutePane: (sessionName: string, windowIndex: number, paneIndex: number) => void;
   unmutePane: (sessionName: string, windowIndex: number, paneIndex: number) => void;
@@ -359,11 +363,21 @@ export function AppProvider(props: { children: JSX.Element }) {
     }
   }
 
+  // Per-host health tracker: did the last poll succeed or fail? Used to
+  // detect ok→fail / fail→ok transitions so we can surface them once
+  // (toast + error-log entry) rather than repeating every 10 s tick.
+  const remoteHealth: Map<string, { ok: boolean }> = new Map();
+
   /** Fetch every pane on every remote host and filter to the ones that
    *  should appear in the grid: panes running Claude AND panes with an
    *  active assignment. Shell-only Mac sessions the user spun up for
    *  unrelated work stay hidden, matching the plan's "running Claude
-   *  OR has assignment" discovery rule. */
+   *  OR has assignment" discovery rule.
+   *
+   *  Surfaces connectivity changes: when a host transitions from
+   *  reachable to unreachable we emit a toast + error_log entry so the
+   *  user sees the Mac is offline rather than silently losing its
+   *  panes from the grid. */
   async function loadRemotePanes(): Promise<TmuxPane[]> {
     const hosts = state.remoteHosts;
     if (hosts.length === 0) return [];
@@ -378,8 +392,26 @@ export function AppProvider(props: { children: JSX.Element }) {
             out.push(p);
           }
         }
+        const prev = remoteHealth.get(host);
+        if (prev && !prev.ok) {
+          const { toastSuccess } = await import("../components/ui/Toast");
+          toastSuccess(`${host} reachable again`, "Remote panes restored");
+        }
+        remoteHealth.set(host, { ok: true });
       } catch (e) {
-        console.warn(`[AppContext] loadRemotePanes ${host} failed:`, e);
+        const prev = remoteHealth.get(host);
+        if (!prev || prev.ok) {
+          const { toastError } = await import("../components/ui/Toast");
+          toastError(
+            `${host} unreachable`,
+            "Remote panes hidden until the host is back",
+          );
+          console.warn(`[AppContext] loadRemotePanes ${host} failed:`, e);
+        } else {
+          // Still down — keep quiet to avoid toast spam.
+          console.debug(`[AppContext] loadRemotePanes ${host} still failing:`, e);
+        }
+        remoteHealth.set(host, { ok: false });
       }
     }
     return out;
@@ -515,6 +547,59 @@ export function AppProvider(props: { children: JSX.Element }) {
   function cancelPanePick() {
     setPendingLaunch(null);
     resumePolling();
+  }
+
+  /**
+   * Resolve a pending launch against a user-picked pane. Reads the
+   * pending launch config (project + resume/new + optional sessionId/yolo),
+   * routes to the correct helper (`launchToPane` for resume,
+   * `newSessionInPane` for fresh) with the target pane's host/session/
+   * window/pane_index — so Mac panes get `mncld` and Mac paths, local
+   * panes get `ncld` and WSL paths. No-ops when pendingLaunch is null.
+   *
+   * This replaces the broken `launch.execute(paneIndex)` pattern that
+   * referenced a property never defined on PendingLaunch.
+   */
+  async function completePanePick(pane: TmuxPane) {
+    const launch = pendingLaunch();
+    if (!launch) return;
+    // Clear pending first — a slow launch shouldn't keep the grid in
+    // "select mode" if the user clicks somewhere else in the meantime.
+    setPendingLaunch(null);
+    resumePolling();
+    try {
+      const { launchToPane, newSessionInPane } = await import("../lib/launch");
+      const host = pane.host || "local";
+      const session = pane.session_name || state.selectedTmuxSession || "";
+      const windowIndex = pane.window_index ?? state.selectedTmuxWindow ?? 0;
+      const common = {
+        tmuxSession: session,
+        tmuxWindow: windowIndex,
+        tmuxPanes: state.tmuxPanes,
+        paneAssignments: state.paneAssignments,
+        encodedProject: launch.project.encoded_name,
+        projectPath: launch.project.actual_path,
+        targetPaneIndex: pane.pane_index,
+        host,
+        yolo: launch.yolo,
+      };
+      if (launch.mode === "resume") {
+        await launchToPane({
+          ...common,
+          sessionId: launch.sessionId ?? null,
+          boundSession: launch.project.meta?.bound_session ?? null,
+        });
+      } else {
+        await newSessionInPane(common);
+      }
+      loadTmuxPanes(
+        state.selectedTmuxSession ?? session,
+        state.selectedTmuxWindow ?? windowIndex,
+      );
+      loadPaneAssignments();
+    } catch (e) {
+      console.error("[AppContext] completePanePick error:", e);
+    }
   }
 
   // -- Project settings modal ------------------------------------------------
@@ -811,6 +896,7 @@ export function AppProvider(props: { children: JSX.Element }) {
     pendingLaunch,
     startPanePick,
     cancelPanePick,
+    completePanePick,
     mutePane,
     unmutePane,
     isPaneMuted,

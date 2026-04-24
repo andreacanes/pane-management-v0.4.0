@@ -40,6 +40,7 @@ export function PaneSlot(props: { pane: TmuxPane; assignment?: string | null }) 
     refreshTmuxState,
     openProjectSettings,
     pendingLaunch,
+    completePanePick,
   } = useApp();
 
   const paneIndex = () => props.pane.pane_index;
@@ -345,8 +346,11 @@ export function PaneSlot(props: { pane: TmuxPane; assignment?: string | null }) 
   }
 
   function handlePaneSelect() {
-    const launch = pendingLaunch();
-    if (launch) launch.execute(paneIndex());
+    if (!pendingLaunch()) return;
+    // Dispatch goes through AppContext's completePanePick so the launch
+    // helper sees the full pane coord (host/session/window) — routing to
+    // Mac mncld vs local ncld is decided from `props.pane.host`.
+    completePanePick(props.pane);
   }
 
   return (
@@ -535,7 +539,7 @@ export function PaneSlot(props: { pane: TmuxPane; assignment?: string | null }) 
               <Show when={menuOpen()}>
                 <div class="pane-slot-menu" onClick={(e) => e.stopPropagation()}>
                   <Show when={effectiveProject()}>
-                    <button class="pane-slot-menu-item" onClick={() => { openProjectSettings(effectiveProject()!.encoded_name); setMenuOpen(false); }}>
+                    <button class="pane-slot-menu-item" onClick={() => { openProjectSettings(effectiveProject()!, paneIndex()); setMenuOpen(false); }}>
                       <Settings size={12} /> Settings
                     </button>
                     <Show when={!isRunningClaude()}>

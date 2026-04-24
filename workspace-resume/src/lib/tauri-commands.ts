@@ -416,6 +416,23 @@ export async function checkSshMaster(alias: string): Promise<boolean> {
   return invoke("check_ssh_master", { alias });
 }
 
+/** Create a detached tmux session on a remote host, targeting a project
+ *  directory with a specific Claude account. Mirrors the `cc` CLI on
+ *  Mac but detached so SSH without a TTY works. Returns [session, window, pane]. */
+export async function launchProjectSessionOn(
+  host: string,
+  sessionName: string,
+  projectPath: string,
+  account: string,
+): Promise<[string, number, number]> {
+  return invoke("launch_project_session_on", {
+    host,
+    sessionName,
+    projectPath,
+    account,
+  });
+}
+
 export async function checkPaneStatuses(sessionName: string): Promise<Record<string, WindowPaneStatus>> {
   return invoke("check_pane_statuses", { sessionName });
 }

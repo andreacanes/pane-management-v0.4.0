@@ -31,6 +31,7 @@ pub fn run() {
             commands::mac_sync::list_remote_hosts,
             commands::mac_sync::check_remote_path_exists,
             commands::mac_sync::check_ssh_master,
+            commands::mac_sync::launch_project_session_on,
             commands::usage::get_project_usage,
             commands::usage::get_all_usage,
             commands::usage::get_usage_summary,

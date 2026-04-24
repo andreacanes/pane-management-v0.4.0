@@ -2,9 +2,21 @@ import { Show, createSignal, createEffect, For, onMount } from "solid-js";
 import {
   createPaneOn,
   createSessionOn,
+  launchProjectSessionOn,
   listTmuxSessionsOn,
 } from "../../lib/tauri-commands";
-import type { TmuxSession } from "../../lib/types";
+import { useApp } from "../../contexts/AppContext";
+import type { TmuxSession, ProjectWithMeta } from "../../lib/types";
+
+/** Derive the Mac-side project path under the Mutagen `~/projects`
+ *  convention. Mirrors `toMacPath` in `launch.ts`; kept inline here to
+ *  avoid importing a module that also statically imports
+ *  tauri-commands (the circular static/dynamic import warning). */
+function macPathFor(wslProjectPath: string): string {
+  const parts = wslProjectPath.split(/[\\/]+/).filter((s) => s.length > 0);
+  const basename = parts[parts.length - 1] ?? "";
+  return basename ? `/Users/admin/projects/${basename}` : "";
+}
 
 /**
  * Ask the user where to create a new tmux pane: which host, which
@@ -36,14 +48,43 @@ export function CreatePaneModal(props: {
    *  project name when we launched the modal from a drag-drop flow. */
   defaultSession?: string;
 }) {
+  const { state } = useApp();
   const [host, setHost] = createSignal<string>("local");
   const [mode, setMode] = createSignal<"existing" | "new">("existing");
   const [direction, setDirection] = createSignal<"h" | "v">("h");
   const [existingSessions, setExistingSessions] = createSignal<TmuxSession[]>([]);
   const [selectedSession, setSelectedSession] = createSignal<string>("");
   const [newSessionName, setNewSessionName] = createSignal<string>("");
+  /** Optional project to launch in the new remote session. When set on
+   *  host=mac+new the modal takes the `cc`-equivalent path:
+   *  `launch_project_session_on` starts a detached session whose first
+   *  pane runs `mncld` inside the mirrored project dir — matches the
+   *  interactive `cc <project> <account>` flow without needing a TTY.
+   *  Leave empty for a bare zsh session. */
+  const [projectEncoded, setProjectEncoded] = createSignal<string>("");
+  const [account, setAccount] = createSignal<string>("andrea");
   const [busy, setBusy] = createSignal(false);
   const [error, setError] = createSignal<string | null>(null);
+
+  const sortedProjects = (): ProjectWithMeta[] =>
+    [...state.projects].sort((a, b) =>
+      (a.meta.display_name ?? a.encoded_name).localeCompare(
+        b.meta.display_name ?? b.encoded_name,
+      ),
+    );
+
+  // When a project is picked, default the session name to its basename
+  // — matches the `cc <project>` convention so users get a sensible
+  // session name without typing.
+  createEffect(() => {
+    const enc = projectEncoded();
+    if (!enc) return;
+    const proj = state.projects.find((p) => p.encoded_name === enc);
+    if (!proj) return;
+    const parts = proj.actual_path.split(/[\\/]+/).filter((s) => s.length > 0);
+    const basename = parts[parts.length - 1] ?? "";
+    if (basename) setNewSessionName(basename);
+  });
 
   onMount(() => {
     setNewSessionName(props.defaultSession ?? "scratch");
@@ -85,13 +126,50 @@ export function CreatePaneModal(props: {
       if (!session) throw new Error("session name is required");
 
       if (mode() === "new") {
-        // Create a new detached tmux session on the target host. The
-        // session starts with one pane (index 0); the caller can split
-        // it further or immediately drop an assignment onto the fresh
-        // slot. We purposefully don't invoke the `cc` helper here so
-        // the modal stays general (not per-project) and doesn't
-        // silently pick an account — that happens at assign/launch time.
-        await createSessionOn(h, session);
+        const enc = projectEncoded();
+        const proj = enc
+          ? state.projects.find((p) => p.encoded_name === enc)
+          : undefined;
+
+        // cc-equivalent path: host != local AND a project is picked.
+        // Starts a detached tmux session running mncld inside the Mac
+        // project dir under the chosen Claude account. Matches what
+        // `~/bin/cc <project> <account>` does on the Mac terminal but
+        // stays headless so no TTY is required over SSH.
+        if (h !== "local" && proj) {
+          const projectPathOnHost = macPathFor(proj.actual_path);
+          if (!projectPathOnHost) {
+            throw new Error("unable to derive project path for this host");
+          }
+          try {
+            await launchProjectSessionOn(h, session, projectPathOnHost, account());
+          } catch (e) {
+            const msg = e instanceof Error ? e.message : String(e);
+            // `tmux new-session -A -d` is already idempotent, so a
+            // duplicate-session error here is rare — but catch it for
+            // parity with the bare-session path and treat as "attach to
+            // existing".
+            if (!/duplicate session/i.test(msg)) throw e;
+          }
+          props.onCreated({ host: h, session, windowIndex: 0, paneIndex: 0 });
+          props.onClose();
+          return;
+        }
+
+        // Bare new-session path: no project / no account. Starts a
+        // plain shell so the user can drag a project onto the slot
+        // later and pick host/account at assignment time.
+        try {
+          await createSessionOn(h, session);
+        } catch (e) {
+          const msg = e instanceof Error ? e.message : String(e);
+          if (/duplicate session/i.test(msg)) {
+            props.onCreated({ host: h, session, windowIndex: 0, paneIndex: 0 });
+            props.onClose();
+            return;
+          }
+          throw e;
+        }
         props.onCreated({ host: h, session, windowIndex: 0, paneIndex: 0 });
         props.onClose();
         return;
@@ -250,6 +328,63 @@ export function CreatePaneModal(props: {
                 <option value="v">Vertical (top / bottom)</option>
               </select>
             </label>
+          </Show>
+
+          {/* Project + account — only relevant when creating a new
+              session on a remote host. Picking them here runs the
+              cc-equivalent flow (mncld in ~/projects/<name> under the
+              chosen account's config dir). Leaving Project empty falls
+              back to a bare shell the user can drag a project onto later. */}
+          <Show when={mode() === "new" && host() !== "local"}>
+            <label style={{ "display": "flex", "gap": "8px", "align-items": "center" }}>
+              <span style={{ "min-width": "72px", "font-size": "12px" }}>Project</span>
+              <select
+                value={projectEncoded()}
+                onChange={(e) => setProjectEncoded(e.currentTarget.value)}
+                title="Pick a project to cd+mncld into, or leave empty for a bare shell"
+                style={{
+                  "flex": "1",
+                  "background": "var(--surface-2, #1f1f23)",
+                  "color": "var(--text, #d4d4d4)",
+                  "border": "1px solid var(--border, #2d2d33)",
+                  "border-radius": "4px",
+                  "padding": "4px 6px",
+                }}
+              >
+                <option value="">(none — bare shell)</option>
+                <For each={sortedProjects()}>
+                  {(p) => (
+                    <option value={p.encoded_name}>
+                      {p.meta.display_name ??
+                        p.actual_path.split(/[\\/]+/).pop() ??
+                        p.encoded_name}
+                    </option>
+                  )}
+                </For>
+              </select>
+            </label>
+            <Show when={projectEncoded() !== ""}>
+              <label style={{ "display": "flex", "gap": "8px", "align-items": "center" }}>
+                <span style={{ "min-width": "72px", "font-size": "12px" }}>Account</span>
+                <select
+                  value={account()}
+                  onChange={(e) => setAccount(e.currentTarget.value)}
+                  title="Claude account mncld runs under in the new session"
+                  style={{
+                    "flex": "1",
+                    "background": "var(--surface-2, #1f1f23)",
+                    "color": "var(--text, #d4d4d4)",
+                    "border": "1px solid var(--border, #2d2d33)",
+                    "border-radius": "4px",
+                    "padding": "4px 6px",
+                  }}
+                >
+                  <option value="andrea">Andrea</option>
+                  <option value="bravura">Bravura</option>
+                  <option value="sully">Sully</option>
+                </select>
+              </label>
+            </Show>
           </Show>
 
           <Show when={error()}>

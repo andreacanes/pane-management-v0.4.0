@@ -6,6 +6,11 @@ use rev_lines::RevLines;
 /// Parsed session metadata from a JSONL file.
 #[derive(Debug, Clone)]
 pub struct SessionMeta {
+    // Read from the JSONL header but not currently surfaced through the
+    // `SessionInfo` DTO (that wire uses the filename-derived session_id).
+    // Kept here so a future consumer that wants to verify the header/
+    // filename agreement has the value already parsed.
+    #[allow(dead_code)]
     pub session_id: Option<String>,
     pub first_timestamp: Option<String>,
     pub last_timestamp: Option<String>,

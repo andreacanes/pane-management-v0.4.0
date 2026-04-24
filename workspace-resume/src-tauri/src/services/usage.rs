@@ -102,6 +102,10 @@ pub struct SessionUsage {
 }
 
 impl SessionUsage {
+    // Sum of all token categories — used by tests and intended for a
+    // future session-card "total tokens" label on the UI. Kept public
+    // so the sibling `ProjectUsage::total_tokens` stays symmetric.
+    #[allow(dead_code)]
     pub fn total_tokens(&self) -> u64 {
         self.input_tokens + self.output_tokens + self.cache_write_tokens + self.cache_read_tokens
     }
@@ -135,6 +139,9 @@ pub struct ProjectUsage {
 }
 
 impl ProjectUsage {
+    // Sum across all sessions; test-covered and intended for an
+    // aggregate project view that's on the backlog but not shipped.
+    #[allow(dead_code)]
     pub fn total_tokens(&self) -> u64 {
         self.total_input + self.total_output + self.total_cache_write + self.total_cache_read
     }

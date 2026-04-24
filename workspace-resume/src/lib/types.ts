@@ -58,6 +58,9 @@ export interface ActivePane {
   start_command: string;
   pane_pid?: string;
   claude_account?: "andrea" | "bravura" | "sully" | null;
+  /** Host the pane runs on — `"local"` for WSL tmux, any other value
+   *  is an SSH alias (e.g. `"mac"`). Stamped by the cross-host scanner. */
+  host: string;
 }
 
 export interface SessionInfo {

@@ -39,6 +39,10 @@ impl HostTarget {
         matches!(self, Self::Local)
     }
 
+    /// Symmetric complement of `is_local` — kept as part of the public
+    /// surface even though most call sites use `!is_local()` today so
+    /// callers reading the host discriminant have an affirmative form.
+    #[allow(dead_code)]
     pub fn is_remote(&self) -> bool {
         matches!(self, Self::Remote { .. })
     }

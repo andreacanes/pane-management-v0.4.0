@@ -31,6 +31,12 @@ use super::{
 const APPROVAL_TTL_MS: i64 = 120_000;
 
 #[derive(Debug, Deserialize)]
+#[allow(dead_code)] // `transcript_path` is accepted from the hook wire
+                    // payload for forward compat but never consumed —
+                    // the companion routes by pane_id, not by re-reading
+                    // the transcript. Kept so a future feature ("show
+                    // transcript tail on Notification") doesn't require
+                    // a wire change.
 pub struct HookPayload {
     #[serde(default)]
     pub session_id: Option<String>,

@@ -280,10 +280,16 @@ pub enum EventDto {
         pane_id: String,
         at: i64,
     },
+    /// Reserved session-lifecycle variants — declared for wire
+    /// compatibility when we add tmux-session create/destroy broadcast
+    /// but not yet emitted by the poller. Keep the shapes frozen so a
+    /// future enable isn't a breaking change for the APK.
+    #[allow(dead_code)]
     SessionStarted {
         name: String,
         at: i64,
     },
+    #[allow(dead_code)]
     SessionEnded {
         name: String,
         at: i64,

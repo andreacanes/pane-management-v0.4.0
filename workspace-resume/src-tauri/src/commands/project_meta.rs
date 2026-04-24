@@ -56,6 +56,8 @@ fn load_pane_assignments(app: &tauri::AppHandle) -> Result<HashMap<String, PaneA
         .collect();
 
     let mut needs_migration = false;
+    let mut rewritten = 0usize;
+    let mut dropped = 0usize;
     let mut migrated: HashMap<String, PaneAssignment> = HashMap::with_capacity(src.len());
     for (k, v) in src {
         if is_legacy_key(&k) {
@@ -64,27 +66,48 @@ fn load_pane_assignments(app: &tauri::AppHandle) -> Result<HashMap<String, PaneA
                 Some((host, session, window, pane)) => {
                     let new_k = build_key(&host, &session, window, pane);
                     migrated.insert(new_k, v);
+                    rewritten += 1;
                 }
                 None => {
-                    eprintln!("[project_meta] dropping malformed pane_assignment key: {}", k);
+                    tracing::warn!(
+                        key = %k,
+                        "dropping malformed pane_assignment key (legacy shape unparseable)"
+                    );
+                    dropped += 1;
                 }
             }
         } else if parse_key(&k).is_some() {
             migrated.insert(k, v);
         } else {
-            eprintln!("[project_meta] dropping malformed pane_assignment key: {}", k);
+            tracing::warn!(
+                key = %k,
+                "dropping malformed pane_assignment key (not 4-segment)"
+            );
             needs_migration = true;
+            dropped += 1;
         }
     }
 
     if needs_migration {
         // One-shot rewrite so future loads skip the migration path and
         // the sweep + frontend both see consistent 4-segment keys.
-        if let Err(e) = save_pane_assignments(app, &migrated) {
-            eprintln!(
-                "[project_meta] pane_assignments migration save failed: {} (continuing with in-memory copy)",
-                e
-            );
+        match save_pane_assignments(app, &migrated) {
+            Ok(()) => {
+                tracing::info!(
+                    rewritten,
+                    dropped,
+                    total = migrated.len(),
+                    "pane_assignments migrated to 4-segment keys"
+                );
+            }
+            Err(e) => {
+                tracing::error!(
+                    error = %e,
+                    rewritten,
+                    dropped,
+                    "pane_assignments migration save failed; continuing with in-memory copy"
+                );
+            }
         }
     }
 

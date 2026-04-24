@@ -139,6 +139,35 @@ async fn list_sessions(State(state): State<AppState>) -> Result<Json<Vec<Session
     Ok(Json(sessions))
 }
 
+/// Split a pane id into its host target and the local-tmux coord.
+///
+/// Wire format:
+/// * Local panes: `"<session>:<window>.<pane>"` — no `/`.
+/// * Remote panes: `"<alias>/<session>:<window>.<pane>"` — leading
+///   `alias/` identifies the SSH host.
+///
+/// This is the single source of truth for "which tmux server do I
+/// send this command to" in the companion HTTP layer. Every endpoint
+/// that runs a `tmux` command against a specific pane id goes through
+/// here before dispatching — otherwise a `mac/main:0.3` pane id would
+/// be pasted verbatim into `tmux send-keys -t mac/main:0.3` on the
+/// local tmux server, which fails silently (no such pane).
+fn split_pane_id_host(id: &str) -> (crate::services::host_target::HostTarget, &str) {
+    use crate::services::host_target::HostTarget;
+    // Local coords never contain '/'. tmux session names can't either
+    // (tmux explicitly forbids them), so a leading `alias/` segment is
+    // unambiguously a remote prefix.
+    match id.split_once('/') {
+        Some((alias, rest)) if !alias.is_empty() && !rest.is_empty() => (
+            HostTarget::Remote {
+                alias: alias.to_string(),
+            },
+            rest,
+        ),
+        _ => (HostTarget::Local, id),
+    }
+}
+
 /// Parse `tmux list-sessions -F '...'` output into `SessionDto`s. When
 /// `alias` is set, each session name is prefixed `<alias>/` so remote
 /// sessions don't collide with local ones sharing the same name (both
@@ -303,16 +332,22 @@ async fn capture_pane(
         }
     }
 
-    // Fallback: tmux capture-pane. pane id format: "<session>:<window>.<pane>"
-    // — the same as tmux target syntax. lines=0 means "all scrollback"
-    // (tmux `-S -`); any positive value captures the last N lines.
+    // Fallback: tmux capture-pane. Local panes use `"<session>:<window>.<pane>"`
+    // which matches tmux target syntax directly; remote panes carry an
+    // `"<alias>/"` prefix we strip before dispatching to SSH. `lines=0`
+    // means "all scrollback" (tmux `-S -`); any positive value captures
+    // the last N lines.
+    let (capture_host, capture_local_id) = split_pane_id_host(&id);
     let start_flag = if q.lines == 0 {
         "-".to_string()
     } else {
         format!("-{}", q.lines)
     };
-    let script = format!("tmux capture-pane -p -e -t {} -S {} 2>&1 || true", id, start_flag);
-    let out = crate::commands::tmux::run_tmux_command_async(script)
+    let script = format!(
+        "tmux capture-pane -p -e -t {} -S {} 2>&1 || true",
+        capture_local_id, start_flag
+    );
+    let out = crate::commands::tmux::run_tmux_command_async_on(capture_host, script)
         .await
         .map_err(tmux_err)?;
     let lines: Vec<String> = out.lines().map(|s| s.to_string()).collect();
@@ -477,11 +512,14 @@ async fn pane_conversation(
                     .filter_map(|(_, r)| r.dto.claude_session_id.clone())
                     .collect()
             };
+            // For remote panes the JSONL files live on the remote host's
+            // filesystem under its own `$HOME` — run `ls` on that host.
+            let (ls_host, _) = split_pane_id_host(&id);
             let script = format!(
                 "ls -t \"$HOME/{}/projects/{}\"/*.jsonl 2>/dev/null",
                 config_dir, proj
             );
-            let listing = crate::commands::tmux::run_tmux_command_async(script)
+            let listing = crate::commands::tmux::run_tmux_command_async_on(ls_host, script)
                 .await
                 .map_err(tmux_err)?;
             let listing_count = listing.lines().filter(|l| !l.trim().is_empty()).count();
@@ -533,6 +571,9 @@ async fn pane_conversation(
         }
     };
 
+    // Pane id carries the host prefix; read_jsonl_with_retry threads it
+    // through so `cat` runs on the pane's actual filesystem (Mac for
+    // remote panes).
     let raw = read_jsonl_with_retry(&jsonl_path, &id, &session_id, pick_path).await?;
 
     let messages = parse_jsonl_conversation(&raw, q.after.as_deref());
@@ -555,6 +596,10 @@ async fn read_jsonl_with_retry(
     session_id: &str,
     pick_path: &'static str,
 ) -> Result<String, AppError> {
+    // Route the `cat` to the pane's host — remote Claude sessions
+    // store their JSONL on the Mac filesystem; we can't reach them
+    // from local WSL.
+    let (host, _) = split_pane_id_host(pane_id);
     let script = format!(
         "cat \"{}\" 2>/dev/null || echo '__FILE_NOT_FOUND__'",
         jsonl_path
@@ -563,7 +608,7 @@ async fn read_jsonl_with_retry(
     let mut attempt = 0u8;
     loop {
         attempt += 1;
-        let raw = crate::commands::tmux::run_tmux_command_async(script.clone())
+        let raw = crate::commands::tmux::run_tmux_command_async_on(host.clone(), script.clone())
             .await
             .map_err(tmux_err)?;
 
@@ -954,8 +999,9 @@ async fn send_key(
             req.key
         )));
     }
-    let script = format!("tmux send-keys -t {} {}", id, req.key);
-    crate::commands::tmux::run_tmux_command_async(script)
+    let (host, local_id) = split_pane_id_host(&id);
+    let script = format!("tmux send-keys -t {} {}", local_id, req.key);
+    crate::commands::tmux::run_tmux_command_async_on(host, script)
         .await
         .map_err(tmux_err)?;
     Ok(StatusCode::NO_CONTENT)
@@ -965,8 +1011,9 @@ async fn cancel_pane(
     State(_state): State<AppState>,
     Path(id): Path<String>,
 ) -> Result<StatusCode, AppError> {
-    let script = format!("tmux send-keys -t {} C-c C-c 2>&1", id);
-    crate::commands::tmux::run_tmux_command_async(script)
+    let (host, local_id) = split_pane_id_host(&id);
+    let script = format!("tmux send-keys -t {} C-c C-c 2>&1", local_id);
+    crate::commands::tmux::run_tmux_command_async_on(host, script)
         .await
         .map_err(tmux_err)?;
     Ok(StatusCode::NO_CONTENT)
@@ -1090,27 +1137,32 @@ async fn create_window(
     State(_state): State<AppState>,
     Json(req): Json<CreateWindowRequest>,
 ) -> Result<Json<CreateWindowResponse>, AppError> {
-    // Andrea = ncld, Bravura = ncld2. Both shell functions live in
-    // ~/.bashrc so the command runs inside an interactive shell via
-    // `send-keys`, not as a `new-window "cmd"` argument.
-    let cmd = match req.account.as_str() {
-        "bravura" => "ncld2",
-        "andrea" | "" => "ncld",
-        other => {
-            return Err(AppError::BadRequest(format!(
-                "unknown account '{}': expected andrea|bravura",
-                other
-            )))
-        }
-    };
     if req.session_name.is_empty() || req.project_path.is_empty() {
         return Err(AppError::BadRequest(
             "session_name and project_path are required".into(),
         ));
     }
 
+    // session_name may be prefixed `<alias>/` when the APK picked a
+    // remote-host session. Split off the alias so tmux targets the
+    // right host's session and the response's pane_id carries the
+    // same prefix back.
+    let (win_host, local_session) = split_pane_id_host(&req.session_name);
+
+    // Launcher: local panes use ncld family; remote panes use mncld
+    // (patched) for consistency with `cc` on Mac. Account `"sully"`
+    // picks the tertiary config dir.
+    let cmd = match (win_host.is_local(), req.account.as_str()) {
+        (true, "bravura") => "ncld2",
+        (true, "sully") => "ncld3",
+        (true, _) => "ncld",
+        (false, "bravura") => "mncld2",
+        (false, "sully") => "mncld3",
+        (false, _) => "mncld",
+    };
+
     // Single-quote shell escape: a single quote becomes '\''
-    let sess_esc = req.session_name.replace('\'', r"'\''");
+    let sess_esc = local_session.replace('\'', r"'\''");
     let path_esc = req.project_path.replace('\'', r"'\''");
     let name_esc = req.project_display_name.replace('\'', r"'\''");
 
@@ -1125,7 +1177,7 @@ async fn create_window(
         cmd = cmd,
     );
 
-    let out = crate::commands::tmux::run_tmux_command_async(script)
+    let out = crate::commands::tmux::run_tmux_command_async_on(win_host.clone(), script)
         .await
         .map_err(tmux_err)?;
 
@@ -1138,7 +1190,17 @@ async fn create_window(
         .trim()
         .parse()
         .map_err(|_| AppError::BadRequest(format!("create_window bad index: {}", idx_str)))?;
-    let pane_id = format!("{}:{}.1", req.session_name, window_index);
+    // Re-apply the alias prefix so the returned pane_id matches the
+    // poller's remote id format (APK stores this and addresses future
+    // /panes/{id}/... calls with it).
+    let pane_id = match &win_host {
+        crate::services::host_target::HostTarget::Local => {
+            format!("{}:{}.1", local_session, window_index)
+        }
+        crate::services::host_target::HostTarget::Remote { alias } => {
+            format!("{}/{}:{}.1", alias, local_session, window_index)
+        }
+    };
 
     tracing::info!(%pane_id, account = %req.account, "new window created");
 
@@ -1155,9 +1217,10 @@ async fn kill_window(
     if session.is_empty() {
         return Err(AppError::BadRequest("session is required".into()));
     }
-    let sess_esc = session.replace('\'', r"'\''");
+    let (host, local_session) = split_pane_id_host(&session);
+    let sess_esc = local_session.replace('\'', r"'\''");
     let script = format!("tmux kill-window -t '{}':{} 2>&1", sess_esc, index);
-    crate::commands::tmux::run_tmux_command_async(script)
+    crate::commands::tmux::run_tmux_command_async_on(host, script)
         .await
         .map_err(tmux_err)?;
     tracing::info!(%session, index, "window killed");
@@ -1168,13 +1231,15 @@ async fn kill_pane(
     State(_state): State<AppState>,
     Path(id): Path<String>,
 ) -> Result<StatusCode, AppError> {
-    // id is "session:window.pane", e.g. "main:3.1"
+    // id is either local `"session:window.pane"` (e.g. `main:3.1`) or
+    // remote `"<alias>/session:window.pane"` (e.g. `mac/akamai:0.0`).
     if id.is_empty() {
         return Err(AppError::BadRequest("pane id is required".into()));
     }
-    let id_esc = id.replace('\'', r"'\''");
+    let (host, local_id) = split_pane_id_host(&id);
+    let id_esc = local_id.replace('\'', r"'\''");
     let script = format!("tmux kill-pane -t '{}' 2>&1", id_esc);
-    crate::commands::tmux::run_tmux_command_async(script)
+    crate::commands::tmux::run_tmux_command_async_on(host, script)
         .await
         .map_err(tmux_err)?;
     tracing::info!(%id, "pane killed");
@@ -1187,17 +1252,10 @@ async fn create_pane(
 ) -> Result<Json<CreatePaneResponse>, AppError> {
     // Split the current window (horizontally / side-by-side by default; vertical
     // when the caller opts in), inheriting the target pane's working directory,
-    // then launch the account-specific Claude launcher inside it.
-    let cmd = match req.account.as_str() {
-        "bravura" => "ncld2",
-        "andrea" | "" => "ncld",
-        other => {
-            return Err(AppError::BadRequest(format!(
-                "unknown account '{}': expected andrea|bravura",
-                other
-            )))
-        }
-    };
+    // then launch the account-specific Claude launcher inside it. The launcher
+    // name is resolved below once we know the target's host (mncld on Mac,
+    // ncld on local) — pre-refactor code had a local-only `cmd` mapping here
+    // that's now dead.
     if req.target_pane_id.is_empty() {
         return Err(AppError::BadRequest("target_pane_id is required".into()));
     }
@@ -1211,7 +1269,18 @@ async fn create_pane(
             )))
         }
     };
-    let target_esc = req.target_pane_id.replace('\'', r"'\''");
+    // Split target's pane id may be prefixed with `<alias>/` when the
+    // source lives on a remote host. Route the split to that host's
+    // tmux server, and swap `ncld`/`ncld2` for `mncld`/`mncld2` so the
+    // new pane uses the patched Mac binary by convention.
+    let (split_host, target_local) = split_pane_id_host(&req.target_pane_id);
+    let cmd = match (split_host.is_local(), req.account.as_str()) {
+        (true, "bravura") => "ncld2",
+        (true, _) => "ncld",
+        (false, "bravura") => "mncld2",
+        (false, _) => "mncld",
+    };
+    let target_esc = target_local.replace('\'', r"'\''");
 
     // Query the target pane's cwd first — #{pane_current_path} in split-window's
     // -c arg expands relative to the *active* pane, not the -t target.
@@ -1227,16 +1296,25 @@ async fn create_pane(
         cmd = cmd,
     );
 
-    let out = crate::commands::tmux::run_tmux_command_async(script)
+    let out = crate::commands::tmux::run_tmux_command_async_on(split_host.clone(), script)
         .await
         .map_err(tmux_err)?;
 
-    let new_pane_id = out
+    let new_local_id = out
         .lines()
         .find_map(|l| l.strip_prefix("NEW="))
         .ok_or_else(|| AppError::BadRequest(format!("create_pane parse failed: {}", out)))?
         .trim()
         .to_string();
+
+    // Re-apply the alias prefix on the returned pane id so the APK
+    // stores + addresses it the same way the poller does.
+    let new_pane_id = match &split_host {
+        crate::services::host_target::HostTarget::Local => new_local_id,
+        crate::services::host_target::HostTarget::Remote { alias } => {
+            format!("{}/{}", alias, new_local_id)
+        }
+    };
 
     tracing::info!(%new_pane_id, target = %req.target_pane_id, account = %req.account, flag = %flag, "pane split created");
 
@@ -1312,17 +1390,18 @@ async fn fork_pane(
         }
         sid
     };
-    let cmd = match req.account.as_str() {
-        "bravura" => "ncld2",
-        "andrea" | "" => "ncld",
-        other => {
-            return Err(AppError::BadRequest(format!(
-                "unknown account '{}': expected andrea|bravura",
-                other
-            )))
-        }
+    // Pick the launcher for the new pane's host — local uses ncld,
+    // Mac uses mncld (patched Claude binary per convention). Accounts
+    // other than andrea get the `2` variant which the bashrc/zshenv
+    // functions alias to the correct CLAUDE_CONFIG_DIR.
+    let (fork_host, source_local_id) = split_pane_id_host(&id);
+    let cmd = match (fork_host.is_local(), req.account.as_str()) {
+        (true, "bravura") => "ncld2",
+        (true, _) => "ncld",
+        (false, "bravura") => "mncld2",
+        (false, _) => "mncld",
     };
-    let id_esc = id.replace('\'', r"'\''");
+    let id_esc = source_local_id.replace('\'', r"'\''");
     let sid_esc = session_id.replace('\'', r"'\''");
     // Target the new pane by its immutable `%N` pane_id, not by
     // `session:win.pane` index. When split-window creates a pane adjacent
@@ -1349,16 +1428,25 @@ async fn fork_pane(
         sid = sid_esc,
     );
 
-    let out = crate::commands::tmux::run_tmux_command_async(script)
+    let out = crate::commands::tmux::run_tmux_command_async_on(fork_host.clone(), script)
         .await
         .map_err(tmux_err)?;
 
-    let new_pane_id = out
+    let new_local_id = out
         .lines()
         .find_map(|l| l.strip_prefix("NEW="))
         .ok_or_else(|| AppError::BadRequest(format!("fork_pane parse failed: {}", out)))?
         .trim()
         .to_string();
+
+    // Re-apply the alias prefix on the returned id for consistency
+    // with the poller's remote pane id format.
+    let new_pane_id = match &fork_host {
+        crate::services::host_target::HostTarget::Local => new_local_id,
+        crate::services::host_target::HostTarget::Remote { alias } => {
+            format!("{}/{}", alias, new_local_id)
+        }
+    };
 
     tracing::info!(
         source_pane = %id,
@@ -1409,18 +1497,19 @@ async fn audit_log(
 /// Send literal text to a tmux pane via `send-keys -l`, optionally
 /// followed by Enter. Keeps quoting sane by passing via stdin.
 async fn send_text_to_pane(id: &str, text: &str, submit: bool) -> Result<(), AppError> {
+    let (host, local_id) = split_pane_id_host(id);
     // Escape single quotes for bash single-quoted string
     let escaped = text.replace('\'', r"'\''");
     let submit_line = if submit {
-        format!("tmux send-keys -t {} Enter", id)
+        format!("tmux send-keys -t {} Enter", local_id)
     } else {
         String::new()
     };
     let script = format!(
         "tmux send-keys -t {} -l '{}'; {}",
-        id, escaped, submit_line
+        local_id, escaped, submit_line
     );
-    crate::commands::tmux::run_tmux_command_async(script)
+    crate::commands::tmux::run_tmux_command_async_on(host, script)
         .await
         .map_err(tmux_err)?;
     Ok(())
@@ -1428,13 +1517,18 @@ async fn send_text_to_pane(id: &str, text: &str, submit: bool) -> Result<(), App
 
 /// Query a pane's real `#{pane_width}` from tmux — bypasses the poller's
 /// cached value for capture requests that might race a recent pane
-/// resize. Returns None on failure; caller treats that as width=0 and
-/// lets replay_to_lines use REPLAY_COLS_FALLBACK.
+/// resize. Routes to the pane's actual host so Mac pane widths are
+/// queried against the Mac's tmux server. Returns None on failure;
+/// caller treats that as width=0 and lets replay_to_lines use
+/// REPLAY_COLS_FALLBACK.
 async fn query_pane_width_live(pane_id: &str) -> Option<usize> {
+    let (host, local_id) = split_pane_id_host(pane_id);
     let script = format!(
         "tmux display-message -p -t {} '#{{pane_width}}' 2>/dev/null",
-        pane_id
+        local_id
     );
-    let out = crate::commands::tmux::run_tmux_command_async(script).await.ok()?;
+    let out = crate::commands::tmux::run_tmux_command_async_on(host, script)
+        .await
+        .ok()?;
     out.trim().parse::<usize>().ok().filter(|&w| w > 0)
 }

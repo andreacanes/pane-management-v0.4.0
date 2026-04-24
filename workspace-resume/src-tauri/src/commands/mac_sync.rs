@@ -47,6 +47,57 @@ pub async fn list_remote_hosts() -> Result<Vec<String>, String> {
     Ok(vec!["mac".to_string()])
 }
 
+/// Start a new detached tmux session on a remote host, targeting a
+/// specific project directory with a specific Claude account, and
+/// launch `mncld` inside it. Mirrors what `~/bin/cc <project> <account>`
+/// does on the Mac but stays detached so SSH without a TTY still works.
+///
+/// Parameters:
+/// * `host` — SSH alias (e.g. `"mac"`). `"local"` is accepted but the
+///   `ncld` family is the more natural entry point for local launches.
+/// * `session_name` — the tmux session name. By `cc` convention this
+///   matches the project basename.
+/// * `project_path` — absolute path on the remote host's filesystem.
+///   For Mac, this is typically `/Users/admin/projects/<name>` — the
+///   caller (CreatePaneModal) derives it via `toMacPath`.
+/// * `account` — `"andrea"` | `"bravura"` | `"sully"`. Picks the
+///   `CLAUDE_CONFIG_DIR` that mncld runs under.
+///
+/// Returns the created `(session, window, pane)` coord so the UI can
+/// refresh and drop an assignment on the new slot.
+#[tauri::command]
+pub async fn launch_project_session_on(
+    host: String,
+    session_name: String,
+    project_path: String,
+    account: String,
+) -> Result<(String, u32, u32), String> {
+    use crate::services::host_target::HostTarget;
+    if session_name.is_empty() || project_path.is_empty() {
+        return Err("session_name and project_path are required".into());
+    }
+    let env_prefix = match account.as_str() {
+        "bravura" => "env CLAUDE_CONFIG_DIR=\"$HOME/.claude-b\" ",
+        "sully" => "env CLAUDE_CONFIG_DIR=\"$HOME/.claude-c\" ",
+        _ => "",
+    };
+    // -A = attach if exists; -d = create detached. Together they mean
+    // "create if missing, no-op if exists, don't attach". Safe to call
+    // over SSH without a TTY. `-- env ... mncld` makes mncld the pane's
+    // initial command, matching the `cc` helper's shape.
+    let sess_esc = session_name.replace('\'', r"'\''");
+    let path_esc = project_path.replace('\'', r"'\''");
+    let script = format!(
+        "tmux new-session -A -d -s '{sess}' -c '{path}' -- {env}mncld",
+        sess = sess_esc,
+        path = path_esc,
+        env = env_prefix,
+    );
+    let host_t = HostTarget::from_str(Some(&host));
+    crate::commands::tmux::run_tmux_command_async_on(host_t, script).await?;
+    Ok((session_name, 0, 0))
+}
+
 /// Check whether `path` exists as a directory on `host`. Used by the UI
 /// to gate the Host=Mac dropdown: if the project hasn't been mirrored to
 /// the Mac yet, the launch would silently fail with "no such file or
