@@ -33,6 +33,8 @@ import {
   swapTmuxWindow,
   checkPaneStatuses,
 } from "../lib/tauri-commands";
+import { toastError, toastSuccess } from "../components/ui/Toast";
+import { launchToPane, newSessionInPane } from "../lib/launch";
 import type {
   ProjectWithMeta,
   ProjectMeta,
@@ -115,6 +117,10 @@ interface AppContextValue {
    *  Pane carries host/session/window so the launch routes to the
    *  right tmux server (local or Mac). */
   completePanePick: (pane: TmuxPane) => void;
+  /** Re-read the persistent `remote_hosts` list and kick off a fresh
+   *  remote poll. Settings calls this after saving edits so the grid
+   *  reflects the new host set immediately. */
+  refreshRemoteHosts: () => Promise<void>;
   // Notification muting
   mutePane: (sessionName: string, windowIndex: number, paneIndex: number) => void;
   unmutePane: (sessionName: string, windowIndex: number, paneIndex: number) => void;
@@ -394,14 +400,12 @@ export function AppProvider(props: { children: JSX.Element }) {
         }
         const prev = remoteHealth.get(host);
         if (prev && !prev.ok) {
-          const { toastSuccess } = await import("../components/ui/Toast");
           toastSuccess(`${host} reachable again`, "Remote panes restored");
         }
         remoteHealth.set(host, { ok: true });
       } catch (e) {
         const prev = remoteHealth.get(host);
         if (!prev || prev.ok) {
-          const { toastError } = await import("../components/ui/Toast");
           toastError(
             `${host} unreachable`,
             "Remote panes hidden until the host is back",
@@ -442,8 +446,11 @@ export function AppProvider(props: { children: JSX.Element }) {
   }
 
   /** Seed the remoteHosts state at mount so `loadRemotePanes` has targets
-   *  to poll. Static for MVP (`["mac"]`); future work may migrate this
-   *  into a user-editable `remote_hosts` Tauri store key. */
+   *  to poll. Backed by the persistent `remote_hosts` Tauri store key
+   *  (editable via Settings > Remote hosts); defaults to `["mac"]` when
+   *  the store is empty. `refreshRemoteHosts` re-reads the store —
+   *  Settings calls it after a save so host changes take effect without
+   *  an app restart. */
   async function loadRemoteHosts() {
     try {
       const hosts = await listRemoteHosts();
@@ -568,7 +575,6 @@ export function AppProvider(props: { children: JSX.Element }) {
     setPendingLaunch(null);
     resumePolling();
     try {
-      const { launchToPane, newSessionInPane } = await import("../lib/launch");
       const host = pane.host || "local";
       const session = pane.session_name || state.selectedTmuxSession || "";
       const windowIndex = pane.window_index ?? state.selectedTmuxWindow ?? 0;
@@ -897,6 +903,10 @@ export function AppProvider(props: { children: JSX.Element }) {
     startPanePick,
     cancelPanePick,
     completePanePick,
+    refreshRemoteHosts: async () => {
+      await loadRemoteHosts();
+      refreshTmuxState();
+    },
     mutePane,
     unmutePane,
     isPaneMuted,

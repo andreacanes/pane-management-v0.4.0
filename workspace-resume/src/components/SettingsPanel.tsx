@@ -8,8 +8,12 @@ import {
   getCompanionConfig,
   getCompanionQr,
   rotateCompanionToken,
+  getRemoteHosts,
+  setRemoteHosts,
   type CompanionConfig,
 } from "../lib/tauri-commands";
+import { toastError, toastSuccess } from "./ui/Toast";
+import { useApp } from "../contexts/AppContext";
 import type { ErrorLogEntry } from "../lib/types";
 
 const uiStore = new LazyStore("settings.json");
@@ -30,6 +34,7 @@ export { showAnimations, showHotkeyHint };
 })();
 
 export function SettingsPanel() {
+  const { refreshRemoteHosts: refreshHostsInGrid } = useApp();
   const [tmuxSessionName, setTmuxSessionName] = createSignal("main");
   const [tmuxSessionDraft, setTmuxSessionDraft] = createSignal("main");
   const [sessionNameError, setSessionNameError] = createSignal<string | null>(null);
@@ -40,6 +45,14 @@ export function SettingsPanel() {
   const [companionQr, setCompanionQr] = createSignal<string | null>(null);
   const [tokenRevealed, setTokenRevealed] = createSignal(false);
 
+  // Remote hosts — SSH aliases the app polls for Mac-style multi-host
+  // panes. `remoteHostsDraft` is the editable mirror; we save when the
+  // user clicks Save (vs. losing every keystroke on blur, which would
+  // be surprising on a typing-intensive control).
+  const [remoteHosts, setRemoteHostsState] = createSignal<string[]>([]);
+  const [remoteHostsDraft, setRemoteHostsDraft] = createSignal<string[]>([]);
+  const [remoteHostsSaving, setRemoteHostsSaving] = createSignal(false);
+
   onMount(async () => {
     try {
       const settings = await getTerminalSettings();
@@ -48,9 +61,62 @@ export function SettingsPanel() {
     } catch (e) {
       console.error("[SettingsPanel] Failed to load settings:", e);
     }
+    try {
+      const hosts = await getRemoteHosts();
+      setRemoteHostsState(hosts);
+      setRemoteHostsDraft(hosts);
+    } catch (e) {
+      console.error("[SettingsPanel] Failed to load remote hosts:", e);
+    }
     await loadCompanion();
     await refreshErrors();
   });
+
+  async function handleSaveRemoteHosts() {
+    setRemoteHostsSaving(true);
+    try {
+      const saved = await setRemoteHosts(remoteHostsDraft());
+      setRemoteHostsState(saved);
+      setRemoteHostsDraft(saved);
+      // Tell AppContext to re-read the store + kick a fresh remote poll
+      // so the grid reflects the new host list without an app restart.
+      await refreshHostsInGrid();
+      toastSuccess(
+        "Remote hosts saved",
+        saved.length === 0
+          ? "No hosts — AppContext will default to ['mac']"
+          : saved.join(", "),
+      );
+    } catch (e) {
+      const msg = e instanceof Error ? e.message : String(e);
+      toastError("Remote hosts save failed", msg);
+    } finally {
+      setRemoteHostsSaving(false);
+    }
+  }
+
+  function addRemoteHost() {
+    setRemoteHostsDraft([...remoteHostsDraft(), ""]);
+  }
+  function removeRemoteHost(idx: number) {
+    const next = [...remoteHostsDraft()];
+    next.splice(idx, 1);
+    setRemoteHostsDraft(next);
+  }
+  function updateRemoteHost(idx: number, value: string) {
+    const next = [...remoteHostsDraft()];
+    next[idx] = value;
+    setRemoteHostsDraft(next);
+  }
+  function remoteHostsDirty(): boolean {
+    const a = remoteHosts();
+    const b = remoteHostsDraft();
+    if (a.length !== b.length) return true;
+    for (let i = 0; i < a.length; i++) {
+      if (a[i] !== b[i]) return true;
+    }
+    return false;
+  }
 
   async function loadCompanion() {
     try {
@@ -260,6 +326,48 @@ export function SettingsPanel() {
             </button>
           </div>
         </Show>
+      </div>
+
+      <div class="settings-section">
+        <h4>Remote hosts</h4>
+        <p style={{ "opacity": 0.7, "font-size": "12px", "margin": "0 0 8px" }}>
+          SSH aliases the app polls for multi-host panes. Each entry must resolve via{" "}
+          <code>~/.ssh/config</code> (e.g. <code>mac</code>). Blank list defaults to{" "}
+          <code>mac</code> at runtime.
+        </p>
+        <For each={remoteHostsDraft()}>
+          {(host, idx) => (
+            <div class="settings-row">
+              <input
+                type="text"
+                value={host}
+                onInput={(e) => updateRemoteHost(idx(), e.currentTarget.value)}
+                placeholder="ssh alias (e.g. mac)"
+              />
+              <button
+                class="modal-btn"
+                style={{ "margin-left": "6px" }}
+                onClick={() => removeRemoteHost(idx())}
+                title="Remove this host"
+              >
+                Remove
+              </button>
+            </div>
+          )}
+        </For>
+        <div class="settings-row" style={{ "justify-content": "space-between" }}>
+          <button class="modal-btn" onClick={addRemoteHost}>
+            + Add host
+          </button>
+          <button
+            class="modal-btn primary"
+            onClick={handleSaveRemoteHosts}
+            disabled={remoteHostsSaving() || !remoteHostsDirty()}
+            title="Persist the list to the Tauri store and trigger a refresh"
+          >
+            {remoteHostsSaving() ? "Saving…" : remoteHostsDirty() ? "Save" : "Saved"}
+          </button>
+        </div>
       </div>
 
       <div class="settings-section">

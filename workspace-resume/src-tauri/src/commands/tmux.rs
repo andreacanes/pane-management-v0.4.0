@@ -469,19 +469,17 @@ pub fn pane_is_claude(current_command: &str, start_command: &str) -> bool {
 }
 
 #[tauri::command]
-pub async fn list_active_claude_panes() -> Result<Vec<ActivePane>, String> {
+pub async fn list_active_claude_panes(app: tauri::AppHandle) -> Result<Vec<ActivePane>, String> {
     use crate::services::host_target::HostTarget;
 
     // Local scan: one wsl.exe call, walk every pane via tmux list-panes -a.
     let mut result = scan_active_claude_panes_on(&HostTarget::Local, "local").await?;
 
-    // Remote scan: fan out across every host we can reach. Remote
-    // discovery is gated on either (a) the host appearing in a
-    // pane_assignment with a non-"local" host, or (b) `list_remote_hosts`
-    // (static `["mac"]` today). We union the two so a host that's
-    // configured but not yet assigned still surfaces its active Claudes.
+    // Remote scan: fan out across every configured remote host so
+    // active Claude sessions on Mac show up in the global panel without
+    // the user having to pre-assign them to a pane slot.
     let mut hosts: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
-    if let Ok(known) = crate::commands::mac_sync::list_remote_hosts().await {
+    if let Ok(known) = crate::commands::mac_sync::list_remote_hosts(app).await {
         for h in known {
             hosts.insert(h);
         }

@@ -3544,6 +3544,211 @@ div:has(> .drag-overlay-card) {
 }
 
 /* ============================================================
+   Host-aware multi-host grid — CreatePaneModal, Add Pane button,
+   host badge, and the "project not synced to Mac" warning. These
+   replaced inline styles from the host-aware refactor so they now
+   pick up `--surface` / `--border` / `--text` rhythm like the rest
+   of the UI.
+   ============================================================ */
+
+:root {
+  --host-local: #94a3b8;
+  --host-local-bg: rgba(148, 163, 184, 0.16);
+  --host-remote: #14b8a6;
+  --host-remote-bg: rgba(20, 184, 166, 0.18);
+  --warn: #fca5a5;
+  --warn-bg: rgba(239, 68, 68, 0.12);
+  --warn-border: rgba(239, 68, 68, 0.35);
+  --warn-btn-bg: rgba(239, 68, 68, 0.22);
+  --warn-btn-border: rgba(239, 68, 68, 0.5);
+  --warn-btn-text: #fecaca;
+  --ok-dot: #22c55e;
+  --off-dot: #f59e0b;
+}
+
+/* Host badge — shown on every occupied pane slot. Local = gray so
+   it blends; remote = teal to make Mac slots pop. */
+.host-badge {
+  padding: 1px 6px;
+  border-radius: 999px;
+  font-size: 10px;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+}
+.host-badge--local {
+  background: var(--host-local-bg);
+  color: var(--host-local);
+}
+.host-badge--remote {
+  background: var(--host-remote-bg);
+  color: var(--host-remote);
+}
+.host-badge-dot {
+  display: inline-block;
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+}
+.host-badge-dot--live {
+  background: var(--ok-dot);
+  box-shadow: 0 0 4px rgba(34, 197, 94, 0.6);
+}
+.host-badge-dot--dead {
+  background: var(--off-dot);
+  box-shadow: 0 0 4px rgba(245, 158, 11, 0.6);
+}
+
+/* Host/account dropdown row on an occupied pane slot. */
+.pane-slot-host-account {
+  display: flex;
+  gap: 6px;
+  margin-top: 4px;
+  font-size: 11px;
+}
+.pane-slot-host-account select {
+  background: var(--surface);
+  color: var(--text);
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  padding: 2px 4px;
+}
+
+/* "Project not synced to Mac" inline warning with a Sync-now CTA.
+   Appears below the host row only when a Mac slot is assigned to a
+   project that isn't mirrored to ~/projects/<name> yet. */
+.pane-slot-mac-warn {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  margin-top: 4px;
+  padding: 4px 6px;
+  background: var(--warn-bg);
+  border: 1px solid var(--warn-border);
+  border-radius: 4px;
+  font-size: 10px;
+  color: var(--warn);
+}
+.pane-slot-mac-warn__cta {
+  margin-left: auto;
+  background: var(--warn-btn-bg);
+  border: 1px solid var(--warn-btn-border);
+  color: var(--warn-btn-text);
+  border-radius: 3px;
+  padding: 1px 6px;
+  font-size: 10px;
+  cursor: pointer;
+}
+.pane-slot-mac-warn__cta:disabled {
+  cursor: default;
+  opacity: 0.6;
+}
+
+/* "Add Pane" button above the grid. */
+.pane-grid-toolbar {
+  display: flex;
+  justify-content: flex-end;
+  padding: 4px 6px;
+  gap: 6px;
+}
+.pane-grid-toolbar__button {
+  background: var(--surface);
+  color: var(--text);
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  padding: 3px 8px;
+  font-size: 11px;
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  cursor: pointer;
+}
+.pane-grid-toolbar__button:hover {
+  border-color: var(--accent);
+  color: var(--accent-light);
+}
+
+/* CreatePaneModal — picker for host + session + project + account. */
+.create-pane-modal {
+  background: #111113;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 16px;
+  width: 380px;
+  max-width: 90vw;
+  color: var(--text);
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+}
+.create-pane-modal__title {
+  font-size: 14px;
+  font-weight: 600;
+}
+.create-pane-modal__row {
+  display: flex;
+  gap: 8px;
+  align-items: center;
+}
+.create-pane-modal__row--stacked {
+  align-items: flex-start;
+}
+.create-pane-modal__label {
+  min-width: 72px;
+  font-size: 12px;
+}
+.create-pane-modal__label--stacked {
+  margin-top: 2px;
+}
+.create-pane-modal__input,
+.create-pane-modal__select {
+  background: var(--surface);
+  color: var(--text);
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  padding: 4px 6px;
+  flex: 1;
+}
+.create-pane-modal__radio-row {
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+.create-pane-modal__radio-option {
+  display: flex;
+  gap: 6px;
+  align-items: center;
+  font-size: 12px;
+}
+.create-pane-modal__radio-option select,
+.create-pane-modal__radio-option input[type="text"] {
+  flex: 1;
+  background: var(--surface);
+  color: var(--text);
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  padding: 2px 6px;
+}
+.create-pane-modal__error {
+  color: var(--warn);
+  background: var(--warn-bg);
+  border: 1px solid var(--warn-border);
+  border-radius: 4px;
+  padding: 6px 8px;
+  font-size: 11px;
+}
+.create-pane-modal__actions {
+  display: flex;
+  gap: 8px;
+  justify-content: flex-end;
+  margin-top: 4px;
+}
+
+/* ============================================================
    Utility
    ============================================================ */
 

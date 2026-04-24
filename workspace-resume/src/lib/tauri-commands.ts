@@ -123,9 +123,12 @@ export async function listTmuxPanes(sessionName: string, windowIndex: number): P
   return invoke("list_tmux_panes", { sessionName, windowIndex });
 }
 
-/** Host-aware per-window pane list. For the grid's remote-host rows,
- *  callers typically prefer `listTmuxPanesAllOn(host)` since remote
- *  sessions + windows aren't usually pre-selected in the UI. */
+/** Host-aware per-window pane list. The grid uses `listTmuxPanesAllOn`
+ *  for remote refresh (single SSH round-trip covers every session);
+ *  this variant is kept for any future caller that needs to refresh a
+ *  *specific* remote session+window without fetching the whole host —
+ *  e.g. a focused "show this window" drill-down. The Rust side is
+ *  registered unconditionally so the wire is always available. */
 export async function listTmuxPanesOn(host: string, sessionName: string, windowIndex: number): Promise<TmuxPane[]> {
   return invoke("list_tmux_panes_on", { host, sessionName, windowIndex });
 }
@@ -394,9 +397,27 @@ export async function syncProjectToMac(encodedProject: string): Promise<string> 
   return invoke("sync_project_to_mac", { encodedProject });
 }
 
-/** SSH aliases of currently-supported remote hosts (static ["mac"] for MVP). */
+/** SSH aliases of currently-supported remote hosts. Backed by the
+ *  `remote_hosts` Tauri store key; defaults to ["mac"] when empty.
+ *  Consumers (AppContext, host pickers) should treat this as the
+ *  live list — edit via Settings > Remote hosts. */
 export async function listRemoteHosts(): Promise<string[]> {
   return invoke("list_remote_hosts");
+}
+
+/** Raw getter for the persisted `remote_hosts` list. Unlike
+ *  `listRemoteHosts`, returns an empty array verbatim — the Settings
+ *  UI uses this so "no hosts configured" is distinguishable from
+ *  "defaulted to mac". */
+export async function getRemoteHosts(): Promise<string[]> {
+  return invoke("get_remote_hosts");
+}
+
+/** Persist a new list of SSH aliases. Validation (non-empty, no
+ *  `/` or `|`, not `"local"`) happens backend-side; returns the
+ *  normalized list actually saved (de-duplicated, trimmed). */
+export async function setRemoteHosts(hosts: string[]): Promise<string[]> {
+  return invoke("set_remote_hosts", { hosts });
 }
 
 /** Does `path` exist as a directory on `host`? Used by PaneSlot to gate

@@ -80,22 +80,11 @@ export function PaneGrid() {
         </div>
       }
     >
-      <div style={{ "display": "flex", "justify-content": "flex-end", "padding": "4px 6px", "gap": "6px" }}>
+      <div class="pane-grid-toolbar">
         <button
+          class="pane-grid-toolbar__button"
           onClick={() => setCreateOpen(true)}
           title="Create a new tmux pane on WSL or the Mac"
-          style={{
-            "background": "var(--surface-2, #1f1f23)",
-            "color": "var(--text, #d4d4d4)",
-            "border": "1px solid var(--border, #2d2d33)",
-            "border-radius": "4px",
-            "padding": "3px 8px",
-            "font-size": "11px",
-            "display": "inline-flex",
-            "align-items": "center",
-            "gap": "4px",
-            "cursor": "pointer",
-          }}
         >
           <Plus size={12} /> Add Pane
         </button>

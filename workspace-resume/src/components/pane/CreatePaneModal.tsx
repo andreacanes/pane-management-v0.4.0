@@ -209,47 +209,25 @@ export function CreatePaneModal(props: {
           props.onClose();
         }}
       >
-        <div
-          class="create-pane-modal"
-          onClick={(e) => e.stopPropagation()}
-          style={{
-            "background": "var(--surface-1, #111113)",
-            "border": "1px solid var(--border, #2d2d33)",
-            "border-radius": "8px",
-            "padding": "16px",
-            "width": "360px",
-            "max-width": "90vw",
-            "color": "var(--text, #d4d4d4)",
-            "display": "flex",
-            "flex-direction": "column",
-            "gap": "12px",
-          }}
-        >
-          <div style={{ "font-size": "14px", "font-weight": "600" }}>Add Pane</div>
+        <div class="create-pane-modal" onClick={(e) => e.stopPropagation()}>
+          <div class="create-pane-modal__title">Add Pane</div>
 
-          <label style={{ "display": "flex", "gap": "8px", "align-items": "center" }}>
-            <span style={{ "min-width": "72px", "font-size": "12px" }}>Host</span>
+          <label class="create-pane-modal__row">
+            <span class="create-pane-modal__label">Host</span>
             <select
+              class="create-pane-modal__select"
               value={host()}
               onChange={(e) => setHost(e.currentTarget.value)}
-              style={{
-                "flex": "1",
-                "background": "var(--surface-2, #1f1f23)",
-                "color": "var(--text, #d4d4d4)",
-                "border": "1px solid var(--border, #2d2d33)",
-                "border-radius": "4px",
-                "padding": "4px 6px",
-              }}
             >
               <option value="local">WSL (local)</option>
               <option value="mac">Mac</option>
             </select>
           </label>
 
-          <div style={{ "display": "flex", "gap": "8px", "align-items": "flex-start" }}>
-            <span style={{ "min-width": "72px", "font-size": "12px", "margin-top": "2px" }}>Session</span>
-            <div style={{ "flex": "1", "display": "flex", "flex-direction": "column", "gap": "4px" }}>
-              <label style={{ "display": "flex", "gap": "6px", "align-items": "center", "font-size": "12px" }}>
+          <div class="create-pane-modal__row create-pane-modal__row--stacked">
+            <span class="create-pane-modal__label create-pane-modal__label--stacked">Session</span>
+            <div class="create-pane-modal__radio-row">
+              <label class="create-pane-modal__radio-option">
                 <input
                   type="radio"
                   name="session-mode"
@@ -263,14 +241,6 @@ export function CreatePaneModal(props: {
                   value={selectedSession()}
                   onChange={(e) => setSelectedSession(e.currentTarget.value)}
                   disabled={mode() !== "existing" || existingSessions().length === 0}
-                  style={{
-                    "flex": "1",
-                    "background": "var(--surface-2, #1f1f23)",
-                    "color": "var(--text, #d4d4d4)",
-                    "border": "1px solid var(--border, #2d2d33)",
-                    "border-radius": "4px",
-                    "padding": "2px 4px",
-                  }}
                 >
                   <For each={existingSessions()}>
                     {(s) => <option value={s.name}>{s.name}</option>}
@@ -281,7 +251,7 @@ export function CreatePaneModal(props: {
                 </select>
               </label>
 
-              <label style={{ "display": "flex", "gap": "6px", "align-items": "center", "font-size": "12px" }}>
+              <label class="create-pane-modal__radio-option">
                 <input
                   type="radio"
                   name="session-mode"
@@ -296,33 +266,18 @@ export function CreatePaneModal(props: {
                   onInput={(e) => setNewSessionName(e.currentTarget.value)}
                   disabled={mode() !== "new"}
                   placeholder="session name"
-                  style={{
-                    "flex": "1",
-                    "background": "var(--surface-2, #1f1f23)",
-                    "color": "var(--text, #d4d4d4)",
-                    "border": "1px solid var(--border, #2d2d33)",
-                    "border-radius": "4px",
-                    "padding": "2px 6px",
-                  }}
                 />
               </label>
             </div>
           </div>
 
           <Show when={mode() === "existing"}>
-            <label style={{ "display": "flex", "gap": "8px", "align-items": "center" }}>
-              <span style={{ "min-width": "72px", "font-size": "12px" }}>Split</span>
+            <label class="create-pane-modal__row">
+              <span class="create-pane-modal__label">Split</span>
               <select
+                class="create-pane-modal__select"
                 value={direction()}
                 onChange={(e) => setDirection(e.currentTarget.value as "h" | "v")}
-                style={{
-                  "flex": "1",
-                  "background": "var(--surface-2, #1f1f23)",
-                  "color": "var(--text, #d4d4d4)",
-                  "border": "1px solid var(--border, #2d2d33)",
-                  "border-radius": "4px",
-                  "padding": "4px 6px",
-                }}
               >
                 <option value="h">Horizontal (side by side)</option>
                 <option value="v">Vertical (top / bottom)</option>
@@ -336,20 +291,13 @@ export function CreatePaneModal(props: {
               chosen account's config dir). Leaving Project empty falls
               back to a bare shell the user can drag a project onto later. */}
           <Show when={mode() === "new" && host() !== "local"}>
-            <label style={{ "display": "flex", "gap": "8px", "align-items": "center" }}>
-              <span style={{ "min-width": "72px", "font-size": "12px" }}>Project</span>
+            <label class="create-pane-modal__row">
+              <span class="create-pane-modal__label">Project</span>
               <select
+                class="create-pane-modal__select"
                 value={projectEncoded()}
                 onChange={(e) => setProjectEncoded(e.currentTarget.value)}
                 title="Pick a project to cd+mncld into, or leave empty for a bare shell"
-                style={{
-                  "flex": "1",
-                  "background": "var(--surface-2, #1f1f23)",
-                  "color": "var(--text, #d4d4d4)",
-                  "border": "1px solid var(--border, #2d2d33)",
-                  "border-radius": "4px",
-                  "padding": "4px 6px",
-                }}
               >
                 <option value="">(none — bare shell)</option>
                 <For each={sortedProjects()}>
@@ -364,20 +312,13 @@ export function CreatePaneModal(props: {
               </select>
             </label>
             <Show when={projectEncoded() !== ""}>
-              <label style={{ "display": "flex", "gap": "8px", "align-items": "center" }}>
-                <span style={{ "min-width": "72px", "font-size": "12px" }}>Account</span>
+              <label class="create-pane-modal__row">
+                <span class="create-pane-modal__label">Account</span>
                 <select
+                  class="create-pane-modal__select"
                   value={account()}
                   onChange={(e) => setAccount(e.currentTarget.value)}
                   title="Claude account mncld runs under in the new session"
-                  style={{
-                    "flex": "1",
-                    "background": "var(--surface-2, #1f1f23)",
-                    "color": "var(--text, #d4d4d4)",
-                    "border": "1px solid var(--border, #2d2d33)",
-                    "border-radius": "4px",
-                    "padding": "4px 6px",
-                  }}
                 >
                   <option value="andrea">Andrea</option>
                   <option value="bravura">Bravura</option>
@@ -388,33 +329,14 @@ export function CreatePaneModal(props: {
           </Show>
 
           <Show when={error()}>
-            <div
-              style={{
-                "color": "#fca5a5",
-                "background": "rgba(239, 68, 68, 0.1)",
-                "border": "1px solid rgba(239, 68, 68, 0.35)",
-                "border-radius": "4px",
-                "padding": "6px 8px",
-                "font-size": "11px",
-              }}
-            >
-              {error()}
-            </div>
+            <div class="create-pane-modal__error">{error()}</div>
           </Show>
 
-          <div style={{ "display": "flex", "gap": "8px", "justify-content": "flex-end", "margin-top": "4px" }}>
-            <button
-              class="modal-btn"
-              onClick={props.onClose}
-              disabled={busy()}
-            >
+          <div class="create-pane-modal__actions">
+            <button class="modal-btn" onClick={props.onClose} disabled={busy()}>
               Cancel
             </button>
-            <button
-              class="modal-btn primary"
-              onClick={handleCreate}
-              disabled={busy()}
-            >
+            <button class="modal-btn primary" onClick={handleCreate} disabled={busy()}>
               {busy() ? "Creating…" : "Create"}
             </button>
           </div>

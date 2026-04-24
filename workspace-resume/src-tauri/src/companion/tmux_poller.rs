@@ -499,22 +499,38 @@ async fn sweep_stale_assignments(
 /// [`AppState`]; cheap enough to call every 1s tick (store is in-memory
 /// after first load, serde-deserializes a small HashMap).
 async fn discover_remote_hosts(state: &AppState) -> HashSet<String> {
-    let full = match crate::commands::project_meta::get_pane_assignments_full_sync(&state.app) {
-        Ok(m) => m,
-        Err(e) => {
-            tracing::debug!("pane_assignments read failed during remote discovery: {e}");
-            return HashSet::new();
-        }
-    };
-    full.values()
-        .filter_map(|a| {
-            if a.host.is_empty() || a.host == "local" {
-                None
-            } else {
-                Some(a.host.clone())
+    let mut out: HashSet<String> = HashSet::new();
+
+    // Union 1: every alias referenced by a pane_assignment. Covers the
+    // "user explicitly assigned this slot to Mac" case.
+    if let Ok(full) =
+        crate::commands::project_meta::get_pane_assignments_full_sync(&state.app)
+    {
+        for a in full.values() {
+            if !a.host.is_empty() && a.host != "local" {
+                out.insert(a.host.clone());
             }
-        })
-        .collect()
+        }
+    }
+
+    // Union 2: every alias from the persistent `remote_hosts` list the
+    // user curated in Settings. Covers "I have a Mac and I want to see
+    // its panes even before I've assigned anything" — matches the
+    // desktop frontend's behaviour (loadRemotePanes iterates the same
+    // list). Without this union the APK's /panes endpoint stays blind
+    // to Mac until a first Mac assignment exists, which was a real gap
+    // between the desktop and mobile views.
+    if let Ok(configured) =
+        crate::commands::mac_sync::list_remote_hosts(state.app.clone()).await
+    {
+        for alias in configured {
+            if !alias.is_empty() && alias != "local" {
+                out.insert(alias);
+            }
+        }
+    }
+
+    out
 }
 
 /// Build a lookup from `"<session>|<window>|<pane>"` → configured

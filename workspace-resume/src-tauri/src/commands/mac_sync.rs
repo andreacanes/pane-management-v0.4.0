@@ -36,15 +36,62 @@ pub async fn sync_project_to_mac(encoded_project: String) -> Result<String, Stri
     .await
 }
 
-/// Return the SSH aliases of currently-supported remote hosts. MVP
-/// returns a static `["mac"]`; future work will read this from user
-/// settings so additional hosts (a Linux box, a second Mac) can be
-/// added without a code change.
+/// Return the SSH aliases of currently-supported remote hosts. Reads
+/// from the Tauri store key `remote_hosts` so the user can add / remove
+/// hosts via the Settings panel. Defaults to `["mac"]` when the key is
+/// absent (first-run) or malformed — guarantees a Mac-ready baseline
+/// without a Settings visit.
 #[tauri::command]
-pub async fn list_remote_hosts() -> Result<Vec<String>, String> {
-    // TODO(follow-up): read from a `remote_hosts` Tauri store key so
-    // users can register additional SSH aliases without rebuilding.
-    Ok(vec!["mac".to_string()])
+pub async fn list_remote_hosts(app: tauri::AppHandle) -> Result<Vec<String>, String> {
+    let hosts = get_remote_hosts(app).await?;
+    if hosts.is_empty() {
+        Ok(vec!["mac".to_string()])
+    } else {
+        Ok(hosts)
+    }
+}
+
+/// Raw accessor: read the persisted `remote_hosts` array from the
+/// Tauri store. Unlike [`list_remote_hosts`] this returns whatever is
+/// stored — including an empty list — so the Settings UI can render
+/// "no hosts configured" without the [`list_remote_hosts`] default
+/// papering over it.
+#[tauri::command]
+pub async fn get_remote_hosts(app: tauri::AppHandle) -> Result<Vec<String>, String> {
+    crate::services::store::load_store_or_default::<Vec<String>>(&app, "remote_hosts")
+}
+
+/// Persist `hosts` to the Tauri store's `remote_hosts` key. Each entry
+/// must be a non-empty SSH alias (no `/` or `|`) — those separators are
+/// reserved by the 4-segment pane_assignment key format. Returns the
+/// normalized list actually persisted (de-duplicated, trimmed).
+#[tauri::command]
+pub async fn set_remote_hosts(
+    hosts: Vec<String>,
+    app: tauri::AppHandle,
+) -> Result<Vec<String>, String> {
+    let mut seen = std::collections::BTreeSet::new();
+    let mut out: Vec<String> = Vec::new();
+    for raw in hosts {
+        let trimmed = raw.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        if trimmed.contains('/') || trimmed.contains('|') {
+            return Err(format!(
+                "host alias '{}' contains reserved separator (/ or |) — use a clean SSH alias",
+                trimmed
+            ));
+        }
+        if trimmed == "local" {
+            return Err("'local' is reserved for the WSL side and cannot be a remote alias".into());
+        }
+        if seen.insert(trimmed.to_string()) {
+            out.push(trimmed.to_string());
+        }
+    }
+    crate::services::store::save_store(&app, "remote_hosts", &out)?;
+    Ok(out)
 }
 
 /// Start a new detached tmux session on a remote host, targeting a

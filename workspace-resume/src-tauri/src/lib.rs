@@ -29,6 +29,8 @@ pub fn run() {
             commands::launcher::build_launch_command,
             commands::mac_sync::sync_project_to_mac,
             commands::mac_sync::list_remote_hosts,
+            commands::mac_sync::get_remote_hosts,
+            commands::mac_sync::set_remote_hosts,
             commands::mac_sync::check_remote_path_exists,
             commands::mac_sync::check_ssh_master,
             commands::mac_sync::launch_project_session_on,

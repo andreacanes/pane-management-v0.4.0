@@ -374,7 +374,7 @@ export function PaneSlot(props: { pane: TmuxPane; assignment?: string | null }) 
           <div class="pane-slot-primary">
             <span class="pane-slot-title">{projectName()}</span>
             <span
-              class="pane-slot-host-badge"
+              class={`host-badge ${paneHost() === "local" ? "host-badge--local" : "host-badge--remote"}`}
               title={(() => {
                 const base = paneHost() === "local"
                   ? `Pane runs on this WSL tmux (${paneSession()}:${paneWindow()}.${paneIndex()})`
@@ -385,35 +385,11 @@ export function PaneSlot(props: { pane: TmuxPane; assignment?: string | null }) 
                 if (live === false) return `${base} — SSH master dead (next call will be slow)`;
                 return base;
               })()}
-              style={{
-                "background": paneHost() === "local"
-                  ? "rgba(148, 163, 184, 0.16)"
-                  : "rgba(20, 184, 166, 0.18)",
-                "color": paneHost() === "local" ? "#94a3b8" : "#14b8a6",
-                "padding": "1px 6px",
-                "border-radius": "999px",
-                "font-size": "10px",
-                "font-weight": "600",
-                "text-transform": "uppercase",
-                "letter-spacing": "0.04em",
-                "display": "inline-flex",
-                "align-items": "center",
-                "gap": "4px",
-              }}
             >
               <Show when={paneHost() !== "local" && sshLive() !== null}>
                 <span
                   aria-hidden
-                  style={{
-                    "display": "inline-block",
-                    "width": "6px",
-                    "height": "6px",
-                    "border-radius": "50%",
-                    "background": sshLive() ? "#22c55e" : "#f59e0b",
-                    "box-shadow": sshLive()
-                      ? "0 0 4px rgba(34,197,94,0.6)"
-                      : "0 0 4px rgba(245,158,11,0.6)",
-                  }}
+                  class={`host-badge-dot ${sshLive() ? "host-badge-dot--live" : "host-badge-dot--dead"}`}
                 />
               </Show>
               {paneHost() === "local" ? "WSL" : paneHost()}
@@ -437,16 +413,7 @@ export function PaneSlot(props: { pane: TmuxPane; assignment?: string | null }) 
           </div>
 
           <Show when={hasProject()}>
-            <div
-              class="pane-slot-host-account"
-              style={{
-                "display": "flex",
-                "gap": "6px",
-                "margin-top": "4px",
-                "font-size": "11px",
-              }}
-              onClick={(e) => e.stopPropagation()}
-            >
+            <div class="pane-slot-host-account" onClick={(e) => e.stopPropagation()}>
               {/* Host is a property of the pane, not a knob — see plan's
                   Q1 option A. The badge at the top of the slot shows
                   which host this is; here we only control the Claude
@@ -455,13 +422,6 @@ export function PaneSlot(props: { pane: TmuxPane; assignment?: string | null }) 
                 value={currentAccount()}
                 onChange={(e) => handleAccountChange(e.currentTarget.value)}
                 title="Claude account for the next launch in this pane"
-                style={{
-                  "background": "var(--surface-2, #1f1f23)",
-                  "color": "var(--text, #d4d4d4)",
-                  "border": "1px solid var(--border, #2d2d33)",
-                  "border-radius": "4px",
-                  "padding": "2px 4px",
-                }}
               >
                 <option value="andrea">Andrea</option>
                 <option value="bravura">Bravura</option>
@@ -472,34 +432,13 @@ export function PaneSlot(props: { pane: TmuxPane; assignment?: string | null }) 
               <div
                 class="pane-slot-mac-warn"
                 onClick={(e) => e.stopPropagation()}
-                style={{
-                  "display": "flex",
-                  "align-items": "center",
-                  "gap": "6px",
-                  "margin-top": "4px",
-                  "padding": "4px 6px",
-                  "background": "rgba(239, 68, 68, 0.12)",
-                  "border": "1px solid rgba(239, 68, 68, 0.35)",
-                  "border-radius": "4px",
-                  "font-size": "10px",
-                  "color": "#fca5a5",
-                }}
                 title={`Project not mirrored to /Users/admin/projects/${expectedMacPath()?.split("/").pop() ?? ""} — launching Host=Mac will fail until you sync.`}
               >
                 <span>Not synced to Mac</span>
                 <button
+                  class="pane-slot-mac-warn__cta"
                   onClick={() => handleSyncToMac()}
                   disabled={syncing()}
-                  style={{
-                    "margin-left": "auto",
-                    "background": "rgba(239, 68, 68, 0.22)",
-                    "border": "1px solid rgba(239, 68, 68, 0.5)",
-                    "color": "#fecaca",
-                    "border-radius": "3px",
-                    "padding": "1px 6px",
-                    "font-size": "10px",
-                    "cursor": syncing() ? "default" : "pointer",
-                  }}
                 >
                   {syncing() ? "Syncing…" : "Sync now"}
                 </button>
