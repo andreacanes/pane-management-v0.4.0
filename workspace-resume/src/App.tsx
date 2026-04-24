@@ -28,6 +28,9 @@ function AppInner() {
   const [pendingPaneDrop, setPendingPaneDrop] = createSignal<{
     encodedProject: string;
     projectPath: string;
+    host: string;
+    session: string;
+    windowIndex: number;
     paneIndex: number;
     existingName: string;
   } | null>(null);
@@ -89,47 +92,85 @@ function AppInner() {
       return;
     }
 
-    // Project dropped onto a pane slot (numeric drop id)
-    const paneIndex = parseInt(dropId, 10);
-    if (isNaN(paneIndex)) return;
+    // Project dropped onto a pane slot. Slot drop ids are the full
+    // 4-segment coord `host|session|window|pane` after the host-aware
+    // refactor (PaneSlot.tsx::assignmentKey). Legacy numeric-only ids
+    // aren't supported anymore.
+    const parts = dropId.split("|");
+    if (parts.length !== 4) return;
+    const [dropHost, dropSession, dropWinStr, dropPaneStr] = parts;
+    const dropWindowIndex = parseInt(dropWinStr, 10);
+    const dropPaneIndex = parseInt(dropPaneStr, 10);
+    if (!dropHost || !dropSession || Number.isNaN(dropWindowIndex) || Number.isNaN(dropPaneIndex)) {
+      return;
+    }
 
     const project = state.projects.find((p) => p.encoded_name === encodedProject);
     if (!project) return;
 
-    const session = state.selectedTmuxSession;
-    const window = state.selectedTmuxWindow;
-    if (!session || window == null) return;
-
-    // Check if pane is occupied
-    const existingAssignment = state.paneAssignments[paneIndex.toString()];
-    const pane = state.tmuxPanes.find((p) => p.pane_index === paneIndex);
-    const paneHasActivity = existingAssignment || (pane && !["bash", "zsh", "sh", "-"].includes(pane.current_command));
+    // Look up the assignment + target pane using the full coord so a
+    // Local main:0.3 drop doesn't alias against a Mac main:0.3 slot.
+    const existingAssignment = state.paneAssignments[dropId];
+    const pane = state.tmuxPanes.find(
+      (p) =>
+        (p.host || "local") === dropHost &&
+        p.session_name === dropSession &&
+        p.window_index === dropWindowIndex &&
+        p.pane_index === dropPaneIndex,
+    );
+    const paneHasActivity =
+      existingAssignment ||
+      (pane && !["bash", "zsh", "sh", "-"].includes(pane.current_command));
 
     if (paneHasActivity) {
-      const existingProject = existingAssignment ? state.projects.find((p) => p.encoded_name === existingAssignment) : null;
+      const existingProject = existingAssignment
+        ? state.projects.find((p) => p.encoded_name === existingAssignment)
+        : null;
       const existingName = existingProject
-        ? (existingProject.meta.display_name || existingProject.actual_path.split(/[\\/]/).pop() || "unknown")
-        : (pane?.current_command || "active process");
-      setPendingPaneDrop({ encodedProject, projectPath: project.actual_path, paneIndex, existingName });
+        ? existingProject.meta.display_name ||
+          existingProject.actual_path.split(/[\\/]/).pop() ||
+          "unknown"
+        : pane?.current_command || "active process";
+      setPendingPaneDrop({
+        encodedProject,
+        projectPath: project.actual_path,
+        host: dropHost,
+        session: dropSession,
+        windowIndex: dropWindowIndex,
+        paneIndex: dropPaneIndex,
+        existingName,
+      });
       return;
     }
 
-    await executePaneDrop(encodedProject, project.actual_path, paneIndex);
+    await executePaneDrop(
+      encodedProject,
+      project.actual_path,
+      dropHost,
+      dropSession,
+      dropWindowIndex,
+      dropPaneIndex,
+    );
   }
 
-  async function executePaneDrop(encodedProject: string, projectPath: string, paneIndex: number) {
-    const session = state.selectedTmuxSession;
-    const window = state.selectedTmuxWindow;
-    if (!session || window == null) return;
+  async function executePaneDrop(
+    encodedProject: string,
+    projectPath: string,
+    host: string,
+    session: string,
+    windowIndex: number,
+    paneIndex: number,
+  ) {
     try {
       await assignToPane({
         tmuxSession: session,
-        tmuxWindow: window,
+        tmuxWindow: windowIndex,
         tmuxPanes: state.tmuxPanes,
         paneAssignments: state.paneAssignments,
         encodedProject,
         projectPath,
         targetPaneIndex: paneIndex,
+        host,
       });
       refreshTmuxState();
       refreshProjects();
@@ -193,7 +234,10 @@ function AppInner() {
         <div class="modal-backdrop" onClick={() => setPendingPaneDrop(null)}>
           <div class="confirm-modal" onClick={(e) => e.stopPropagation()}>
             <p class="confirm-message">
-              <strong>Pane {pendingPaneDrop()!.paneIndex}</strong> already has:
+              <strong>
+                {pendingPaneDrop()!.host === "local" ? "" : `${pendingPaneDrop()!.host} `}
+                Pane {pendingPaneDrop()!.session}:{pendingPaneDrop()!.windowIndex}.{pendingPaneDrop()!.paneIndex}
+              </strong>{" "}already has:
               <br /><em>{pendingPaneDrop()!.existingName}</em>
             </p>
             <p class="confirm-warning">Replacing it will send Ctrl+C and reassign.</p>
@@ -202,7 +246,14 @@ function AppInner() {
               <button class="modal-btn danger" onClick={async () => {
                 const drop = pendingPaneDrop()!;
                 setPendingPaneDrop(null);
-                await executePaneDrop(drop.encodedProject, drop.projectPath, drop.paneIndex);
+                await executePaneDrop(
+                  drop.encodedProject,
+                  drop.projectPath,
+                  drop.host,
+                  drop.session,
+                  drop.windowIndex,
+                  drop.paneIndex,
+                );
               }}>Replace</button>
             </div>
           </div>
