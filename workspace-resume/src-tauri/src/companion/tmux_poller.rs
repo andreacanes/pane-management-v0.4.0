@@ -1078,9 +1078,12 @@ async fn poll_once(state: &AppState) -> anyhow::Result<()> {
     // pane_width is columns — fed into avt at /capture time so line wrap
     // matches Claude's TUI and cell-diff renders without character-level
     // mixing.
+    // window_active sits between pane_width and pane_start_command so the
+    // last-field-joins-pipes rule for start_command still holds. Drives
+    // the WindowFocusChanged event further below.
     let combined = "echo '---LIST:BEGIN---'; \
         tmux list-panes -a -F \
-        '#{session_name}|#{window_index}|#{window_name}|#{pane_index}|#{pane_current_command}|#{pane_current_path}|#{pane_pid}|#{pane_pipe}|#{pane_id}|#{pane_width}|#{pane_start_command}' \
+        '#{session_name}|#{window_index}|#{window_name}|#{pane_index}|#{pane_current_command}|#{pane_current_path}|#{pane_pid}|#{pane_pipe}|#{pane_id}|#{pane_width}|#{window_active}|#{pane_start_command}' \
         2>/dev/null; \
         echo '---LIST:END---'; \
         for id in $(tmux list-panes -a -F '#{session_name}:#{window_index}.#{pane_index}' 2>/dev/null); do \
