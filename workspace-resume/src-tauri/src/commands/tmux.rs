@@ -196,16 +196,37 @@ pub async fn send_to_pane_on(
     Ok(())
 }
 
-/// Write binary data to a file on the WSL filesystem by piping through
-/// `wsl.exe -e bash -c "cat > '<path>'"`. The parent directory is created
-/// automatically. This is synchronous — call [`write_file_to_wsl_async`]
-/// from async contexts.
-pub fn write_file_to_wsl(path: &str, data: &[u8]) -> Result<(), String> {
+/// Write binary data to a file on a specific host, creating the parent
+/// directory automatically. Piped through `wsl.exe -e bash -c
+/// "cat > '<path>'"` for [`HostTarget::Local`]; wrapped in
+/// `ssh <alias> -- '...'` for [`HostTarget::Remote`] so the bytes land
+/// on the remote host's filesystem without ever materializing in WSL
+/// tmpfs. The stdin pipe survives the extra hop because plain `ssh`
+/// (no `-n`/`-T`) forwards stdin to the remote command by default —
+/// we deliberately keep both disabled so image bytes stream through
+/// the multiplex socket rather than buffering in an ad-hoc tmp file.
+///
+/// Used by the companion's `/panes/{id}/image` handler so a phone
+/// screenshot destined for a Mac pane writes to the Mac's `/tmp`, not
+/// WSL's — otherwise the subsequent `send-keys` message references a
+/// path that only exists on the wrong side of the SSH tunnel.
+pub fn write_file_to_host(
+    host: &crate::services::host_target::HostTarget,
+    path: &str,
+    data: &[u8],
+) -> Result<(), String> {
+    use crate::services::host_target::{ssh_shell_quote, HostTarget};
     let path_esc = path.replace('\'', r"'\''");
-    let script = format!(
+    let inner = format!(
         "mkdir -p \"$(dirname '{}')\" && cat > '{}'",
         path_esc, path_esc,
     );
+    let script = match host {
+        HostTarget::Local => inner,
+        HostTarget::Remote { alias } => {
+            format!("ssh {} -- {}", alias, ssh_shell_quote(&inner))
+        }
+    };
     let mut cmd = std::process::Command::new("wsl.exe");
     cmd.args(["-e", "bash", "-c", &script]);
     cmd.stdin(std::process::Stdio::piped());
@@ -235,9 +256,13 @@ pub fn write_file_to_wsl(path: &str, data: &[u8]) -> Result<(), String> {
     Ok(())
 }
 
-/// Async wrapper for [`write_file_to_wsl`].
-pub async fn write_file_to_wsl_async(path: String, data: Vec<u8>) -> Result<(), String> {
-    tokio::task::spawn_blocking(move || write_file_to_wsl(&path, &data))
+/// Async wrapper for [`write_file_to_host`].
+pub async fn write_file_to_host_async(
+    host: crate::services::host_target::HostTarget,
+    path: String,
+    data: Vec<u8>,
+) -> Result<(), String> {
+    tokio::task::spawn_blocking(move || write_file_to_host(&host, &path, &data))
         .await
         .map_err(|e| format!("join: {}", e))?
 }
@@ -373,6 +398,8 @@ pub struct ActivePane {
     pub host: String,
 }
 
+// Serde calls this by string-name reference (`#[serde(default = "...")]` on
+// `host` above), which the compiler can't see — hence the allow(dead_code).
 #[allow(dead_code)]
 fn default_active_pane_host() -> String {
     "local".to_string()
@@ -589,11 +616,25 @@ pub async fn list_tmux_sessions_on(host: String) -> Result<Vec<TmuxSession>, Str
 
 #[tauri::command]
 pub async fn list_tmux_windows(session_name: String) -> Result<Vec<TmuxWindow>, String> {
+    list_tmux_windows_on("local".to_string(), session_name).await
+}
+
+/// Host-aware tmux window list. Prerequisite for future multi-host
+/// TopBar tabs — enumerates windows on `host`'s tmux server for the
+/// given session. Returns empty when the session has no windows or the
+/// remote is unreachable (both "nothing to show" from the UI's view).
+#[tauri::command]
+pub async fn list_tmux_windows_on(
+    host: String,
+    session_name: String,
+) -> Result<Vec<TmuxWindow>, String> {
+    use crate::services::host_target::HostTarget;
+    let host_t = HostTarget::from_str(Some(&host));
     let script = format!(
         "tmux list-windows -t '{}' -F '#{{window_index}}|#{{window_name}}|#{{window_panes}}|#{{window_active}}' 2>/dev/null",
         session_name
     );
-    let output = run_tmux_command_async(script).await?;
+    let output = run_tmux_command_async_on(host_t, script).await?;
     if output.is_empty() {
         return Ok(vec![]);
     }
@@ -1335,6 +1376,27 @@ pub async fn reduce_pane_grid(
 pub async fn check_pane_statuses(
     session_name: String,
 ) -> Result<HashMap<String, WindowPaneStatus>, String> {
+    check_pane_statuses_on("local".to_string(), session_name).await
+}
+
+/// Host-aware variant of [`check_pane_statuses`]. Runs the same batched
+/// list-panes + capture-pane pipeline against an arbitrary tmux server
+/// so the frontend's waiting-approval dot (amber on window tabs, pane
+/// slots, and pinned pills) reflects Mac Claudes too. Called per
+/// distinct `(host, session)` pair by `AppContext.pollPaneStatuses`
+/// every 1.5 s.
+///
+/// The returned map is keyed by window index as a string. Callers that
+/// mix results across hosts/sessions should namespace with the pair
+/// themselves — this command is host-scoped on the way in but the tmux
+/// format string produces bare window indices on the way out.
+#[tauri::command]
+pub async fn check_pane_statuses_on(
+    host: String,
+    session_name: String,
+) -> Result<HashMap<String, WindowPaneStatus>, String> {
+    use crate::services::host_target::HostTarget;
+    let host_t = HostTarget::from_str(Some(&host));
     // Single batched script:
     // 1. List all panes across all windows with their commands (-s flag)
     // 2. For panes running claude, capture last 10 lines and check for approval prompts
@@ -1344,7 +1406,7 @@ pub async fn check_pane_statuses(
             "tmux list-panes -s -t '{sess}' -F '#{{window_index}}|#{{pane_index}}|#{{pane_current_command}}|#{{pane_current_path}}|#{{pane_start_command}}' 2>/dev/null; ",
             "echo '---CAPTURES---'; ",
             "tmux list-panes -s -t '{sess}' -F '#{{window_index}}|#{{pane_index}}|#{{pane_current_command}}|#{{pane_start_command}}' 2>/dev/null | while IFS='|' read -r win idx cmd scmd; do ",
-            "  case \"$cmd$scmd\" in *[Cc]laude*|*node*) ",
+            "  case \"$cmd$scmd\" in *[Cc]laude*|*cld*|*node*) ",
             "    echo \"===W${{win}}P${{idx}}===\"; ",
             "    tmux capture-pane -t '{sess}:'\"$win\".\"$idx\" -p -S -10 2>/dev/null || true; ",
             "    ;; esac; ",
@@ -1354,7 +1416,7 @@ pub async fn check_pane_statuses(
         sess = session_name
     );
 
-    let output = run_tmux_command_async(script).await?;
+    let output = run_tmux_command_async_on(host_t, script).await?;
     if output.is_empty() {
         return Ok(HashMap::new());
     }
@@ -1479,6 +1541,101 @@ fn is_approval_prompt(lines: &[String]) -> bool {
         }
     }
     false
+}
+
+/// Create (or select) a local WSL tmux window that SSH-attaches to
+/// `session_name` on `alias`'s remote tmux server. This is the glue
+/// between "a Mac session exists" and "I can see its terminal from my
+/// WezTerm" — tmux servers are per-host, so without an explicit `ssh
+/// -t <host> tmux attach-session -t <name>` there is no way for a
+/// local client to view a remote pane's live output.
+///
+/// Idempotent: looks for an existing local window named
+/// `<alias>/<session_name>` in the target local session; if found,
+/// `select-window`s to it instead of duplicating. Picks the local
+/// session in this order:
+///   1. The currently attached session (what WezTerm is showing).
+///   2. `main`, creating it detached if absent.
+///
+/// Used by:
+///   - The companion's `/api/v1/launch-host-session` handler, which
+///     fires this as a side-effect after creating a Mac session so
+///     phone-initiated launches also get a local-tmux view.
+///   - The desktop PaneSlot's "Attach here" button on remote panes,
+///     which calls it explicitly when the user wants to pick up a
+///     Mac session that has no local mirror yet.
+///
+/// `ssh -t` is required so the *remote* ssh command (`tmux attach-session`)
+/// gets a pseudo-TTY on the Mac side; otherwise tmux errors with
+/// "open terminal failed: not a terminal" and the ssh process exits
+/// immediately, killing the local window.
+#[tauri::command]
+pub async fn attach_remote_session(
+    alias: String,
+    session_name: String,
+) -> Result<(), String> {
+    if alias.is_empty() || alias == "local" {
+        return Err("attach_remote_session requires a non-local host alias".into());
+    }
+    if session_name.is_empty() {
+        return Err("session_name is required".into());
+    }
+
+    // Pick the local session to host the attach window. An attached
+    // session is the one WezTerm is currently showing; using it means
+    // the user sees the new window immediately. Fall back to `main`
+    // (create detached if absent) so the window lands somewhere sane
+    // even when no client is attached.
+    let attached_probe =
+        "tmux list-sessions -F '#{session_name}|#{?session_attached,1,0}' 2>/dev/null \
+         | awk -F'|' '$2==\"1\"{print $1; exit}'";
+    let attached = run_tmux_command_async(attached_probe.to_string()).await?;
+    let local_session = if !attached.trim().is_empty() {
+        attached.trim().to_string()
+    } else {
+        run_tmux_command_async(
+            "tmux has-session -t main 2>/dev/null || tmux new-session -d -s main".to_string(),
+        )
+        .await?;
+        "main".to_string()
+    };
+
+    // Window-name convention makes the window instantly identifiable in
+    // the WezTerm tab bar as "this is a remote tmux mirror, not a local
+    // shell". Also drives the idempotency check — re-clicking the
+    // Attach button re-selects instead of spawning a duplicate.
+    let window_name = format!("{}/{}", alias, session_name);
+    let sess_esc = local_session.replace('\'', r"'\''");
+    let name_esc = window_name.replace('\'', r"'\''");
+    let alias_esc = alias.replace('\'', r"'\''");
+    let rsess_esc = session_name.replace('\'', r"'\''");
+
+    let find_existing = format!(
+        "tmux list-windows -t '{}' -F '#{{window_index}}|#{{window_name}}' 2>/dev/null \
+         | awk -F'|' -v n='{}' '$2==n{{print $1; exit}}'",
+        sess_esc, name_esc,
+    );
+    let existing = run_tmux_command_async(find_existing).await?;
+    if !existing.trim().is_empty() {
+        let idx = existing.trim().to_string();
+        let idx_esc = idx.replace('\'', r"'\''");
+        run_tmux_command_async(format!(
+            "tmux select-window -t '{}':{}",
+            sess_esc, idx_esc
+        ))
+        .await?;
+        return Ok(());
+    }
+
+    // Spawn the ssh-attach as the window's command. When the nested
+    // tmux detaches (or the Mac session ends), ssh exits and the
+    // window closes — clean lifecycle, nothing leaks.
+    let script = format!(
+        "tmux new-window -t '{}' -n '{}' 'ssh -t {} tmux attach-session -t {}'",
+        sess_esc, name_esc, alias_esc, rsess_esc,
+    );
+    run_tmux_command_async(script).await?;
+    Ok(())
 }
 
 #[tauri::command]

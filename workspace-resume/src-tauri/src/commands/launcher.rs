@@ -9,7 +9,7 @@ use crate::services::store::{load_store_or_default, save_store};
 pub async fn get_terminal_settings(
     app: tauri::AppHandle,
 ) -> Result<TerminalSettings, String> {
-    load_terminal_settings(&app)
+    load_store_or_default(&app, "terminal_settings")
 }
 
 #[tauri::command]
@@ -30,7 +30,7 @@ pub async fn update_tmux_session_name(
         tmux_session_name: trimmed,
     };
 
-    save_terminal_settings(&app, &settings)?;
+    save_store(&app, "terminal_settings", &settings)?;
     Ok(settings)
 }
 
@@ -38,40 +38,14 @@ pub async fn update_tmux_session_name(
 pub async fn get_error_log(
     app: tauri::AppHandle,
 ) -> Result<Vec<ErrorLogEntry>, String> {
-    load_error_log(&app)
+    load_store_or_default(&app, "error_log")
 }
 
 #[tauri::command]
 pub async fn clear_error_log(
     app: tauri::AppHandle,
 ) -> Result<(), String> {
-    save_error_log(&app, &Vec::<ErrorLogEntry>::new())
-}
-
-// ---------------------
-// Store helpers
-// ---------------------
-
-fn load_terminal_settings(app: &tauri::AppHandle) -> Result<TerminalSettings, String> {
-    load_store_or_default(app, "terminal_settings")
-}
-
-fn save_terminal_settings(
-    app: &tauri::AppHandle,
-    settings: &TerminalSettings,
-) -> Result<(), String> {
-    save_store(app, "terminal_settings", settings)
-}
-
-fn load_error_log(app: &tauri::AppHandle) -> Result<Vec<ErrorLogEntry>, String> {
-    load_store_or_default(app, "error_log")
-}
-
-fn save_error_log(
-    app: &tauri::AppHandle,
-    log: &Vec<ErrorLogEntry>,
-) -> Result<(), String> {
-    save_store(app, "error_log", log)
+    save_store(&app, "error_log", &Vec::<ErrorLogEntry>::new())
 }
 
 // ---------------------

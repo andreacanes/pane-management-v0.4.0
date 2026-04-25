@@ -15,10 +15,12 @@ use super::{
     error::AppError,
     hook_sink,
     models::{
-        now_ms, AccountRateLimit, ApprovalDto, ApprovalResponse, CaptureResponse,
-        ConversationMessage, ConversationResponse, CreatePaneRequest, CreatePaneResponse,
-        CreateWindowRequest, CreateWindowResponse, ForkPaneRequest, HealthDto, ImageRequest,
-        InputRequest, KeyRequest, PaneDto, ProjectDto, SessionDto, VoiceRequest,
+        now_ms, AccountRateLimit, ApprovalDto, ApprovalResponse, AttachRemoteSessionRequest,
+        AttachRemoteSessionResponse, CaptureResponse, ConversationMessage, ConversationResponse,
+        CreatePaneRequest, CreatePaneResponse, CreateWindowRequest, CreateWindowResponse,
+        ForkPaneRequest, HealthDto, ImageRequest, InputRequest, KeyRequest,
+        LaunchHostSessionRequest, LaunchHostSessionResponse, PaneDto, ProjectDto,
+        RemoteHostsResponse, SessionDto, SyncProjectRequest, SyncProjectResponse, VoiceRequest,
     },
     ntfy_server, pane_log,
     state::AppState,
@@ -46,6 +48,10 @@ pub fn router(state: AppState) -> Router {
         .route("/projects", get(list_projects))
         .route("/windows", post(create_window))
         .route("/windows/{session}/{index}", delete(kill_window))
+        .route("/launch-host-session", post(launch_host_session))
+        .route("/sync-project-to-mac", post(sync_project_to_mac))
+        .route("/attach-remote-session", post(attach_remote_session))
+        .route("/remote-hosts", get(list_remote_hosts))
         .route("/panes/{id}", delete(kill_pane))
         .route("/rate-limits", get(rate_limits))
         .route("/audit", get(audit_log))
@@ -119,7 +125,7 @@ async fn list_sessions(State(state): State<AppState>) -> Result<Json<Vec<Session
     // failures degrade gracefully — a reachable Mac contributes its
     // sessions; an unreachable one logs and drops out without failing
     // the whole response.
-    let remote_hosts = collect_remote_hosts(&state);
+    let remote_hosts = crate::services::remote_hosts::collect_remote_hosts(&state.app);
     for alias in remote_hosts {
         match crate::commands::tmux::run_tmux_command_async_on(
             HostTarget::Remote { alias: alias.clone() },
@@ -191,28 +197,6 @@ fn parse_session_list(out: &str, alias: Option<&str>) -> Vec<SessionDto> {
             })
         })
         .collect()
-}
-
-/// Enumerate distinct non-local SSH aliases currently referenced by any
-/// pane assignment. Matches the poller's `discover_remote_hosts` — kept
-/// inline here rather than imported to avoid a cross-module cycle
-/// (poller is private within the companion).
-fn collect_remote_hosts(state: &AppState) -> Vec<String> {
-    let full = match crate::commands::project_meta::get_pane_assignments_full_sync(&state.app) {
-        Ok(m) => m,
-        Err(e) => {
-            tracing::debug!("pane_assignments read failed for list_sessions: {e}");
-            return Vec::new();
-        }
-    };
-    let mut seen = std::collections::HashSet::new();
-    let mut out = Vec::new();
-    for a in full.values() {
-        if !a.host.is_empty() && a.host != "local" && seen.insert(a.host.clone()) {
-            out.push(a.host.clone());
-        }
-    }
-    out
 }
 
 #[derive(Debug, Deserialize)]
@@ -932,10 +916,18 @@ async fn send_image(
         return Err(AppError::BadRequest("no images provided".into()));
     }
 
+    // Route writes to the pane's actual host. Local panes land in WSL
+    // /tmp (unchanged pre-refactor behaviour); remote panes land in the
+    // remote host's /tmp so the `send_text_to_pane` message below
+    // references a file Claude can actually `Read` on its own
+    // filesystem. The path string is host-invariant because both WSL
+    // Ubuntu and macOS ship a world-writable /tmp by default.
+    let (img_host, _) = split_pane_id_host(&id);
+
     // Decode + write each image. Timestamp + index produces unique filenames
     // so multiple attachments in one request don't collide.
     let base_ts = chrono::Utc::now().timestamp_millis();
-    let mut wsl_paths: Vec<String> = Vec::with_capacity(req.images.len());
+    let mut img_paths: Vec<String> = Vec::with_capacity(req.images.len());
     for (idx, item) in req.images.iter().enumerate() {
         let bytes = base64::engine::general_purpose::STANDARD
             .decode(&item.image_base64)
@@ -946,25 +938,29 @@ async fn send_image(
             "image/gif" => "gif",
             _ => "png",
         };
-        let wsl_path = format!("/tmp/pane-mgmt/img_{}_{}.{}", base_ts, idx, ext);
-        crate::commands::tmux::write_file_to_wsl_async(wsl_path.clone(), bytes)
-            .await
-            .map_err(tmux_err)?;
-        wsl_paths.push(wsl_path);
+        let path = format!("/tmp/pane-mgmt/img_{}_{}.{}", base_ts, idx, ext);
+        crate::commands::tmux::write_file_to_host_async(
+            img_host.clone(),
+            path.clone(),
+            bytes,
+        )
+        .await
+        .map_err(tmux_err)?;
+        img_paths.push(path);
     }
 
     // Build one message that references every image path inline so Claude
     // reads them all with the Read tool on the same turn.
-    let paths_joined = wsl_paths.join(", ");
+    let paths_joined = img_paths.join(", ");
     let prompt = req.prompt.as_deref().unwrap_or("").trim();
-    let label = if wsl_paths.len() == 1 { "screenshot" } else { "screenshots" };
+    let label = if img_paths.len() == 1 { "screenshot" } else { "screenshots" };
     let message = if prompt.is_empty() {
         format!("Look at this {}: {}", label, paths_joined)
     } else {
         format!("{} ({}: {})", prompt, label, paths_joined)
     };
 
-    tracing::info!(pane = %id, count = wsl_paths.len(), "images uploaded");
+    tracing::info!(pane = %id, host = %img_host.wire_str(), count = img_paths.len(), "images uploaded");
     send_text_to_pane(&id, &message, true).await?;
     let was_attention = state.attention_panes.write().await.remove(&id).is_some();
     state.attention_details.write().await.remove(&id);
@@ -1208,6 +1204,201 @@ async fn create_window(
         window_index,
         pane_id,
     }))
+}
+
+/// APK-facing "launch Claude on a remote host" path — wraps the
+/// `launch_project_session_on` Tauri command so the phone can start a
+/// per-project Mac tmux session without needing the desktop in front.
+///
+/// Host MUST be remote; local launches go through [`create_window`]
+/// (phone "Launch window" for WSL stays on that codepath because it
+/// uses the currently-attached `main` session and doesn't need
+/// session creation). Having a single endpoint serve both hosts would
+/// mean the APK has to know about tmux session shapes per host —
+/// cleaner to let each endpoint express its own contract.
+///
+/// Pre-flight: `check_remote_path_exists` on the derived Mac path
+/// (`/Users/admin/projects/<basename>`). A 400 with a "not mirrored"
+/// message is friendlier than a silent `cd: no such file` inside the
+/// new pane.
+async fn launch_host_session(
+    State(_state): State<AppState>,
+    Json(req): Json<LaunchHostSessionRequest>,
+) -> Result<Json<LaunchHostSessionResponse>, AppError> {
+    if req.project_path.is_empty() {
+        return Err(AppError::BadRequest("project_path is required".into()));
+    }
+    if req.host.is_empty() {
+        return Err(AppError::BadRequest("host is required".into()));
+    }
+    if req.host == "local" {
+        return Err(AppError::BadRequest(
+            "use POST /api/v1/windows for local (WSL) launches — this endpoint is for remote hosts".into(),
+        ));
+    }
+
+    // Session name follows the `cc` convention: basename of the project
+    // path. `std::path::Path::file_name` peels the last non-empty
+    // segment cleanly whether the caller sent a trailing slash or not.
+    let basename = std::path::Path::new(&req.project_path)
+        .file_name()
+        .and_then(|s| s.to_str())
+        .map(|s| s.to_string())
+        .ok_or_else(|| {
+            AppError::BadRequest(format!(
+                "cannot derive session name from project_path '{}'",
+                req.project_path,
+            ))
+        })?;
+    if basename.is_empty() {
+        return Err(AppError::BadRequest(
+            "derived basename is empty — project_path must end in a real directory".into(),
+        ));
+    }
+
+    // Mac filesystem convention — see `mac_studio_bridge` memory /
+    // CreatePaneModal::toMacPath. Other remote hosts might use a
+    // different root in the future; when we add one, lift this into a
+    // `services::remote_paths` helper keyed by host.
+    let remote_path = format!("/Users/admin/projects/{}", basename);
+
+    let path_exists = crate::commands::mac_sync::check_remote_path_exists(
+        req.host.clone(),
+        remote_path.clone(),
+    )
+    .await
+    .map_err(tmux_err)?;
+    if !path_exists {
+        return Err(AppError::BadRequest(format!(
+            "'{}' is not mirrored to host '{}' — run sync first (desktop: Settings → Remote hosts, or `sync-add-project` on WSL)",
+            req.project_display_name.trim(),
+            req.host,
+        )));
+    }
+
+    let (session_name, window_index, pane_index) =
+        crate::commands::mac_sync::launch_project_session_on(
+            req.host.clone(),
+            basename,
+            remote_path,
+            req.account.clone(),
+        )
+        .await
+        .map_err(tmux_err)?;
+
+    let pane_id = format!(
+        "{}/{}:{}.{}",
+        req.host, session_name, window_index, pane_index
+    );
+    tracing::info!(
+        %pane_id,
+        host = %req.host,
+        account = %req.account,
+        "host session launched from APK"
+    );
+
+    // Fire-and-forget: also open a local WSL tmux window that
+    // SSH-attaches to the just-created remote session. When the user
+    // walks back to their WezTerm, the Mac session has a visible local
+    // terminal view without them having to type `ssh mac` manually.
+    // Failures are logged but don't fail the HTTP response — the Mac
+    // session exists regardless, and the desktop's "Attach here" button
+    // gives the user a manual retry.
+    let attach_host = req.host.clone();
+    let attach_session = session_name.clone();
+    tokio::spawn(async move {
+        if let Err(e) = crate::commands::tmux::attach_remote_session(
+            attach_host.clone(),
+            attach_session.clone(),
+        )
+        .await
+        {
+            tracing::debug!(
+                host = %attach_host,
+                session = %attach_session,
+                error = %e,
+                "local auto-attach failed (non-fatal)"
+            );
+        }
+    });
+
+    Ok(Json(LaunchHostSessionResponse {
+        pane_id,
+        window_index,
+        session_name,
+    }))
+}
+
+/// Kick off (or re-run) the Mutagen bidirectional sync between the
+/// WSL project directory and its Mac mirror. Wraps the
+/// `sync_project_to_mac` Tauri command so the APK can trigger it — the
+/// desktop already exposes the same logic via a menu action. Helper
+/// is idempotent (see `commands/mac_sync.rs`), so retrying is safe.
+/// Errors propagate as 400 rather than 502 because the usual failure
+/// mode is "encoded_project not found" (user typo / stale APK cache)
+/// rather than Mutagen itself crashing.
+async fn sync_project_to_mac(
+    State(_state): State<AppState>,
+    Json(req): Json<SyncProjectRequest>,
+) -> Result<Json<SyncProjectResponse>, AppError> {
+    if req.encoded_project.is_empty() {
+        return Err(AppError::BadRequest("encoded_project is required".into()));
+    }
+    let output = crate::commands::mac_sync::sync_project_to_mac(req.encoded_project.clone())
+        .await
+        .map_err(AppError::BadRequest)?;
+    tracing::info!(
+        encoded = %req.encoded_project,
+        chars = output.len(),
+        "sync-add-project triggered from APK"
+    );
+    Ok(Json(SyncProjectResponse { output }))
+}
+
+/// Open (or re-select) a local WSL tmux window that SSH-attaches to a
+/// remote tmux session. Wraps the Tauri-side `attach_remote_session`
+/// command so the APK can ask the desktop to pre-create a mirror without
+/// the user having to switch to WezTerm first.
+///
+/// Idempotent at the Rust layer (a duplicate request just re-selects
+/// the existing `<alias>/<session>` window), so retrying is safe.
+async fn attach_remote_session(
+    State(_state): State<AppState>,
+    Json(req): Json<AttachRemoteSessionRequest>,
+) -> Result<Json<AttachRemoteSessionResponse>, AppError> {
+    if req.alias.is_empty() {
+        return Err(AppError::BadRequest("alias is required".into()));
+    }
+    if req.session_name.is_empty() {
+        return Err(AppError::BadRequest("session_name is required".into()));
+    }
+    if req.alias == "local" {
+        return Err(AppError::BadRequest(
+            "alias must be a non-local SSH host — local sessions are already in WSL tmux".into(),
+        ));
+    }
+    crate::commands::tmux::attach_remote_session(req.alias.clone(), req.session_name.clone())
+        .await
+        .map_err(tmux_err)?;
+    let local_window_name = format!("{}/{}", req.alias, req.session_name);
+    tracing::info!(
+        alias = %req.alias,
+        session = %req.session_name,
+        "remote session mirrored locally from APK"
+    );
+    Ok(Json(AttachRemoteSessionResponse { local_window_name }))
+}
+
+/// Enumerate distinct remote SSH aliases the app currently knows about.
+/// Mirrors the union used by `/api/v1/sessions` and the poller — the
+/// APK uses this to populate its host segmented control instead of
+/// hardcoding ["mac"], so adding a third host requires no APK rebuild.
+async fn list_remote_hosts(
+    State(state): State<AppState>,
+) -> Json<RemoteHostsResponse> {
+    Json(RemoteHostsResponse {
+        hosts: crate::services::remote_hosts::collect_remote_hosts(&state.app),
+    })
 }
 
 async fn kill_window(

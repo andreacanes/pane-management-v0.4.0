@@ -213,22 +213,133 @@ async fn ensure_project_cache(state: &AppState) -> HashMap<String, (String, Stri
     by_path
 }
 
-/// Look up a pane's current_path in the project cache. Walks up the
-/// directory tree so a pane sitting in a project subdirectory still
-/// resolves to the correct project root.
+/// Look up a pane's current_path in the project cache.
+///
+/// Two passes:
+///
+/// 1. **Direct tree walk.** Normalize the pane's cwd and walk up the
+///    directory tree, checking each ancestor against the cache's
+///    (WSL-side) project paths. Handles the local case where the pane
+///    sits inside a WSL project's root (exact hit) or a subdirectory
+///    of it (ancestor hit).
+///
+/// 2. **Basename fallback.** When no ancestor matched by path, walk up
+///    again comparing each ancestor's *basename* against the basename
+///    of every cached project path. This captures the WSL ↔ Mac
+///    Mutagen pair convention — `/home/andrea/<name>` on WSL is the
+///    same project as `/Users/admin/projects/<name>` on Mac because
+///    the user set up the mirror that way. Without this fallback, a
+///    Mac pane's `project_encoded_name` would be the Mac-style
+///    `-Users-admin-projects-<name>` which doesn't match any entry in
+///    `/api/v1/projects` (WSL-encoded), so the APK and desktop grid
+///    can't resolve a display name.
+///
+///    Ambiguity guard: if two WSL projects share a basename (e.g.
+///    `~/foo-a/widgets` and `~/foo-b/widgets`), we return None rather
+///    than picking one arbitrarily. Those cases are rare enough that
+///    falling through to "no project bound" (current behaviour) is
+///    safer than wiring the wrong identity.
 fn lookup_project<'a>(
     cache: &'a HashMap<String, (String, String)>,
     pane_path: &str,
 ) -> Option<&'a (String, String)> {
     let mut p = normalize_path(pane_path);
+
+    // Pass 1: direct path tree walk.
+    {
+        let mut q = p.clone();
+        loop {
+            if let Some(hit) = cache.get(&q) {
+                return Some(hit);
+            }
+            match q.rfind('/') {
+                Some(idx) if idx > 0 => q.truncate(idx),
+                _ => break,
+            }
+        }
+    }
+
+    // Pass 2: basename walk. Reuse `p` as the cursor.
     loop {
-        if let Some(hit) = cache.get(&p) {
-            return Some(hit);
+        let base = path_basename(&p);
+        if !base.is_empty() {
+            let mut found: Option<&'a (String, String)> = None;
+            let mut ambiguous = false;
+            for (cache_key, value) in cache.iter() {
+                if path_basename(cache_key) == base {
+                    if found.is_some() {
+                        ambiguous = true;
+                        break;
+                    }
+                    found = Some(value);
+                }
+            }
+            if !ambiguous {
+                if let Some(hit) = found {
+                    return Some(hit);
+                }
+            }
         }
         match p.rfind('/') {
             Some(idx) if idx > 0 => p.truncate(idx),
             _ => return None,
         }
+    }
+}
+
+#[cfg(test)]
+mod lookup_project_tests {
+    use super::*;
+
+    fn cache(items: &[(&str, &str, &str)]) -> HashMap<String, (String, String)> {
+        let mut m = HashMap::new();
+        for (path, encoded, display) in items {
+            m.insert(normalize_path(path), (encoded.to_string(), display.to_string()));
+        }
+        m
+    }
+
+    #[test]
+    fn direct_match() {
+        let c = cache(&[("/home/andrea/akamai", "enc-a", "akamai")]);
+        let hit = lookup_project(&c, "/home/andrea/akamai").unwrap();
+        assert_eq!(hit.0, "enc-a");
+    }
+
+    #[test]
+    fn subdir_match() {
+        let c = cache(&[("/home/andrea/akamai", "enc-a", "akamai")]);
+        let hit = lookup_project(&c, "/home/andrea/akamai/src/deep").unwrap();
+        assert_eq!(hit.0, "enc-a");
+    }
+
+    #[test]
+    fn mac_basename_fallback() {
+        let c = cache(&[("/home/andrea/akamai", "enc-a", "akamai")]);
+        let hit = lookup_project(&c, "/Users/admin/projects/akamai").unwrap();
+        assert_eq!(hit.0, "enc-a");
+    }
+
+    #[test]
+    fn mac_subdir_basename_fallback() {
+        let c = cache(&[("/home/andrea/akamai", "enc-a", "akamai")]);
+        let hit = lookup_project(&c, "/Users/admin/projects/akamai/src/deep").unwrap();
+        assert_eq!(hit.0, "enc-a");
+    }
+
+    #[test]
+    fn ambiguous_basename_returns_none() {
+        let c = cache(&[
+            ("/home/andrea/foo-a/widgets", "enc-x", "widgets"),
+            ("/home/andrea/foo-b/widgets", "enc-y", "widgets"),
+        ]);
+        assert!(lookup_project(&c, "/Users/admin/projects/widgets").is_none());
+    }
+
+    #[test]
+    fn miss_returns_none() {
+        let c = cache(&[("/home/andrea/akamai", "enc-a", "akamai")]);
+        assert!(lookup_project(&c, "/tmp/nowhere").is_none());
     }
 }
 
@@ -340,7 +451,7 @@ pub async fn run(state: AppState) {
         // assignments and fire each on its own cadence. When no pane
         // targets a remote host, the inner loop doesn't execute and
         // we don't pay any SSH cost.
-        let remote_hosts = discover_remote_hosts(&state).await;
+        let remote_hosts = crate::services::remote_hosts::collect_remote_hosts(&state.app);
         for alias in remote_hosts {
             let due = remote_last
                 .get(&alias)
@@ -494,45 +605,6 @@ async fn sweep_stale_assignments(
     Ok(())
 }
 
-/// Enumerate distinct non-local host aliases currently assigned to any
-/// pane slot. Reads from the Tauri store via the handle held on
-/// [`AppState`]; cheap enough to call every 1s tick (store is in-memory
-/// after first load, serde-deserializes a small HashMap).
-async fn discover_remote_hosts(state: &AppState) -> HashSet<String> {
-    let mut out: HashSet<String> = HashSet::new();
-
-    // Union 1: every alias referenced by a pane_assignment. Covers the
-    // "user explicitly assigned this slot to Mac" case.
-    if let Ok(full) =
-        crate::commands::project_meta::get_pane_assignments_full_sync(&state.app)
-    {
-        for a in full.values() {
-            if !a.host.is_empty() && a.host != "local" {
-                out.insert(a.host.clone());
-            }
-        }
-    }
-
-    // Union 2: every alias from the persistent `remote_hosts` list the
-    // user curated in Settings. Covers "I have a Mac and I want to see
-    // its panes even before I've assigned anything" — matches the
-    // desktop frontend's behaviour (loadRemotePanes iterates the same
-    // list). Without this union the APK's /panes endpoint stays blind
-    // to Mac until a first Mac assignment exists, which was a real gap
-    // between the desktop and mobile views.
-    if let Ok(configured) =
-        crate::commands::mac_sync::list_remote_hosts(state.app.clone()).await
-    {
-        for alias in configured {
-            if !alias.is_empty() && alias != "local" {
-                out.insert(alias);
-            }
-        }
-    }
-
-    out
-}
-
 /// Build a lookup from `"<session>|<window>|<pane>"` → configured
 /// account for every pane assignment targeting `alias`. Used by
 /// [`poll_once_remote`] to synthesize `claude_account` on the DTO
@@ -618,6 +690,14 @@ async fn poll_once_remote(state: &AppState, alias: &str) -> anyhow::Result<()> {
     let cap_map = parse_capture_batch(&captures_section);
 
     let account_map = remote_account_map_for_alias(state, alias).await;
+    // Same project lookup table the local poll uses. Needed so Mac pane
+    // `current_path`s (e.g. `/Users/admin/projects/akamai`) can resolve
+    // to the WSL-encoded project name via the basename fallback in
+    // `lookup_project` — otherwise the DTO would carry the Mac-side
+    // encoding `-Users-admin-projects-akamai`, which `/api/v1/projects`
+    // never returns, and the APK / desktop grid can't pair the pane to
+    // a project display name.
+    let project_cache = ensure_project_cache(state).await;
     let mut seen: HashSet<String> = HashSet::new();
     // Remote session-binding queue — same idea as the local
     // `session_detect_queue`, but resolved via
@@ -749,6 +829,24 @@ async fn poll_once_remote(state: &AppState, alias: &str) -> anyhow::Result<()> {
         }
         if rec.dto.host.as_deref() != Some(alias) {
             rec.dto.host = Some(alias.to_string());
+        }
+        // Cross-host project identity. `lookup_project` walks the cache
+        // first by exact path-tree match, then falls back to basename
+        // — so a Mac pane in `/Users/admin/projects/akamai` resolves to
+        // the WSL project whose path ends in `/akamai`. Always prefer
+        // this over any previously stamped value: the async
+        // lsof-over-SSH session detector below sets `project_encoded_name`
+        // to the *Mac-side* encoding (`.claude/projects/-Users-admin-...`),
+        // which the frontend can't match against `/api/v1/projects`.
+        // Refreshing per tick keeps the DTO correct even if the first
+        // binding was Mac-encoded.
+        if let Some((enc, display)) = lookup_project(&project_cache, &current_path) {
+            if rec.dto.project_encoded_name.as_deref() != Some(enc.as_str()) {
+                rec.dto.project_encoded_name = Some(enc.clone());
+            }
+            if rec.dto.project_display_name.as_deref() != Some(display.as_str()) {
+                rec.dto.project_display_name = Some(display.clone());
+            }
         }
         if claude_session_id.is_some()
             && rec.binding_confidence != BindingConfidence::Explicit

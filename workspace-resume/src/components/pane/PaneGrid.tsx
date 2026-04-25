@@ -2,8 +2,10 @@ import { createMemo, createSignal, For, Show } from "solid-js";
 import { useApp } from "../../contexts/AppContext";
 import { PaneSlot } from "./PaneSlot";
 import { CreatePaneModal } from "./CreatePaneModal";
+import { attachRemoteSession } from "../../lib/tauri-commands";
+import { toastError } from "../ui/Toast";
 import type { TmuxPane } from "../../lib/types";
-import { Plus } from "../ui/icons";
+import { Plus, Link } from "../ui/icons";
 
 /**
  * Compute inline grid style STRING based on pane count and geometry.
@@ -89,6 +91,38 @@ export function PaneGrid() {
           <Plus size={12} /> Add Pane
         </button>
       </div>
+
+      {/* Unmirrored remote sessions: Mac Claudes running without a
+          local ssh-mirror window. One click creates the mirror and
+          migrates the pane into the grid. Hidden when empty. */}
+      <Show when={state.unmirroredRemotePanes.length > 0}>
+        <div class="pane-grid-unmirrored">
+          <span class="pane-grid-unmirrored__label">
+            {state.unmirroredRemotePanes.length} running on Mac, not yet attached here:
+          </span>
+          <For each={state.unmirroredRemotePanes}>
+            {(p) => (
+              <button
+                class="pane-grid-unmirrored__chip"
+                onClick={async () => {
+                  try {
+                    await attachRemoteSession(p.host || "mac", p.session_name);
+                    refreshTmuxState();
+                  } catch (e) {
+                    toastError(
+                      "Attach failed",
+                      e instanceof Error ? e.message : String(e),
+                    );
+                  }
+                }}
+                title={`Open a local WezTerm tmux window SSH-attached to ${p.host}/${p.session_name}`}
+              >
+                <Link size={12} /> {p.host}/{p.session_name}
+              </button>
+            )}
+          </For>
+        </div>
+      </Show>
 
       <Show
         when={hasPanes()}

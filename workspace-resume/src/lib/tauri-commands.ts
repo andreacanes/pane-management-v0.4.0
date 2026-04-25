@@ -119,6 +119,13 @@ export async function listTmuxWindows(sessionName: string): Promise<TmuxWindow[]
   return invoke("list_tmux_windows", { sessionName });
 }
 
+/** Host-aware tmux window list. Prerequisite for a future Mac-aware
+ *  TopBar window-tabs UX; unused today, kept wired so the Rust surface
+ *  stays complete. `host = "local"` matches legacy `listTmuxWindows`. */
+export async function listTmuxWindowsOn(host: string, sessionName: string): Promise<TmuxWindow[]> {
+  return invoke("list_tmux_windows_on", { host, sessionName });
+}
+
 export async function listTmuxPanes(sessionName: string, windowIndex: number): Promise<TmuxPane[]> {
   return invoke("list_tmux_panes", { sessionName, windowIndex });
 }
@@ -223,6 +230,22 @@ export async function createSessionOn(host: string, sessionName: string): Promis
   return invoke("create_session_on", { host, sessionName });
 }
 
+/** Create (or select) a local WSL tmux window that SSH-attaches to a
+ *  remote tmux session. The glue between "a Mac session exists" and "I
+ *  can see it in WezTerm" — without this, remote tmux servers are
+ *  invisible to local clients. Idempotent: re-selects the existing
+ *  `<alias>/<session>` window if one exists instead of duplicating.
+ *  Used by the PaneSlot "Attach here" button for remote panes, and
+ *  auto-called by the companion after a phone-initiated Mac launch.
+ *
+ *  Param is `alias` not `host` because the Rust side rejects `"local"`
+ *  outright (commands/tmux.rs:1576): an SSH alias is the only valid
+ *  input. The other host-aware wrappers in this file accept `"local"`
+ *  and route accordingly, so they use `host`. */
+export async function attachRemoteSession(alias: string, sessionName: string): Promise<void> {
+  return invoke("attach_remote_session", { alias, sessionName });
+}
+
 export async function killSession(sessionName: string): Promise<TmuxSession[]> {
   return invoke("kill_session", { sessionName });
 }
@@ -316,13 +339,6 @@ export async function savePanePreset(name: string, layout: string, paneCount: nu
 
 export async function deletePanePreset(name: string): Promise<void> {
   return invoke("delete_pane_preset", { name });
-}
-
-/** Scoped pane_index → encoded_project map for one `(host, session, window)`.
- *  Host became a required coordinate after the refactor — pass `"local"`
- *  for the WSL scope. */
-export async function getPaneAssignments(host: string, sessionName: string, windowIndex: number): Promise<Record<string, string>> {
-  return invoke("get_pane_assignments", { host, sessionName, windowIndex });
 }
 
 /** Entire pane-assignment map, keyed on the full 4-segment coord
@@ -456,6 +472,16 @@ export async function launchProjectSessionOn(
 
 export async function checkPaneStatuses(sessionName: string): Promise<Record<string, WindowPaneStatus>> {
   return invoke("check_pane_statuses", { sessionName });
+}
+
+/** Host-aware pane-status check. Used by AppContext.pollPaneStatuses to
+ *  fan out across every (host, session) pair represented in the current
+ *  pane grid so Mac Claudes drive the amber "waiting for approval"
+ *  indicator the same way local Claudes do. Return shape is identical
+ *  to checkPaneStatuses — keyed by window index as a string; callers
+ *  namespace by host+session themselves before merging. */
+export async function checkPaneStatusesOn(host: string, sessionName: string): Promise<Record<string, WindowPaneStatus>> {
+  return invoke("check_pane_statuses_on", { host, sessionName });
 }
 
 export async function updateProjectInode(encodedName: string, inode: number | null, claudeProjectDirs: string[] | null): Promise<void> {

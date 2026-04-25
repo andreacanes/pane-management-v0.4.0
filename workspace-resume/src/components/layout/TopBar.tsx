@@ -21,8 +21,6 @@ import { deriveName, matchProjectByPath } from "../../lib/path";
 
 // Window tab reorder prefix (only remaining drag type in top bar)
 export const WINDOW_TAB_PREFIX = "window-tab:";
-// Kept for backward compat with App.tsx handleDragEnd — session tabs no longer sortable
-export const SESSION_TAB_PREFIX = "session-tab:";
 
 // ---------------------------------------------------------------------------
 // Window tab (still sortable)
@@ -103,7 +101,11 @@ export function TopBar() {
   function windowDisplayName(win: TmuxWindow): string {
     const rawName = win.name || "";
     if (!SHELL_WINDOW_NAMES.has(rawName.toLowerCase())) return rawName;
-    const status = state.windowStatuses[String(win.index)];
+    // TopBar's window tabs always belong to the selected LOCAL session
+    // (remote sessions aren't yet exposed in tabs), so the lookup is
+    // scoped to `local|<selected-session>|<win.index>` in the new
+    // host-namespaced windowStatuses map.
+    const status = state.windowStatuses[`local|${state.selectedTmuxSession}|${win.index}`];
     const paths = status?.active_paths ?? [];
     for (const panePath of paths) {
       if (!panePath) continue;
@@ -326,7 +328,7 @@ export function TopBar() {
             <SortableProvider ids={windowIds()}>
               <For each={state.tmuxWindows}>
                 {(win) => {
-                  const winStatus = () => state.windowStatuses[String(win.index)];
+                  const winStatus = () => state.windowStatuses[`local|${state.selectedTmuxSession}|${win.index}`];
                   return (
                     <WindowTab
                       win={win}

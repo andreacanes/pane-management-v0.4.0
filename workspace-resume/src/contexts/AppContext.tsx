@@ -31,7 +31,7 @@ import {
   getPinnedOrder,
   setPinnedOrder as setPinnedOrderCmd,
   swapTmuxWindow,
-  checkPaneStatuses,
+  checkPaneStatusesOn,
 } from "../lib/tauri-commands";
 import { toastError, toastSuccess } from "../components/ui/Toast";
 import { launchToPane, newSessionInPane } from "../lib/launch";
@@ -63,6 +63,14 @@ interface AppState {
    *  session_name, and window_index; consumers never infer coordinates
    *  from the outer `selectedTmux*` ambient context. */
   tmuxPanes: TmuxPane[];
+  /** Remote panes that are RUNNING on a remote host but have no local
+   *  ssh-mirror window in WSL tmux. Kept separate from `tmuxPanes` so
+   *  they don't pollute every local window's grid — rendered as an
+   *  "Unmirrored Mac sessions" caret at the top of PaneGrid with a
+   *  one-click Attach action. A remote pane migrates into `tmuxPanes`
+   *  the moment a local window gets named `<host>/<session>`
+   *  (attachRemoteSession does exactly that). */
+  unmirroredRemotePanes: TmuxPane[];
   /** Encoded-project map keyed on the full 4-segment coord
    *  `"host|session|window|pane"`. Swapped from the old pane-index keys
    *  so a local `main:0.3` and a Mac `main:0.3` don't collide. */
@@ -121,17 +129,24 @@ interface AppContextValue {
    *  remote poll. Settings calls this after saving edits so the grid
    *  reflects the new host set immediately. */
   refreshRemoteHosts: () => Promise<void>;
-  // Notification muting
-  mutePane: (sessionName: string, windowIndex: number, paneIndex: number) => void;
-  unmutePane: (sessionName: string, windowIndex: number, paneIndex: number) => void;
-  isPaneMuted: (sessionName: string, windowIndex: number, paneIndex: number) => boolean;
+  // Notification muting — keyed on the full host+session+window+pane so
+  // a Mac pane and a local pane with colliding coords don't share
+  // state. Callers typically pass `pane.host || "local"`.
+  mutePane: (host: string, sessionName: string, windowIndex: number, paneIndex: number) => void;
+  unmutePane: (host: string, sessionName: string, windowIndex: number, paneIndex: number) => void;
+  isPaneMuted: (host: string, sessionName: string, windowIndex: number, paneIndex: number) => boolean;
   // Derived getters
   projectsByTier: (tier: ProjectTier) => ProjectWithMeta[];
   getProjectMeta: (encodedName: string) => ProjectMeta;
   isProjectActive: (encodedName: string) => boolean;
   isProjectActiveInSession: (encodedName: string) => boolean;
   isProjectWaitingInSession: (encodedName: string) => boolean;
-  findProjectWindow: (encodedName: string) => number | null;
+  /** Find the first window where a project has panes. After the
+   *  multi-host refactor this can return a remote-host window too, so
+   *  the shape is an object with host + session + windowIndex instead
+   *  of a bare window number. Consumers that only want to focus local
+   *  windows should gate on `host === "local"`. */
+  findProjectWindow: (encodedName: string) => { host: string; session: string; windowIndex: number } | null;
   activeProjectCount: () => number;
 }
 
@@ -155,6 +170,7 @@ export function AppProvider(props: { children: JSX.Element }) {
     tmuxSessions: [],
     tmuxWindows: [],
     tmuxPanes: [],
+    unmirroredRemotePanes: [],
     paneAssignments: {},
     paneAssignmentsFull: {},
     remoteHosts: [],
@@ -327,6 +343,43 @@ export function AppProvider(props: { children: JSX.Element }) {
     );
   }
 
+  /** Split remote panes into "mirror-matched" (belongs in the grid of
+   *  the selected local window) and "unmirrored" (rendered in the
+   *  PaneGrid caret). A remote pane is considered mirrored when some
+   *  local tmux window's name equals `<host>/<session>` — that's the
+   *  convention `attachRemoteSession` uses when it creates a local
+   *  window ssh-attached to the remote tmux. Matching by window name
+   *  is resilient to renames mid-flight (tmux reports the new name on
+   *  the next poll) and doesn't require us to parse `start_command`.
+   *
+   *  Returns `[inCurrentWindow, unmirrored]`. Panes whose mirror is in
+   *  a DIFFERENT local window (e.g. user has main:9 = mac/A mirror and
+   *  main:12 = mac/B mirror, currently viewing main:9) are excluded
+   *  from both — they'll appear when the user switches to that window.
+   *  This is the whole point of Fix 1: Mac panes get a "location"
+   *  instead of polluting every local window's grid. */
+  function partitionRemotePanes(
+    remote: TmuxPane[],
+    localWindows: TmuxWindow[],
+    currentWindowIndex: number | null,
+  ): { matched: TmuxPane[]; unmirrored: TmuxPane[] } {
+    const currentName = localWindows.find((w) => w.index === currentWindowIndex)?.name ?? "";
+    const mirroredNames = new Set(localWindows.map((w) => w.name));
+    const matched: TmuxPane[] = [];
+    const unmirrored: TmuxPane[] = [];
+    for (const p of remote) {
+      const mirrorKey = `${p.host || ""}/${p.session_name || ""}`;
+      if (mirrorKey === currentName) {
+        matched.push(p);
+      } else if (!mirroredNames.has(mirrorKey)) {
+        unmirrored.push(p);
+      }
+      // else: mirrored in another local window — it'll show when the
+      // user switches there. Deliberately not shown anywhere right now.
+    }
+    return { matched, unmirrored };
+  }
+
   async function loadTmuxPanes(sessionName: string, windowIndex: number) {
     try {
       const tmuxState = await getTmuxState(sessionName, windowIndex);
@@ -341,8 +394,14 @@ export function AppProvider(props: { children: JSX.Element }) {
         setState("selectedTmuxWindow", activeWin.index);
         const freshState = await getTmuxState(sessionName, activeWin.index);
         const remote = await loadRemotePanes();
+        const { matched, unmirrored } = partitionRemotePanes(
+          remote,
+          freshState.windows,
+          activeWin.index,
+        );
         batch(() => {
-          setState("tmuxPanes", [...freshState.panes, ...remote]);
+          setState("tmuxPanes", [...freshState.panes, ...matched]);
+          setState("unmirroredRemotePanes", unmirrored);
         });
         loadPaneAssignments();
         pollPaneStatuses();
@@ -356,16 +415,28 @@ export function AppProvider(props: { children: JSX.Element }) {
         setState("tmuxPanes", tmuxState.panes);
       });
 
-      // Then fetch remote panes and merge. Keeps the grid responsive
-      // even when a Mac is slow to answer — the Mac section appears
-      // ~50-500 ms later without blocking the local render path.
+      // Then fetch remote panes, partition by mirror match, and merge.
+      // Keeps the grid responsive even when a Mac is slow to answer —
+      // the Mac section appears ~50-500 ms later without blocking the
+      // local render path.
       const remote = await loadRemotePanes();
-      if (remote.length > 0) {
-        setState("tmuxPanes", [...tmuxState.panes, ...remote]);
-      }
+      const { matched, unmirrored } = partitionRemotePanes(
+        remote,
+        tmuxState.windows,
+        windowIndex,
+      );
+      batch(() => {
+        if (matched.length > 0) {
+          setState("tmuxPanes", [...tmuxState.panes, ...matched]);
+        }
+        setState("unmirroredRemotePanes", unmirrored);
+      });
     } catch (e) {
       console.error("[AppContext] loadTmuxPanes error:", e);
-      setState("tmuxPanes", []);
+      batch(() => {
+        setState("tmuxPanes", []);
+        setState("unmirroredRemotePanes", []);
+      });
     }
   }
 
@@ -471,61 +542,107 @@ export function AppProvider(props: { children: JSX.Element }) {
   }
 
   // -- Notification muting ---------------------------------------------------
-  // Muted panes are tracked by key "session|window|pane_index".
+  // Muted panes are tracked by key "host|session|window|pane_index".
   // Muted panes are filtered out of waiting_panes before storing in state,
   // so window tabs, pinned pills, and pane slots all naturally see "not waiting".
   // Auto-unmutes when the pane stops waiting (agent resumed).
+  //
+  // The `host` segment is required because after the multi-host refactor
+  // a local `main:0.3` and a Mac `main:0.3` are distinct panes; muting
+  // one must not silence the other.
 
   const mutedPanes = new Set<string>();
   const prevWaiting = new Map<string, boolean>(); // track previous waiting state for auto-unmute
 
-  function muteKey(session: string, window: number, pane: number): string {
-    return `${session}|${window}|${pane}`;
+  function muteKey(host: string, session: string, window: number, pane: number): string {
+    return `${host}|${session}|${window}|${pane}`;
   }
 
-  function mutePane(session: string, window: number, pane: number) {
-    mutedPanes.add(muteKey(session, window, pane));
+  function mutePane(host: string, session: string, window: number, pane: number) {
+    mutedPanes.add(muteKey(host, session, window, pane));
     // Re-filter current state immediately
     pollPaneStatuses();
   }
 
-  function unmutePane(session: string, window: number, pane: number) {
-    mutedPanes.delete(muteKey(session, window, pane));
+  function unmutePane(host: string, session: string, window: number, pane: number) {
+    mutedPanes.delete(muteKey(host, session, window, pane));
     pollPaneStatuses();
   }
 
-  function isPaneMuted(session: string, window: number, pane: number): boolean {
-    return mutedPanes.has(muteKey(session, window, pane));
+  function isPaneMuted(host: string, session: string, window: number, pane: number): boolean {
+    return mutedPanes.has(muteKey(host, session, window, pane));
   }
 
+  /** Fan out `check_pane_statuses_on` across every (host, session) pair
+   *  the UI currently knows about — the local selected session plus
+   *  every distinct pair from the pane grid (captures remote Mac panes
+   *  at whatever sessions they live in). One slow or failing host
+   *  doesn't block the others; each probe has its own catch that
+   *  degrades to an empty status map for that scope.
+   *
+   *  Results are merged into `state.windowStatuses` under a composite
+   *  key `"host|session|winIdx"` so same-coord collisions across hosts
+   *  can't overwrite each other. Consumers either look up by the full
+   *  key (PaneSlot, TopBar) or iterate `Object.values()` when they
+   *  only care about "any pane waiting anywhere" (StatusOrb,
+   *  QuickLaunch status counts, project-level helpers). */
   async function pollPaneStatuses() {
     if (pollingPaused) return;
-    const session = state.selectedTmuxSession;
-    if (!session) return;
-    try {
-      const statuses = await checkPaneStatuses(session);
 
-      // Auto-unmute panes that are no longer waiting
-      for (const key of mutedPanes) {
-        const [sess, win, pane] = key.split("|");
-        const winStatus = statuses[win];
-        const stillWaiting = winStatus?.waiting_panes?.includes(Number(pane)) ?? false;
-        if (!stillWaiting) {
-          mutedPanes.delete(key);
-        }
-      }
-
-      // Filter muted panes out of waiting_panes before storing
-      for (const [winIdx, status] of Object.entries(statuses)) {
-        status.waiting_panes = status.waiting_panes.filter(
-          (paneIdx) => !mutedPanes.has(muteKey(session, Number(winIdx), paneIdx))
-        );
-      }
-
-      setState("windowStatuses", reconcile(statuses));
-    } catch (e) {
-      // Silently ignore — tmux may not be running
+    const pairs = new Map<string, { host: string; session: string }>();
+    if (state.selectedTmuxSession) {
+      pairs.set(`local|${state.selectedTmuxSession}`, {
+        host: "local",
+        session: state.selectedTmuxSession,
+      });
     }
+    for (const p of state.tmuxPanes) {
+      const host = p.host || "local";
+      const session = p.session_name;
+      if (!session) continue;
+      const k = `${host}|${session}`;
+      if (!pairs.has(k)) pairs.set(k, { host, session });
+    }
+    if (pairs.size === 0) return;
+
+    const results = await Promise.all(
+      [...pairs.values()].map(async ({ host, session }) => {
+        try {
+          const statuses = await checkPaneStatusesOn(host, session);
+          return { host, session, statuses };
+        } catch {
+          return { host, session, statuses: {} as Record<string, WindowPaneStatus> };
+        }
+      }),
+    );
+
+    const merged: Record<string, WindowPaneStatus> = {};
+    for (const { host, session, statuses } of results) {
+      for (const [winIdx, status] of Object.entries(statuses)) {
+        merged[`${host}|${session}|${winIdx}`] = status;
+      }
+    }
+
+    // Auto-unmute panes that are no longer waiting — iterate on a
+    // snapshot so deletion mid-loop is safe.
+    for (const mk of [...mutedPanes]) {
+      const [mHost, mSess, mWin, mPane] = mk.split("|");
+      const ws = merged[`${mHost}|${mSess}|${mWin}`];
+      const stillWaiting = ws?.waiting_panes?.includes(Number(mPane)) ?? false;
+      if (!stillWaiting) mutedPanes.delete(mk);
+    }
+
+    // Filter muted panes out of waiting_panes before storing. Mutates
+    // status objects in place — they were freshly produced by invoke,
+    // so no other consumer holds a reference yet.
+    for (const [key, status] of Object.entries(merged)) {
+      const [mHost, mSess, mWin] = key.split("|");
+      status.waiting_panes = status.waiting_panes.filter(
+        (paneIdx) => !mutedPanes.has(muteKey(mHost, mSess, Number(mWin), paneIdx)),
+      );
+    }
+
+    setState("windowStatuses", reconcile(merged));
   }
 
   // -- Polling control -------------------------------------------------------
@@ -796,19 +913,26 @@ export function AppProvider(props: { children: JSX.Element }) {
     return false;
   }
 
-  /** Find the window index where a project is active. Returns the first match, preferring waiting windows. */
-  function findProjectWindow(encodedName: string): number | null {
+  /** Find the first window where a project has a pane. Prefers a
+   *  waiting pane over a merely-active one so the UI focuses where
+   *  user attention is actually needed. Returns an object with
+   *  `host` + `session` + `windowIndex` — callers that only want to
+   *  navigate to local windows should gate on `host === "local"`. */
+  function findProjectWindow(encodedName: string) {
     const proj = state.projects.find((p) => p.encoded_name === encodedName);
     if (!proj) return null;
-    let firstActive: number | null = null;
-    for (const [winIdx, status] of Object.entries(state.windowStatuses)) {
+    let firstActive: { host: string; session: string; windowIndex: number } | null = null;
+    for (const [key, status] of Object.entries(state.windowStatuses)) {
+      const [host, session, winStr] = key.split("|");
+      if (!host || !session || !winStr) continue;
+      const windowIndex = Number(winStr);
       const paths = status.active_paths ?? [];
       const panes = status.active_panes ?? [];
       const waiting = status.waiting_panes ?? [];
       for (let i = 0; i < paths.length; i++) {
         if (pathMatchesProject(paths[i], proj.actual_path)) {
-          if (waiting.includes(panes[i])) return Number(winIdx); // prefer waiting window
-          if (firstActive == null) firstActive = Number(winIdx);
+          if (waiting.includes(panes[i])) return { host, session, windowIndex };
+          if (firstActive == null) firstActive = { host, session, windowIndex };
         }
       }
     }

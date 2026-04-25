@@ -9,7 +9,9 @@ import {
   checkSshMaster,
   killPaneOn,
   openDirectory,
+  attachRemoteSession,
 } from "../../lib/tauri-commands";
+import { toastError, toastSuccess } from "../ui/Toast";
 import {
   launchToPane,
   newSessionInPane,
@@ -84,13 +86,41 @@ export function PaneSlot(props: { pane: TmuxPane; assignment?: string | null }) 
     });
   };
 
+  /** Local ssh-mirror panes — windows we created via
+   *  `attachRemoteSession` whose single pane runs
+   *  `ssh -t <alias> tmux attach-session -t <session>` as a live
+   *  viewport into the remote tmux. These aren't "working on a
+   *  project"; without this check the cross-host-identity basename
+   *  lookup would match the ssh process's cwd (`/home/andrea`) to the
+   *  WSL project named "Andrea" and render them with the wrong title,
+   *  plus offer nonsensical Resume/Fork buttons. Detected by parsing
+   *  `start_command`. */
+  const isSshMirror = () => {
+    const sc = (props.pane.start_command ?? "").toLowerCase();
+    return sc.includes("ssh -t") && sc.includes("tmux attach-session");
+  };
+
+  /** Parse `<alias>` and `<session>` out of an ssh-mirror pane's
+   *  start_command. Returns null for non-mirrors. Drives the mirror
+   *  card's label. */
+  const mirrorTarget = (): { alias: string; session: string } | null => {
+    const sc = props.pane.start_command ?? "";
+    const m = sc.match(/ssh\s+-t\s+(\S+)\s+tmux\s+attach-session\s+-t\s+(\S+)/i);
+    return m ? { alias: m[1], session: m[2] } : null;
+  };
+
   /**
    * If the live cwd matches a known project different from the stored
    * assignment, the user cd'd away — prefer what the pane is actually
    * running in, not the stale label. Fall back to the assignment only
    * when the cwd doesn't match any project (e.g. pane is at $HOME).
+   *
+   * ssh-mirror panes short-circuit to `undefined` — their cwd is
+   * always `/home/andrea` (where the ssh process ran), which would
+   * otherwise pair them with the "Andrea" WSL project.
    */
   const effectiveProject = () => {
+    if (isSshMirror()) return undefined;
     const assigned = assignedProject();
     const detected = detectedProject();
     if (detected && assigned && detected.encoded_name !== assigned.encoded_name) {
@@ -102,18 +132,34 @@ export function PaneSlot(props: { pane: TmuxPane; assignment?: string | null }) 
   // contain the literal "claude". Widen the match so any ncld wrapper
   // also registers — otherwise the UI mis-reports running-Claude panes
   // as idle, and hides Fork / shows Resume+New in the wrong state.
+  // ssh-mirror panes run `ssh` locally; the REMOTE pane runs Claude
+  // but that's a separate DTO in the grid (see partitionRemotePanes
+  // in AppContext), so we deliberately treat the local mirror as
+  // not-running-claude — Resume/Fork would target the wrong process.
   const isRunningClaude = () => {
+    if (isSshMirror()) return false;
     const cmd = props.pane.current_command?.toLowerCase() ?? "";
     return cmd.includes("claude") || cmd.includes("ncld");
   };
   const projectName = () => {
+    if (isSshMirror()) {
+      const t = mirrorTarget();
+      return t ? `🔗 ${t.alias}/${t.session}` : "🔗 ssh mirror";
+    }
     const p = effectiveProject();
     if (p) return p.meta.display_name || deriveName(p.actual_path);
     return deriveName(props.pane.current_path || "");
   };
   const isWaitingApproval = () => {
-    const winIdx = String(props.pane.window_index);
-    const ws = state.windowStatuses[winIdx];
+    // windowStatuses is keyed "host|session|winIdx" after the
+    // multi-host refactor; the pane already carries all three
+    // coordinates so we can look up the exact status entry for this
+    // slot without depending on the outer selected-session context
+    // (important for Mac panes where the pane's session differs from
+    // the locally-selected one).
+    const host = props.pane.host || "local";
+    const session = props.pane.session_name || "";
+    const ws = state.windowStatuses[`${host}|${session}|${props.pane.window_index}`];
     return ws?.waiting_panes?.includes(paneIndex()) ?? false;
   };
   const isPaneSelectMode = () => pendingLaunch() != null;
@@ -277,12 +323,35 @@ export function PaneSlot(props: { pane: TmuxPane; assignment?: string | null }) 
     if (!p || syncing()) return;
     setSyncing(true);
     try {
-      const out = await syncProjectToMac(p.encoded_name);
-      console.log("[PaneSlot] sync-to-mac:", out);
+      await syncProjectToMac(p.encoded_name);
     } catch (e) {
       console.error("[PaneSlot] syncToMac error:", e);
     } finally {
       setSyncing(false);
+    }
+  }
+
+  /** Open (or re-select) a local WSL tmux window that SSH-attaches to
+   *  this pane's remote session. Makes the remote terminal visible in
+   *  WezTerm; no-op for local panes (they're already in local tmux).
+   *  Toasts success/failure rather than inline-erroring since this is
+   *  a side-channel action, not part of the pane's primary state. */
+  async function handleAttachHere() {
+    const host = paneHost();
+    const session = paneSession();
+    if (host === "local" || !session) return;
+    try {
+      await attachRemoteSession(host, session);
+      toastSuccess(
+        "Attached in local tmux",
+        `${host}/${session} is now open as a window in your WezTerm.`,
+      );
+    } catch (e) {
+      console.error("[PaneSlot] attachRemoteSession error:", e);
+      toastError(
+        "Attach failed",
+        e instanceof Error ? e.message : String(e),
+      );
     }
   }
 
@@ -490,6 +559,15 @@ export function PaneSlot(props: { pane: TmuxPane; assignment?: string | null }) 
                   <button class="pane-slot-menu-item" onClick={() => { handleOpenDir(); setMenuOpen(false); }}>
                     <FolderOpen size={12} /> Open directory
                   </button>
+                  <Show when={paneHost() !== "local"}>
+                    <button
+                      class="pane-slot-menu-item"
+                      onClick={() => { handleAttachHere(); setMenuOpen(false); }}
+                      title={`Open a local WezTerm tmux window SSH-attached to ${paneHost()}/${paneSession()}`}
+                    >
+                      <Terminal size={12} /> Attach here
+                    </button>
+                  </Show>
                   <Show when={hasProject() && paneHost() !== "local"}>
                     <button
                       class="pane-slot-menu-item"

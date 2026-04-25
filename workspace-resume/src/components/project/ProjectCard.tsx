@@ -8,12 +8,14 @@ import {
   updateProjectInode,
   getProjectUsage,
   createWorktree,
+  syncProjectToMac,
 } from "../../lib/tauri-commands";
 import { open } from "@tauri-apps/plugin-dialog";
 import { launchToPane, newSessionInPane } from "../../lib/launch";
 import { deriveName } from "../../lib/path";
+import { toastError, toastSuccess } from "../ui/Toast";
 import type { ProjectWithMeta, ProjectTier } from "../../lib/types";
-import { GitBranch, Link, Plus } from "../ui/icons";
+import { GitBranch, Link, Plus, FolderOpen } from "../ui/icons";
 
 /** Format a token count into a short human-readable string. */
 function fmtTokens(n: number): string {
@@ -39,7 +41,33 @@ export function ProjectCard(props: { project: ProjectWithMeta }) {
   const [editing, setEditing] = createSignal(false);
   const [editValue, setEditValue] = createSignal("");
   const [launching, setLaunching] = createSignal(false);
+  const [syncing, setSyncing] = createSignal(false);
   const [error, setError] = createSignal<string | null>(null);
+
+  /** Kick off (or re-run) the Mutagen bidirectional sync between the
+   *  WSL project directory and its mirror at
+   *  `/Users/admin/projects/<basename>` on the Mac. Idempotent by
+   *  design — re-running for a live session is a no-op. Surfaces the
+   *  helper's stdout via toast so the user sees "creating session" vs
+   *  "already exists" vs any hard errors. */
+  async function handleSyncToMac() {
+    if (syncing()) return;
+    setSyncing(true);
+    try {
+      const out = await syncProjectToMac(props.project.encoded_name);
+      toastSuccess(
+        "Synced to Mac",
+        out.trim().split("\n").slice(-3).join(" · ") || "sync-add-project completed",
+      );
+    } catch (e) {
+      toastError(
+        "Mac sync failed",
+        e instanceof Error ? e.message : String(e),
+      );
+    } finally {
+      setSyncing(false);
+    }
+  }
 
   const displayName = () =>
     props.project.meta.display_name || deriveName(props.project.actual_path);
@@ -339,6 +367,14 @@ export function ProjectCard(props: { project: ProjectWithMeta }) {
             <Plus size={10} />
           </button>
         </Show>
+        <button
+          class="project-settings-btn"
+          disabled={syncing()}
+          onClick={handleSyncToMac}
+          title={`Run 'sync-add-project ${props.project.encoded_name}' so this project is mirrored to the Mac (idempotent — safe to re-run)`}
+        >
+          <FolderOpen size={11} /> {syncing() ? "Syncing…" : "Sync→Mac"}
+        </button>
         <button class="project-settings-btn" onClick={() => openProjectSettings(props.project)}>
           Settings
         </button>

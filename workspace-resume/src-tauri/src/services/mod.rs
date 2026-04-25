@@ -1,9 +1,10 @@
 pub mod git;
 pub mod host_target;
 pub mod launch_cmd;
+pub mod path_decoder;
+pub mod remote_hosts;
 pub mod scanner;
 pub mod store;
-pub mod watcher;
-pub mod path_decoder;
 pub mod usage;
+pub mod watcher;
 pub mod wsl;

@@ -42,13 +42,15 @@ export function Sidebar(props: { width?: number }) {
   const tierCount = (tier: FilterOption): number =>
     tier === "all" ? state.projects.length : projectsByTier(tier).length;
 
-  /** Click a project row: if it has a running pane, navigate there. Otherwise open settings. */
+  /** Click a project row: navigate to a *local* pane if one exists, otherwise open settings.
+   *  Remote-pane case falls through to settings since the local TopBar can't select a
+   *  Mac window — to actually attach, the user uses the unmirrored caret in PaneGrid. */
   function handleProjectClick(project: ProjectWithMeta) {
-    const winIdx = findProjectWindow(project.encoded_name);
-    if (winIdx != null) {
-      selectTmuxWindow(winIdx);
+    const win = findProjectWindow(project.encoded_name);
+    if (win && win.host === "local") {
+      selectTmuxWindow(win.windowIndex);
     } else {
-      openProjectSettings(project.encoded_name);
+      openProjectSettings(project);
     }
   }
 

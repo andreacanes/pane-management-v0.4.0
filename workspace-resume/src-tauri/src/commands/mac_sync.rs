@@ -24,14 +24,57 @@
 /// shell profile; a bare `bash -c` would miss it on fresh shells.
 #[tauri::command]
 pub async fn sync_project_to_mac(encoded_project: String) -> Result<String, String> {
-    // Basic sanitization: encoded_project is passed straight to a shell
-    // arg so we single-quote it and escape embedded singles. The typical
-    // encoded_project format is a safe subset (alphanum + dashes), but
-    // defense-in-depth against pathological project names is cheap.
-    let safe = encoded_project.replace('\'', r"'\''");
+    if encoded_project.is_empty() {
+        return Err("encoded_project is required".into());
+    }
+    // `sync-add-project` expects the project BASENAME (e.g.
+    // `akamai-v3-bestbuy`), not the Claude-encoded `.claude/projects/`
+    // form (`-home-andrea-akamai-v3-bestbuy`). Encoded names start with
+    // `-` which the helper's `usage: sync-add-project <project-name>
+    // [source-dir]` positional parse trips over ("source dir does not
+    // exist: /home/andrea/-home-andrea-..."). Resolve encoded → actual
+    // path via the project scan, then take the path's basename.
+    //
+    // Both existing callers (PaneSlot "Sync to Mac" menu, ProjectCard
+    // "Sync→Mac" button) pass `encoded_name` — the conversion lives
+    // here so they need no changes. APK's /api/v1/sync-project-to-mac
+    // endpoint also goes through this same command, so it benefits
+    // automatically.
+    let projects = crate::commands::discovery::list_projects()
+        .await
+        .map_err(|e| format!("failed to list projects for sync: {}", e))?;
+    let project = projects
+        .into_iter()
+        .find(|p| p.encoded_name == encoded_project)
+        .ok_or_else(|| {
+            format!(
+                "unknown project '{}' — not found in the Claude projects scan",
+                encoded_project
+            )
+        })?;
+    let basename = std::path::Path::new(&project.actual_path)
+        .file_name()
+        .and_then(|s| s.to_str())
+        .map(|s| s.to_string())
+        .ok_or_else(|| {
+            format!(
+                "cannot derive basename from project path '{}'",
+                project.actual_path
+            )
+        })?;
+    if basename.is_empty() {
+        return Err(format!(
+            "derived basename is empty for project '{}'",
+            encoded_project
+        ));
+    }
+    // Defense-in-depth: basename came from a filesystem scan so it's
+    // already safe, but single-quote-escape anyway in case a project
+    // directory ever has weird chars.
+    let safe = basename.replace('\'', r"'\''");
     let script = format!("sync-add-project '{}' 2>&1", safe);
     crate::commands::tmux::run_tmux_command_async(
-        format!("bash -lc {}", shell_quote(&script)),
+        format!("bash -lc {}", crate::services::host_target::ssh_shell_quote(&script)),
     )
     .await
 }
@@ -112,6 +155,33 @@ pub async fn set_remote_hosts(
 ///
 /// Returns the created `(session, window, pane)` coord so the UI can
 /// refresh and drop an assignment on the new slot.
+/// Start (or attach to) a per-project tmux session on a remote host
+/// under the requested Claude account. Delegates to the host's `cc`
+/// script — the single source of truth for remote Claude session
+/// management across all frontends (desktop / APK / WSL shell).
+///
+/// `cc` on the Mac handles:
+///   * account → session name suffixing (`<project>`, `<project>-b`,
+///     `<project>-c`)
+///   * `env CLAUDE_CONFIG_DIR=…` prefix for non-primary accounts
+///   * mismatch detection — rejects if the target name exists but
+///     runs under a different account (no silent cross-account
+///     attach)
+///   * headless mode — because we invoke without a TTY, cc's
+///     `[ ! -t 1 ]` branch fires: it creates-if-missing, prints the
+///     effective session name on stdout, exits 0
+///
+/// Parameters:
+/// * `session_name` — project basename (cc derives the suffix by
+///   itself; don't pre-suffix).
+/// * `project_path` — retained for API compatibility and pre-flight
+///   path checks on the caller side; not forwarded to cc because cc
+///   uses `$HOME/projects/<name>` on Mac by its own convention.
+/// * `account` — `"andrea"` / `"bravura"` / `"sully"`.
+///
+/// Returns the effective session name cc picked (suffixed as needed).
+/// Window and pane indices are always `0,0` for freshly-created Mac
+/// sessions — cc's single pane runs mncld.
 #[tauri::command]
 pub async fn launch_project_session_on(
     host: String,
@@ -120,41 +190,28 @@ pub async fn launch_project_session_on(
     account: String,
 ) -> Result<(String, u32, u32), String> {
     use crate::services::host_target::HostTarget;
-    if session_name.is_empty() || project_path.is_empty() {
-        return Err("session_name and project_path are required".into());
+    let _ = project_path; // retained in API for pre-flight parity; cc derives its own DIR.
+    if session_name.is_empty() {
+        return Err("session_name is required".into());
     }
-    // Always route through `env` — even when the account needs no
-    // CLAUDE_CONFIG_DIR override. Otherwise tmux's `/bin/sh -c
-    // '<shell-command>'` wrapping leaves a `zsh` / `sh` process as the
-    // pane's top-of-tree, which masks the patched Claude binary from
-    // `pane_is_claude` (the check looks for "claude" / "cld" in
-    // `pane_current_command`). `env` is a C program that sets any
-    // given vars then exec-replaces itself with the remaining argv, so
-    // the chain collapses to tmux → env → mncld → cli-mncld-118.bin
-    // and tmux reports `cli-mncld-118.b` as `current_command`.
-    let env_prefix = match account.as_str() {
-        "bravura" => "env CLAUDE_CONFIG_DIR=\"$HOME/.claude-b\" ",
-        "sully" => "env CLAUDE_CONFIG_DIR=\"$HOME/.claude-c\" ",
-        _ => "env ",
-    };
-    // Idempotent create-or-attach. Can't use `tmux new-session -A -d`:
-    // when the session already exists, `-A` falls back to
-    // `attach-session -d` which requires a PTY, and over SSH without
-    // `-t` tmux errors out with "open terminal failed: not a terminal".
-    // `has-session` returns 0 when present (then we no-op) and non-zero
-    // when missing (then we create). Either path is TTY-free.
-    let sess_esc = session_name.replace('\'', r"'\''");
-    let path_esc = project_path.replace('\'', r"'\''");
-    let script = format!(
-        "tmux has-session -t '{sess}' 2>/dev/null || \
-         tmux new-session -d -s '{sess}' -c '{path}' -- {env}mncld",
-        sess = sess_esc,
-        path = path_esc,
-        env = env_prefix,
-    );
     let host_t = HostTarget::from_str(Some(&host));
-    crate::commands::tmux::run_tmux_command_async_on(host_t, script).await?;
-    Ok((session_name, 0, 0))
+    // Single-quote each positional so a project name with shell
+    // metacharacters can't break out. cc validates the account itself
+    // (invalid → non-zero exit with clear message).
+    let proj_esc = session_name.replace('\'', r"'\''");
+    let acct_esc = account.replace('\'', r"'\''");
+    let script = format!("cc '{}' '{}'", proj_esc, acct_esc);
+    let output = crate::commands::tmux::run_tmux_command_async_on(host_t, script).await?;
+    // cc prints exactly one line — the effective session name — on
+    // success. Any stderr ("not mirrored", "mismatch", etc.) surfaces
+    // as the Err above via non-zero exit.
+    let effective_session = output
+        .lines()
+        .rev()
+        .find(|l| !l.trim().is_empty())
+        .map(|l| l.trim().to_string())
+        .ok_or_else(|| format!("cc produced no session name (stdout: '{}')", output))?;
+    Ok((effective_session, 0, 0))
 }
 
 /// Check whether `path` exists as a directory on `host`. Used by the UI
@@ -178,7 +235,7 @@ pub async fn check_remote_path_exists(
     use crate::services::host_target::HostTarget;
     let script = format!(
         "test -d {} && echo yes || echo no",
-        shell_quote(&path),
+        crate::services::host_target::ssh_shell_quote(&path),
     );
     let host_t = HostTarget::from_str(Some(&host));
     let out = crate::commands::tmux::run_tmux_command_async_on(host_t, script).await?;
@@ -199,36 +256,18 @@ pub async fn check_remote_path_exists(
 pub async fn check_ssh_master(alias: String) -> Result<bool, String> {
     let script = format!(
         "ssh -O check {} >/dev/null 2>&1 && echo live || echo dead",
-        shell_quote(&alias),
+        crate::services::host_target::ssh_shell_quote(&alias),
     );
     let out = crate::commands::tmux::run_tmux_command_async(script).await?;
     Ok(out.trim() == "live")
 }
 
-/// Single-quote a bash script fragment for safe nesting inside another
-/// bash `-c` invocation. Mirrors [`crate::services::host_target::ssh_shell_quote`]
-/// but kept local to avoid a dependency inversion — this module is a
-/// `commands/*` leaf, the other is `services/*`.
-fn shell_quote(s: &str) -> String {
-    format!("'{}'", s.replace('\'', r"'\''"))
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn shell_quote_plain() {
-        assert_eq!(shell_quote("foo"), "'foo'");
-    }
-
-    #[test]
-    fn shell_quote_with_single_quote() {
-        assert_eq!(shell_quote("a'b"), r"'a'\''b'");
-    }
-
-    // check_remote_path_exists / check_ssh_master are integration-tested by
-    // running the real commands during the end-to-end verification — they
-    // are pure wrappers around a small shell script + the existing
-    // run_tmux_command_async helpers, which have their own tests.
-}
+// Quoting now uses `services::host_target::ssh_shell_quote` directly —
+// the previous local `shell_quote` duplicate was a dependency-inversion
+// concern that turned out not to apply (commands/* may depend on
+// services/*; the rule prohibits the reverse).
+//
+// check_remote_path_exists / check_ssh_master are integration-tested
+// during the end-to-end verification — they're pure wrappers around a
+// small shell script + the existing run_tmux_command_async helpers,
+// which have their own tests.

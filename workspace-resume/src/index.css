@@ -3671,6 +3671,39 @@ div:has(> .drag-overlay-card) {
   color: var(--accent-light);
 }
 
+/* Unmirrored Mac sessions: running remote Claudes with no local ssh
+   attach-window yet. Rendered as a chip row under the toolbar —
+   subtle, dismissible-by-attach, hidden when empty. */
+.pane-grid-unmirrored {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 6px;
+  padding: 4px 10px 8px 10px;
+  border-bottom: 1px dashed var(--border);
+  margin-bottom: 4px;
+}
+.pane-grid-unmirrored__label {
+  font-size: 11px;
+  color: var(--text-muted);
+}
+.pane-grid-unmirrored__chip {
+  background: rgba(20, 184, 166, 0.08);
+  color: #14b8a6;
+  border: 1px solid rgba(20, 184, 166, 0.35);
+  border-radius: 4px;
+  padding: 3px 8px;
+  font-size: 11px;
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  cursor: pointer;
+}
+.pane-grid-unmirrored__chip:hover {
+  background: rgba(20, 184, 166, 0.18);
+  border-color: #14b8a6;
+}
+
 /* CreatePaneModal — picker for host + session + project + account. */
 .create-pane-modal {
   background: #111113;

@@ -384,6 +384,89 @@ pub struct CreateWindowResponse {
     pub pane_id: String,
 }
 
+/// Body for `POST /api/v1/launch-host-session`. The APK-facing mirror
+/// of the desktop's `CreatePaneModal` "launch on remote host" path.
+/// Only meaningful for `host != "local"` — local launches go through
+/// `CreateWindowRequest` / `POST /api/v1/windows`, which is
+/// specifically designed for "add a new window to the currently
+/// attached WSL session". Having a second local-launch path would
+/// fragment the UX for no gain.
+///
+/// `project_path` is the WSL-side path that `/api/v1/projects`
+/// returned (the APK has no WSL-vs-Mac translation logic); the backend
+/// derives the basename and rewrites to the remote-host filesystem
+/// convention (`/Users/admin/projects/<basename>` on Mac).
+#[derive(Debug, Deserialize)]
+pub struct LaunchHostSessionRequest {
+    pub host: String,            // SSH alias, e.g. "mac"
+    pub account: String,         // "andrea" | "bravura" | "sully"
+    pub project_path: String,    // WSL-side absolute path
+    pub project_display_name: String,
+}
+
+/// Response for [`LaunchHostSessionRequest`]. Shape mirrors
+/// [`CreateWindowResponse`] with an additional `session_name` so the
+/// APK can surface the per-project session name (cc convention: the
+/// project basename) without parsing the pane_id.
+#[derive(Debug, Serialize)]
+pub struct LaunchHostSessionResponse {
+    pub pane_id: String,      // alias-prefixed, e.g. "mac/akamai-v3-bestbuy:0.0"
+    pub window_index: u32,
+    pub session_name: String, // bare session name on the remote host
+}
+
+/// Body for `POST /api/v1/sync-project-to-mac`. Triggers the
+/// `sync-add-project` Mutagen helper so a project that isn't mirrored
+/// yet becomes reachable for a Mac launch. Idempotent helper — calling
+/// again for an already-synced project is a no-op on the WSL side.
+///
+/// Used by the APK to retry `/api/v1/launch-host-session` when the
+/// initial attempt 400s with "not mirrored" — the user taps "Sync now"
+/// on the error, we run this, then the launch retries.
+#[derive(Debug, Deserialize)]
+pub struct SyncProjectRequest {
+    pub encoded_project: String,
+}
+
+#[derive(Debug, Serialize)]
+pub struct SyncProjectResponse {
+    /// Combined stdout from `sync-add-project` — the app surfaces the
+    /// last few lines as a toast so the user can see "creating session"
+    /// vs "already exists" vs any error text verbatim.
+    pub output: String,
+}
+
+/// Body for `POST /api/v1/attach-remote-session`. Tells the desktop's
+/// Rust to create (or select) a local WSL tmux window that SSH-attaches
+/// to the named remote session — same affordance the desktop's
+/// "Attach here" button triggers, but accessible from the phone so the
+/// mirror is ready when the user gets back to WezTerm.
+///
+/// Idempotent: re-uses an existing `<alias>/<session>` window instead
+/// of duplicating, so a phone-tap-then-desktop-click doesn't create two.
+#[derive(Debug, Deserialize)]
+pub struct AttachRemoteSessionRequest {
+    pub alias: String,
+    pub session_name: String,
+}
+
+#[derive(Debug, Serialize)]
+pub struct AttachRemoteSessionResponse {
+    /// The local WSL tmux window name that now mirrors the remote
+    /// session (`<alias>/<session_name>`). Surfaced in confirmation
+    /// toasts; clients can also use it to find the mirror later.
+    pub local_window_name: String,
+}
+
+/// Response for `GET /api/v1/remote-hosts`. Wrapped in an object so
+/// future fields (default host, per-host health) can land without
+/// breaking the wire shape. Sorted; matches the `services::remote_hosts`
+/// union (pane_assignments + configured store + first-run fallback).
+#[derive(Debug, Serialize)]
+pub struct RemoteHostsResponse {
+    pub hosts: Vec<String>,
+}
+
 // ---------------------------------------------------------------------------
 // Pane lifecycle (split-window)
 // ---------------------------------------------------------------------------

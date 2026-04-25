@@ -390,26 +390,6 @@ fn filter_assignments(
         .collect()
 }
 
-/// Per-scope pane-index → encoded_project map for one `(host, session, window)`.
-/// Preserves the pre-refactor wire shape so every caller that used the
-/// old `get_pane_assignments(session, window)` just gains a required
-/// leading `host` arg. For local panes pass `host = "local"`.
-#[tauri::command]
-pub async fn get_pane_assignments(
-    host: String,
-    session_name: String,
-    window_index: u32,
-    app: tauri::AppHandle,
-) -> Result<HashMap<String, String>, String> {
-    let full = load_pane_assignments(&app)?;
-    Ok(filter_assignments(
-        &flatten_assignments(&full),
-        &host,
-        &session_name,
-        window_index,
-    ))
-}
-
 /// Return ALL pane assignments unfiltered, keyed on the full 4-segment
 /// coord (`host|session|window|pane`). Used by resurrect and by the
 /// AppContext grid to know every assigned slot across every host.

@@ -1,7 +1,7 @@
 import { createSignal, createMemo, For, Show, onMount, onCleanup } from "solid-js";
 import { createDroppable } from "@thisbeyond/solid-dnd";
 import { useApp } from "../../contexts/AppContext";
-import { setProjectTier, sendToPane } from "../../lib/tauri-commands";
+import { setProjectTier, sendToPaneOn } from "../../lib/tauri-commands";
 import { deriveName, pathMatchesProject } from "../../lib/path";
 import type { ProjectWithMeta } from "../../lib/types";
 
@@ -26,16 +26,24 @@ function PinnedPill(props: {
     return "";
   };
 
-  function findWaitingPane(): [number, number] | null {
+  /** Locate a waiting-for-approval pane for this project across every
+   *  host+session the app is tracking. Return carries the full
+   *  coordinate so the double-click Enter-send below can route the
+   *  keys to the correct tmux server (local or Mac). windowStatuses
+   *  keys are "host|session|winIdx" after the multi-host refactor. */
+  function findWaitingPane(): { host: string; session: string; windowIndex: number; paneIndex: number } | null {
     const proj = state.projects.find((p) => p.encoded_name === props.project.encoded_name);
     if (!proj) return null;
-    for (const [winIdx, status] of Object.entries(state.windowStatuses)) {
+    for (const [key, status] of Object.entries(state.windowStatuses)) {
+      const [host, session, winStr] = key.split("|");
+      if (!host || !session || !winStr) continue;
+      const windowIndex = Number(winStr);
       const paths = status.active_paths ?? [];
       const panes = status.active_panes ?? [];
       const waiting = status.waiting_panes ?? [];
       for (let i = 0; i < paths.length; i++) {
         if (pathMatchesProject(paths[i], proj.actual_path) && waiting.includes(panes[i])) {
-          return [Number(winIdx), panes[i]];
+          return { host, session, windowIndex, paneIndex: panes[i] };
         }
       }
     }
@@ -50,12 +58,20 @@ function PinnedPill(props: {
       clearTimeout(clickTimer);
       clickTimer = null;
       const wp = findWaitingPane();
-      if (wp && state.selectedTmuxSession) {
-        sendToPane(state.selectedTmuxSession, wp[0], wp[1], "").catch(() => {});
+      if (wp) {
+        // Empty command with Enter = "approve default / confirm" on the
+        // Claude approval prompt. Routes to the pane's own host so a
+        // Mac pane's approval is sent over SSH to the Mac's tmux, not
+        // the local server.
+        sendToPaneOn(wp.host, wp.session, wp.windowIndex, wp.paneIndex, "").catch(() => {});
       }
     } else {
       const win = findProjectWindow(props.project.encoded_name);
-      if (win) {
+      // Only follow local windows — TopBar session/window tabs don't
+      // yet expose remote-host sessions, so selecting a Mac session
+      // would orphan the tab bar. Double-click send-Enter above still
+      // works for Mac panes because it doesn't need UI navigation.
+      if (win && win.host === "local") {
         selectTmuxSession(win.session);
         selectTmuxWindow(win.windowIndex);
       }

@@ -2,21 +2,14 @@ import { Show, createSignal, createEffect, For, onMount } from "solid-js";
 import {
   createPaneOn,
   createSessionOn,
-  launchProjectSessionOn,
   listTmuxSessionsOn,
+  checkRemotePathExists,
+  syncProjectToMac,
+  launchProjectSessionOn,
+  attachRemoteSession,
 } from "../../lib/tauri-commands";
 import { useApp } from "../../contexts/AppContext";
 import type { TmuxSession, ProjectWithMeta } from "../../lib/types";
-
-/** Derive the Mac-side project path under the Mutagen `~/projects`
- *  convention. Mirrors `toMacPath` in `launch.ts`; kept inline here to
- *  avoid importing a module that also statically imports
- *  tauri-commands (the circular static/dynamic import warning). */
-function macPathFor(wslProjectPath: string): string {
-  const parts = wslProjectPath.split(/[\\/]+/).filter((s) => s.length > 0);
-  const basename = parts[parts.length - 1] ?? "";
-  return basename ? `/Users/admin/projects/${basename}` : "";
-}
 
 /**
  * Ask the user where to create a new tmux pane: which host, which
@@ -131,27 +124,88 @@ export function CreatePaneModal(props: {
           ? state.projects.find((p) => p.encoded_name === enc)
           : undefined;
 
-        // cc-equivalent path: host != local AND a project is picked.
-        // Starts a detached tmux session running mncld inside the Mac
-        // project dir under the chosen Claude account. Matches what
-        // `~/bin/cc <project> <account>` does on the Mac terminal but
-        // stays headless so no TTY is required over SSH.
+        // Remote + project picked: split the user's CURRENT LOCAL tmux
+        // window and run `ssh -t <host> cc <project> <account>` in the
+        // new pane. The new pane is a LOCAL tmux pane — visible in the
+        // user's WezTerm-attached main session — that happens to be
+        // running an SSH session into the Mac. Inside, `cc` does
+        // `tmux new-session -A` on the Mac side, so the Mac tmux
+        // session is created/attached transparently. Exactly what
+        // typing `ssh -t mac cc <proj> <acct>` manually does.
         if (h !== "local" && proj) {
-          const projectPathOnHost = macPathFor(proj.actual_path);
-          if (!projectPathOnHost) {
-            throw new Error("unable to derive project path for this host");
+          // Canonical Mac launch path — same primitives the phone
+          // (companion `/api/v1/launch-host-session`) uses. Three
+          // steps, all delegating to Mac-side cc as the single source
+          // of truth:
+          //
+          //   1. Pre-flight: ensure the project directory is mirrored.
+          //      `sync-add-project` is idempotent, so re-running is a
+          //      fast no-op. Without this, cc fails with "no such
+          //      project" inside ssh and the user is left at a bash
+          //      prompt (the original CreatePaneModal local-split +
+          //      send-keys bug).
+          //   2. `launchProjectSessionOn` → ssh's into Mac and runs
+          //      `cc <project> <account>` in headless mode. cc handles
+          //      session-name suffixing (`-b` / `-c`), env prefix,
+          //      account-mismatch detection, and prints the effective
+          //      session name on stdout.
+          //   3. `attachRemoteSession` creates a dedicated local
+          //      `<host>/<session>` tmux window running
+          //      `ssh -t mac tmux attach-session -t <session>`. That
+          //      window is recognized by Fix 1a's mirror detection,
+          //      so the Mac pane card lands in its grid and the user
+          //      sees the live terminal in WezTerm by switching to
+          //      that window.
+          //
+          // The previous local-split + send-keys-`ssh -t mac cc …`
+          // approach was deleted: it created a stray pane in the
+          // user's currently-selected window, didn't form a mirror
+          // (window name was wrong; start_command was bash from the
+          // resurrect snapshot), and confused the grid filter into
+          // mis-labeling the pane via cwd-match. Going through the
+          // canonical path means desktop launches behave identically
+          // to phone launches — one mental model.
+          const projBasename =
+            proj.actual_path.split(/[\\/]+/).filter((s) => s.length > 0).pop() ??
+            proj.encoded_name;
+          const macPath = `/Users/admin/projects/${projBasename}`;
+          const mirrored = await checkRemotePathExists(h, macPath);
+          if (!mirrored) {
+            setError(`Syncing ${projBasename} to ${h}…`);
+            try {
+              await syncProjectToMac(proj.encoded_name);
+              setError(null);
+            } catch (syncErr) {
+              throw new Error(
+                `sync to ${h} failed — cannot launch without a synced project: ${
+                  syncErr instanceof Error ? syncErr.message : String(syncErr)
+                }`,
+              );
+            }
           }
+          const [effectiveSession] = await launchProjectSessionOn(
+            h,
+            projBasename,
+            macPath,
+            account(),
+          );
+          // Auto-attach. Failure is non-fatal: the Mac session still
+          // exists, the user can click the unmirrored caret chip to
+          // retry. Surfaced as a warning rather than blocking.
           try {
-            await launchProjectSessionOn(h, session, projectPathOnHost, account());
-          } catch (e) {
-            const msg = e instanceof Error ? e.message : String(e);
-            // `tmux new-session -A -d` is already idempotent, so a
-            // duplicate-session error here is rare — but catch it for
-            // parity with the bare-session path and treat as "attach to
-            // existing".
-            if (!/duplicate session/i.test(msg)) throw e;
+            await attachRemoteSession(h, effectiveSession);
+          } catch (attachErr) {
+            console.warn(
+              "[CreatePaneModal] attachRemoteSession failed (Mac session still exists):",
+              attachErr,
+            );
           }
-          props.onCreated({ host: h, session, windowIndex: 0, paneIndex: 0 });
+          props.onCreated({
+            host: h,
+            session: effectiveSession,
+            windowIndex: 0,
+            paneIndex: 0,
+          });
           props.onClose();
           return;
         }
