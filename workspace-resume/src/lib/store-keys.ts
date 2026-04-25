@@ -6,4 +6,5 @@ export const STORE_KEYS = {
   TERMINAL_SETTINGS: "terminal_settings",
   ERROR_LOG: "error_log",
   SESSION_NAMES: "session_names",
+  ALWAYS_ON_TOP: "always_on_top",
 } as const;

@@ -1,5 +1,6 @@
 import { createSignal, createMemo, For, Show, onMount, onCleanup } from "solid-js";
 import { getCurrentWebviewWindow } from "@tauri-apps/api/webviewWindow";
+import { LazyStore } from "@tauri-apps/plugin-store";
 import { createSortable, SortableProvider, transformStyle } from "@thisbeyond/solid-dnd";
 import { useApp } from "../../contexts/AppContext";
 import { SettingsPanel, showAnimations } from "../SettingsPanel";
@@ -18,9 +19,15 @@ import { Activity, Settings as SettingsIcon, Plus, ChevronDown } from "../ui/ico
 import { accountForPane, ACCOUNT_COLORS } from "../../lib/account";
 import { StatusOrb } from "../ui/StatusOrb";
 import { deriveName, matchProjectByPath } from "../../lib/path";
+import { STORE_KEYS } from "../../lib/store-keys";
 
 // Window tab reorder prefix (only remaining drag type in top bar)
 export const WINDOW_TAB_PREFIX = "window-tab:";
+
+// Persists the alwaysOnTop preference across launches. Same store
+// file SettingsPanel writes to ("settings.json"); the dedicated key
+// keeps it from colliding with anything the Rust side reads/writes.
+const uiStore = new LazyStore("settings.json");
 
 // ---------------------------------------------------------------------------
 // Window tab (still sortable)
@@ -128,15 +135,31 @@ export function TopBar() {
   });
 
   onMount(async () => {
-    // Don't force always-on-top — let the OS decide window stacking
-    // and let the user opt in via the pin toggle if they want it.
-    await getCurrentWebviewWindow().setAlwaysOnTop(false);
+    // Restore the user's previous pin preference. Default false on
+    // first launch (the user opted into "stop pinning by default" —
+    // they can pin per-launch via the toggle, and we'll remember it
+    // for next time). Failures are silent: an unreadable store
+    // shouldn't strand the window in a state the user can't fix.
+    let pinned = false;
+    try {
+      const stored = await uiStore.get<boolean>(STORE_KEYS.ALWAYS_ON_TOP);
+      if (typeof stored === "boolean") pinned = stored;
+    } catch (_) {}
+    await getCurrentWebviewWindow().setAlwaysOnTop(pinned);
+    setAlwaysOnTop(pinned);
   });
 
   async function toggleAlwaysOnTop() {
     const next = !alwaysOnTop();
     await getCurrentWebviewWindow().setAlwaysOnTop(next);
     setAlwaysOnTop(next);
+    // Persist so the next launch respects the choice. Save failures
+    // are non-fatal — the window state is already correct, the only
+    // loss is the cross-launch memory.
+    try {
+      await uiStore.set(STORE_KEYS.ALWAYS_ON_TOP, next);
+      await uiStore.save();
+    } catch (_) {}
   }
 
   // Confirm-kill state
