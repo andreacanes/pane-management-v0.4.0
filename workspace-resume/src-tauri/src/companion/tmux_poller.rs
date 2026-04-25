@@ -801,6 +801,9 @@ async fn poll_once_remote(state: &AppState, alias: &str) -> anyhow::Result<()> {
                 updated_at: now,
                 last_activity_at: None,
                 warning: None,
+                // Remote panes (Mac tmux) are never SSH mirrors —
+                // they're the actual destinations. Field stays None.
+                mirror_target: None,
             },
             output_hash: [0u8; 32],
             last_output_change: None,
@@ -1193,7 +1196,19 @@ async fn poll_once(state: &AppState) -> anyhow::Result<()> {
         (session, window_index, window_name, pane_index, cur_cmd, cur_path, pane_pid, start_cmd, pane_uid, pane_pipe_active, pane_width),
     ) in fresh.into_iter()
     {
-        let project_match = lookup_project(&project_map, &cur_path).cloned();
+        // SSH-mirror panes are local panes whose process is `ssh -t mac
+        // tmux attach-session -t <session>` — viewports into a remote
+        // tmux server. Their cwd is wherever ssh was invoked from
+        // (`/home/andrea` or `/mnt/c/Users/Andrea`), which the
+        // path-fallback in `lookup_project` would mistag as the
+        // `andrea` project. Skip the lookup entirely; clients use the
+        // `mirror_target` field for rendering instead.
+        let mirror_target = crate::services::ssh_mirror::parse_mirror_target(&start_cmd);
+        let project_match = if mirror_target.is_some() {
+            None
+        } else {
+            lookup_project(&project_map, &cur_path).cloned()
+        };
         let project_encoded = project_match.as_ref().map(|(e, _)| e.clone());
         let project_display = project_match.as_ref().map(|(_, d)| d.clone());
         let cap_out = cap_map.get(&id).cloned().unwrap_or_default();
@@ -1248,6 +1263,7 @@ async fn poll_once(state: &AppState) -> anyhow::Result<()> {
                 updated_at: now,
                 last_activity_at: None,
                 warning: None,
+                mirror_target: mirror_target.clone(),
             },
             output_hash: [0u8; 32],
             last_output_change: None,
@@ -1294,6 +1310,10 @@ async fn poll_once(state: &AppState) -> anyhow::Result<()> {
         rec.dto.current_path = cur_path.clone();
         rec.dto.project_encoded_name = project_encoded.clone();
         rec.dto.project_display_name = project_display.clone();
+        // Refresh per tick — start_command shouldn't change, but if a
+        // user kills a mirror pane and reuses the slot for a regular
+        // shell, the field must clear.
+        rec.dto.mirror_target = mirror_target.clone();
         rec.pane_width = pane_width;
         rec.pane_uid = pane_uid.clone();
         rec.pane_pid = pane_pid.clone();

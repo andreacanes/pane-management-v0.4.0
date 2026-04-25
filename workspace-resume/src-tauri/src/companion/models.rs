@@ -112,6 +112,20 @@ pub struct PaneDto {
     /// cleanly. None for healthy panes.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub warning: Option<String>,
+    /// `Some` iff this pane is a local SSH mirror — i.e. its
+    /// `start_command` is `ssh -t <alias> tmux attach-session -t <session>`,
+    /// used as a viewport into a remote tmux server. When set:
+    ///   * `project_encoded_name` / `project_display_name` are skipped
+    ///     (the cwd-fallback would mistag them as `andrea` / `Andrea`).
+    ///   * Clients render the pane with a `🔗 alias/session` label
+    ///     instead of treating it as a regular project pane.
+    ///   * The APK filters mirror panes out of its main list because
+    ///     they're a desktop-WezTerm concept (the phone has no local
+    ///     terminal to mirror into).
+    /// `None` for ordinary panes — the wire absence carries the same
+    /// meaning thanks to `skip_serializing_if`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub mirror_target: Option<crate::services::ssh_mirror::MirrorTarget>,
 }
 
 // ---------------------------------------------------------------------------

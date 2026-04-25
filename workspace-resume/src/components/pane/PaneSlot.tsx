@@ -101,33 +101,20 @@ export function PaneSlot(props: { pane: TmuxPane; assignment?: string | null }) 
     });
   };
 
-  /** Local ssh-mirror panes — windows we created via
-   *  `attachRemoteSession` whose single pane runs
+  /** Local ssh-mirror panes — windows whose single local pane runs
    *  `ssh -t <alias> tmux attach-session -t <session>` as a live
-   *  viewport into the remote tmux. These aren't "working on a
-   *  project"; without this check the cross-host-identity basename
-   *  lookup would match the ssh process's cwd (`/home/andrea`) to the
-   *  WSL project named "Andrea" and render them with the wrong title,
-   *  plus offer nonsensical Resume/Fork buttons. Detected by parsing
-   *  `start_command`. */
-  const isSshMirror = () => {
-    const sc = (props.pane.start_command ?? "").toLowerCase();
-    return sc.includes("ssh -t") && sc.includes("tmux attach-session");
-  };
+   *  viewport into the remote tmux. The backend stamps
+   *  `mirror_target` on the DTO via `services::ssh_mirror`, so the
+   *  frontend just reads the wire field; without it the
+   *  cross-host-identity basename lookup would mistag these panes
+   *  as the WSL `andrea` project (cwd is `/home/andrea`). */
+  const isSshMirror = () => props.pane.mirror_target != null;
 
-  /** Parse `<alias>` and `<session>` out of an ssh-mirror pane's
-   *  start_command. Returns null for non-mirrors. Drives the mirror
-   *  card's label.
-   *
-   *  tmux's pane_start_command format wraps the command in quotes
-   *  (e.g. `"ssh -t mac tmux attach-session -t foo"`). `\S` would
-   *  capture the trailing `"` into the session name; explicit
-   *  exclusion of quote chars keeps the parsed name clean. */
-  const mirrorTarget = (): { alias: string; session: string } | null => {
-    const sc = props.pane.start_command ?? "";
-    const m = sc.match(/ssh\s+-t\s+([^\s"']+)\s+tmux\s+attach-session\s+-t\s+([^\s"']+)/i);
-    return m ? { alias: m[1], session: m[2] } : null;
-  };
+  /** Mirror target from the wire — `{alias, session}` or `null` for
+   *  ordinary panes. Drives the mirror card's label and the merge
+   *  logic in AppContext.dropDuplicateMirrors. */
+  const mirrorTarget = (): { alias: string; session: string } | null =>
+    props.pane.mirror_target ?? null;
 
   /**
    * If the live cwd matches a known project different from the stored

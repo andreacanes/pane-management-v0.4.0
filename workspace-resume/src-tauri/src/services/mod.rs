@@ -4,6 +4,7 @@ pub mod launch_cmd;
 pub mod path_decoder;
 pub mod remote_hosts;
 pub mod scanner;
+pub mod ssh_mirror;
 pub mod store;
 pub mod usage;
 pub mod watcher;

@@ -66,6 +66,12 @@ pub struct TmuxPane {
     /// always stamp before returning to the wire).
     #[serde(default)]
     pub session_name: String,
+    /// `Some` iff this pane is a local SSH mirror (its `start_command`
+    /// matches `ssh -t <alias> tmux attach-session -t <session>`).
+    /// Stamped by the parser via `services::ssh_mirror::parse_mirror_target`.
+    /// See the field of the same name on `PaneDto` for the full rationale.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mirror_target: Option<crate::services::ssh_mirror::MirrorTarget>,
 }
 
 // Used by `#[serde(default = "...")]` on `TmuxPane::host` when we
@@ -152,6 +158,7 @@ mod tests {
             is_worktree: false,
             host: "local".to_string(),
             session_name: "main".to_string(),
+            mirror_target: None,
         };
         let json = serde_json::to_string(&pane).unwrap();
         assert!(json.contains("\"pane_id\":\"%5\""));
@@ -193,6 +200,7 @@ mod tests {
                 is_worktree: false,
                 host: "local".to_string(),
                 session_name: "test".to_string(),
+                mirror_target: None,
             }],
         };
         let json = serde_json::to_string(&state).unwrap();

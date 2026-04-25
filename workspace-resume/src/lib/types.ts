@@ -145,6 +145,17 @@ export interface TmuxPane {
    * from any Mac session (one per project in the `cc` convention).
    */
   session_name: string;
+  /**
+   * Set when this pane is a local SSH mirror — i.e. its `start_command`
+   * is `ssh -t <alias> tmux attach-session -t <session>`, used as a
+   * viewport into a remote tmux server. The backend stamps this via
+   * `services::ssh_mirror::parse_mirror_target` so every client reads
+   * one unambiguous field instead of each rolling its own regex.
+   * `null` / absent for ordinary panes; the project_encoded_name and
+   * project_display_name are skipped on the wire when mirror_target is
+   * set, so this is the canonical signal.
+   */
+  mirror_target?: { alias: string; session: string } | null;
 }
 
 export interface TmuxState {

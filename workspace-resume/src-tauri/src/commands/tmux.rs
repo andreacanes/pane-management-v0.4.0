@@ -332,6 +332,7 @@ pub fn parse_pane_line(line: &str) -> Option<TmuxPane> {
     };
     let path_end = if parts.len() >= 10 { parts.len() - 1 } else { parts.len() };
     let current_path = parts[path_start..path_end].join("|");
+    let mirror_target = crate::services::ssh_mirror::parse_mirror_target(&start_command);
     Some(TmuxPane {
         pane_index: parts[0].parse().unwrap_or(0),
         pane_id: parts[1].to_string(),
@@ -353,6 +354,7 @@ pub fn parse_pane_line(line: &str) -> Option<TmuxPane> {
         // leave sane defaults here and let the command layer fill them in.
         host: "local".to_string(),
         session_name: String::new(),
+        mirror_target,
     })
 }
 

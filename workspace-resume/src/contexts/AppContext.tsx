@@ -363,19 +363,19 @@ export function AppProvider(props: { children: JSX.Element }) {
    *  session — render just the richer Mac pane card (project, account,
    *  Claude state) instead of two cards for the same thing. Falls back
    *  to keeping the mirror if the Mac pane isn't reachable, so the
-   *  slot doesn't disappear when the Mac is slow / off / SSH down. */
+   *  slot doesn't disappear when the Mac is slow / off / SSH down.
+   *
+   *  Reads `mirror_target` from the wire DTO — the backend's
+   *  `services::ssh_mirror` parses `start_command` once at poll time,
+   *  so this function doesn't carry its own parser. */
   function dropDuplicateMirrors(local: TmuxPane[], matched: TmuxPane[]): TmuxPane[] {
     const targets = new Set(
       matched.map((p) => `${p.host || ""}/${p.session_name || ""}`),
     );
     return local.filter((p) => {
-      const sc = (p.start_command || "").toLowerCase();
-      if (!sc.includes("ssh -t") || !sc.includes("tmux attach-session")) return true;
-      const m = (p.start_command || "").match(
-        /ssh\s+-t\s+([^\s"']+)\s+tmux\s+attach-session\s+-t\s+([^\s"']+)/i,
-      );
+      const m = p.mirror_target;
       if (!m) return true;
-      return !targets.has(`${m[1]}/${m[2]}`);
+      return !targets.has(`${m.alias}/${m.session}`);
     });
   }
 
