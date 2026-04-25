@@ -79,10 +79,25 @@ export function PaneSlot(props: { pane: TmuxPane; assignment?: string | null }) 
   const detectedProject = (): ProjectWithMeta | undefined => {
     const panePath = props.pane.current_path?.toLowerCase().replace(/[\\/]+$/, "");
     if (!panePath) return undefined;
-    return state.projects.find((p) => {
+    // Direct path match — works for any pane whose cwd literally
+    // equals one of the known project paths.
+    const direct = state.projects.find((p) => {
       const actual = p.actual_path.toLowerCase().replace(/[\\/]+$/, "");
       const wsl = fromWslPath(p.actual_path).toLowerCase().replace(/[\\/]+$/, "");
       return actual === panePath || wsl === panePath;
+    });
+    if (direct) return direct;
+    // Basename fallback — a Mac pane's cwd `/Users/admin/projects/foo`
+    // never path-matches WSL's `/home/andrea/foo`, but the basenames do.
+    // Only triggers for non-local panes; on local panes a basename
+    // collision between sibling projects would be a real ambiguity, so
+    // we'd rather match nothing than guess.
+    if ((props.pane.host || "local") === "local") return undefined;
+    const paneBase = panePath.split(/[\\/]+/).filter(Boolean).pop();
+    if (!paneBase) return undefined;
+    return state.projects.find((p) => {
+      const projBase = p.actual_path.split(/[\\/]+/).filter(Boolean).pop();
+      return projBase?.toLowerCase() === paneBase;
     });
   };
 
@@ -164,7 +179,11 @@ export function PaneSlot(props: { pane: TmuxPane; assignment?: string | null }) 
   };
   const isPaneSelectMode = () => pendingLaunch() != null;
   const hasProject = () => effectiveProject() != null;
-  const isOccupied = () => isRunningClaude() || hasProject();
+  // SSH-mirror panes have no project + no Claude, but we still want
+  // them to render with the 🔗 alias/session label instead of the
+  // "Empty pane" fallback — they're a meaningful slot, just one that
+  // lives across an SSH boundary.
+  const isOccupied = () => isSshMirror() || isRunningClaude() || hasProject();
 
   const statusKind = () => {
     if (isWaitingApproval()) return "waiting";
