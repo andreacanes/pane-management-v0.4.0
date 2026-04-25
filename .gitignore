@@ -3,8 +3,10 @@ graphics/
 deployment-package/
 
 # Claude Code local config — rules, skills, agents are committed; only the
-# per-machine settings file is ignored
+# per-machine settings file is ignored, and the harness's transient
+# scheduled-task lock file (recreated on every run).
 .claude/settings.local.json
+.claude/scheduled_tasks.lock
 
 # OS files
 .DS_Store

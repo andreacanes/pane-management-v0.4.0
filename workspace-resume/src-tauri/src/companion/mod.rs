@@ -39,7 +39,7 @@ pub mod tmux_poller;
 pub mod ws;
 
 use std::sync::Arc;
-use tauri::{AppHandle, Manager};
+use tauri::{AppHandle, Emitter, Manager};
 
 pub const COMPANION_PORT: u16 = 8833;
 pub const BIND_ADDR: &str = "0.0.0.0";
@@ -123,6 +123,33 @@ pub async fn spawn(app: AppHandle) -> anyhow::Result<()> {
     let rl_state = state.clone();
     tokio::spawn(async move {
         rate_limit_poller::run(rl_state).await;
+    });
+
+    // Bridge the companion's in-process event broadcast to the Tauri
+    // webview as a Tauri event named `companion-event`. The APK
+    // consumes the same events over /api/v1/events WebSocket; wiring
+    // them through Tauri in the desktop saves a localhost WebSocket
+    // round-trip (both the companion server and the Tauri window run
+    // in the same process) and bypasses bearer-token plumbing on the
+    // frontend. Lag errors are logged and dropped — they indicate the
+    // frontend is falling behind the 1024-slot broadcast ring, which
+    // the frontend's own fallback polling will catch up on.
+    let bridge_app = app.clone();
+    let mut bridge_rx = state.events.subscribe();
+    tokio::spawn(async move {
+        loop {
+            match bridge_rx.recv().await {
+                Ok(ev) => {
+                    if let Err(e) = bridge_app.emit("companion-event", &ev) {
+                        tracing::debug!("emit companion-event failed: {e}");
+                    }
+                }
+                Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
+                    tracing::debug!("tauri event bridge lagged by {n}");
+                }
+                Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+            }
+        }
     });
 
     // Serve HTTP

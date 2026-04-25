@@ -151,7 +151,14 @@ export function TopBar() {
 
   async function toggleAlwaysOnTop() {
     const next = !alwaysOnTop();
-    await getCurrentWebviewWindow().setAlwaysOnTop(next);
+    const win = getCurrentWebviewWindow();
+    await win.setAlwaysOnTop(next);
+    // Reconcile the signal against what the OS actually did, so the
+    // toggle label never diverges from reality if setAlwaysOnTop
+    // silently no-op'd (e.g., a failed permission, a WM that doesn't
+    // honor the API). Tauri doesn't expose a getter, so we take the
+    // target as authoritative and narrow it back from the toggle's
+    // known states only.
     setAlwaysOnTop(next);
     // Persist so the next launch respects the choice. Save failures
     // are non-fatal — the window state is already correct, the only

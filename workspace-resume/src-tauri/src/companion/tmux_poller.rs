@@ -45,6 +45,15 @@ const SWEEP_EVERY_N_TICKS: u32 = 10;
 static MISSING_SINCE: LazyLock<Mutex<HashMap<String, Instant>>> =
     LazyLock::new(|| Mutex::new(HashMap::new()));
 
+/// Last-known active window per session key (`"<host>|<session>"` →
+/// `window_index`). `poll_once` compares each tick's snapshot against
+/// this and emits `WindowFocusChanged` only on a real change; without
+/// the diff we'd re-emit every tick for every session, flooding the
+/// event bus. Module-local because the poll loop is the sole
+/// reader/writer (single-consumer, sequential).
+static LAST_ACTIVE_WINDOWS: LazyLock<Mutex<HashMap<String, u32>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
+
 /// Normalize a path for cross-format matching: lowercase, strip trailing
 /// slashes, convert backslashes to forward slashes. Used to compare a
 /// pane's `current_path` (always POSIX from WSL tmux) against a known
@@ -1106,13 +1115,19 @@ async fn poll_once(state: &AppState) -> anyhow::Result<()> {
         String,
         (String, u32, String, u32, String, String, String, String, String, bool, u16),
     > = HashMap::new();
+    // Active-window detection per session. Multiple panes in the active
+    // window all report `#{window_active}` = 1; dedupe by session and
+    // remember the first `window_index` we see. Compared to
+    // `LAST_ACTIVE_WINDOWS` at the end of this poll to emit
+    // `WindowFocusChanged` only when the focus actually shifts.
+    let mut active_windows_this_tick: HashMap<String, u32> = HashMap::new();
 
     for line in out.lines() {
         if line.trim().is_empty() {
             continue;
         }
         let parts: Vec<&str> = line.split('|').collect();
-        if parts.len() < 11 {
+        if parts.len() < 12 {
             continue;
         }
         let session = parts[0].to_string();
@@ -1126,7 +1141,18 @@ async fn poll_once(state: &AppState) -> anyhow::Result<()> {
         // `pane_id` from tmux is `%N` — strip the `%` for filesystem safety.
         let pane_uid = parts[8].trim_start_matches('%').to_string();
         let pane_width: u16 = parts[9].parse().unwrap_or(0);
-        let start_cmd = parts[10..].join("|"); // in case start_command contains pipes
+        let window_active = parts[10] == "1";
+        let start_cmd = parts[11..].join("|"); // in case start_command contains pipes
+
+        // Track the active window per session so we can emit
+        // WindowFocusChanged at the end of this tick. Multiple panes
+        // in the active window all report window_active=1; dedupe by
+        // session and pick the first window_index we see.
+        if window_active {
+            active_windows_this_tick
+                .entry(session.clone())
+                .or_insert(window_index);
+        }
         let id = format!("{}:{}.{}", session, window_index, pane_index);
 
         seen.insert(id.clone());
@@ -1902,6 +1928,31 @@ async fn poll_once(state: &AppState) -> anyhow::Result<()> {
         if !still_has_panes {
             let _ = state.events.send(EventDto::SessionEnded {
                 name: session,
+                at: now_ms(),
+            });
+        }
+    }
+
+    // Window-focus transitions. Emit inside the same 1 s poll tick the
+    // change was detected in so the desktop's auto-follow reacts
+    // effectively immediately, instead of waiting on the frontend's
+    // 60 s fallback cycle. Session keys may disappear from a tick
+    // (entire session killed) — those show up as SessionEnded above;
+    // we leave LAST_ACTIVE_WINDOWS entries stale because the session
+    // won't come back under the same name without a user action that
+    // would produce its own fresh window_active=1 line.
+    {
+        let mut last = LAST_ACTIVE_WINDOWS.lock().unwrap();
+        for (session, win) in active_windows_this_tick.drain() {
+            let key = format!("local|{}", session);
+            if last.get(&key).copied() == Some(win) {
+                continue;
+            }
+            last.insert(key, win);
+            let _ = state.events.send(EventDto::WindowFocusChanged {
+                host: "local".to_string(),
+                session_name: session,
+                window_index: win,
                 at: now_ms(),
             });
         }

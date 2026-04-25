@@ -11,6 +11,8 @@ import { createStore, produce, reconcile } from "solid-js/store";
 import { pathMatchesProject } from "../lib/path";
 import { listen } from "@tauri-apps/api/event";
 import type { UnlistenFn } from "@tauri-apps/api/event";
+import { subscribeCompanionEvents } from "../lib/companion-events";
+import type { CompanionEvent } from "../lib/types";
 import {
   listProjects,
   getAllProjectMeta,
@@ -659,14 +661,18 @@ export function AppProvider(props: { children: JSX.Element }) {
       if (!stillWaiting) mutedPanes.delete(mk);
     }
 
-    // Filter muted panes out of waiting_panes before storing. Mutates
-    // status objects in place — they were freshly produced by invoke,
-    // so no other consumer holds a reference yet.
+    // Filter muted panes out of waiting_panes. Defensive copy per
+    // entry — earlier versions mutated in place on the assumption no
+    // other consumer held a reference, which is true today but brittle
+    // if a caller ever caches the result of `checkPaneStatusesOn`.
     for (const [key, status] of Object.entries(merged)) {
       const [mHost, mSess, mWin] = key.split("|");
-      status.waiting_panes = status.waiting_panes.filter(
-        (paneIdx) => !mutedPanes.has(muteKey(mHost, mSess, Number(mWin), paneIdx)),
-      );
+      merged[key] = {
+        ...status,
+        waiting_panes: status.waiting_panes.filter(
+          (paneIdx) => !mutedPanes.has(muteKey(mHost, mSess, Number(mWin), paneIdx)),
+        ),
+      };
     }
 
     setState("windowStatuses", reconcile(merged));
@@ -979,6 +985,52 @@ export function AppProvider(props: { children: JSX.Element }) {
   let tmuxPollInterval: ReturnType<typeof setInterval> | undefined;
   let statusPollInterval: ReturnType<typeof setInterval> | undefined;
   let unlistenSessionChanged: UnlistenFn | undefined;
+  let unlistenCompanionEvent: UnlistenFn | undefined;
+
+  /** Handler for the companion's Tauri-bridged event stream.
+   *  Translates Rust-side pane + window changes into local state
+   *  mutations so the UI reacts with ~1 s latency instead of waiting
+   *  on the fallback poll cycle. Anything this doesn't recognise
+   *  falls through to the 60 s full-refresh interval. */
+  function handleCompanionEvent(ev: CompanionEvent) {
+    if (pollingPaused) return;
+    switch (ev.type) {
+      case "window_focus_changed": {
+        // Auto-follow: switch the dashboard's selected window to
+        // whatever the user just focused in tmux. Host-scoped so a
+        // Mac focus change doesn't yank the local-session view.
+        if (ev.host !== "local") break;
+        if (ev.session_name !== state.selectedTmuxSession) break;
+        if (ev.window_index === state.selectedTmuxWindow) break;
+        if (Date.now() <= autoFollowSuppressedUntil) break;
+        selectTmuxWindow(ev.window_index as number);
+        break;
+      }
+      case "pane_state_changed":
+      case "pane_updated":
+      case "pane_removed": {
+        // Any pane-level change that the poller noticed: refresh the
+        // current window's pane list + the waiting/running chips. The
+        // underlying calls are cheap (single tmux list-panes per host)
+        // and coalesce naturally because multiple events within the
+        // same frame collapse to one refresh via the async queue.
+        refreshTmuxState();
+        pollPaneStatuses();
+        break;
+      }
+      case "session_ended":
+      case "session_started": {
+        // Session list needs a re-pull; the top-bar session dropdown
+        // consumes tmuxSessions.
+        loadTmuxSessions();
+        break;
+      }
+      default:
+        // hello / snapshot / approval_* / pane_output_changed — no
+        // desktop-side action; the fallback poll handles any drift.
+        break;
+    }
+  }
 
   onMount(async () => {
     // Load initial data in parallel. `loadRemoteHosts` feeds
@@ -999,40 +1051,49 @@ export function AppProvider(props: { children: JSX.Element }) {
     // F-61: Backfill inodes + scan for orphaned projects (runs in background)
     reconcileProjectInodes();
 
-    // Main tmux poll — 10s fallback for tmux state + project list. Live
-    // updates on the desktop come primarily from tmux-poller's WebSocket
-    // broadcast; this interval catches drift (e.g. a pane assigned from
-    // the phone) that the watcher misses. `pollPaneStatuses` was removed
-    // from this cycle — the 1.5s interval below already fires it, and
-    // piggybacking it on the 10s tick just doubled the wsl.exe load
-    // without changing observed latency.
+    // Main tmux poll — 60 s fallback. Live updates now arrive via the
+    // Tauri event bridge (`companion-event`), which forwards the Rust
+    // poller's 1 s tick broadcasts directly into this context. The
+    // interval is a safety net for (a) events dropped under a lagged
+    // broadcast ring, (b) project metadata that the poller doesn't
+    // touch, and (c) state that drifts between events (e.g. an
+    // assignment edited by the phone). Dropped from 10 s because at
+    // that cadence it dominated the wsl.exe load budget even when
+    // events were flowing.
     const runPollCycle = () => {
       refreshTmuxState();
       loadProjectsWithMeta();
     };
     runPollCycle();
-    // Still call pollPaneStatuses once on mount so the initial chips
-    // reflect real state before the first 1.5s tick fires.
     pollPaneStatuses();
-    tmuxPollInterval = setInterval(runPollCycle, 10000);
+    tmuxPollInterval = setInterval(runPollCycle, 60_000);
 
-    // Fast status poll — pane active/waiting detection runs every 1.5s so
-    // running/waiting chips update near-instantly. The heavy project/tmux
-    // reload still happens on the 10s cycle above.
+    // Chip-status safety net. With events flowing this is strictly a
+    // catch-up for anything pane_state_changed missed; dropped from
+    // 1.5 s to 10 s because the event-triggered refresh above already
+    // covers the fast-path cases.
     statusPollInterval = setInterval(() => {
       pollPaneStatuses();
-    }, 1500);
+    }, 10_000);
 
     // Listen for session file changes from Tauri file watcher
     unlistenSessionChanged = await listen<string[]>("session-changed", () => {
       loadProjectsWithMeta();
     });
+
+    // Subscribe to the companion's live event stream via the Tauri
+    // bridge. Events arrive within ~1 s of the Rust poller detecting
+    // them — orders of magnitude faster than the 60 s fallback above.
+    unlistenCompanionEvent = await subscribeCompanionEvents(
+      handleCompanionEvent,
+    );
   });
 
   onCleanup(() => {
     if (tmuxPollInterval) clearInterval(tmuxPollInterval);
     if (statusPollInterval) clearInterval(statusPollInterval);
     if (unlistenSessionChanged) unlistenSessionChanged();
+    if (unlistenCompanionEvent) unlistenCompanionEvent();
   });
 
   // -- Context value --------------------------------------------------------

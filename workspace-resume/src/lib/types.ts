@@ -193,3 +193,65 @@ export interface CompanionConfig {
   bind: string;
   suggested_url: string;
 }
+
+/**
+ * Wire shape of the companion's event broadcast — same tagged union the
+ * APK consumes over `/api/v1/events`. In the desktop we receive these
+ * via the in-process Tauri bridge (see `src-tauri/src/companion/mod.rs`:
+ * `bridge_rx → app.emit("companion-event", ev)`), so the frontend only
+ * subscribes to a single Tauri event channel and decodes with
+ * `type`-based narrowing.
+ *
+ * Only variants the desktop frontend currently consumes are exhaustively
+ * typed; the rest fall through the `{ type: string }` catch-all so new
+ * Rust-side variants don't break decoding.
+ */
+export type CompanionEvent =
+  | { type: "hello"; at: number }
+  | { type: "snapshot"; panes: PaneDtoWire[]; approvals: unknown[]; attention?: unknown[] }
+  | { type: "pane_updated"; pane: PaneDtoWire }
+  | { type: "pane_state_changed"; pane_id: string; old: string; new: string; at: number }
+  | { type: "pane_output_changed"; pane_id: string; tail: string[]; seq: number; at: number }
+  | { type: "pane_removed"; pane_id: string; at: number }
+  | {
+      type: "window_focus_changed";
+      host: string;
+      session_name: string;
+      window_index: number;
+      at: number;
+    }
+  | { type: "session_started"; name: string; at: number }
+  | { type: "session_ended"; name: string; at: number }
+  | { type: string; [k: string]: unknown };
+
+/**
+ * Wire shape of a pane DTO as the companion emits it — a superset of
+ * what the Tauri-direct `TmuxPane` carries. Only fields the frontend
+ * reads on WebSocket updates are listed; the decoder preserves others
+ * untouched for pass-through to `state.tmuxPanes`.
+ *
+ * Unlike `TmuxPane` this uses the wire id (`<host>/<session>:<window>.<pane>`
+ * or `<session>:<window>.<pane>`) as the primary key, not a tuple.
+ */
+export interface PaneDtoWire {
+  id: string;
+  session_name: string;
+  window_index: number;
+  window_name: string;
+  pane_index: number;
+  current_command: string;
+  current_path: string;
+  state: string;
+  waiting_reason?: string;
+  last_output_preview: string[];
+  project_encoded_name?: string | null;
+  project_display_name?: string | null;
+  claude_session_id?: string | null;
+  claude_account?: string | null;
+  host?: string | null;
+  claude_effort?: string | null;
+  updated_at: number;
+  last_activity_at?: number | null;
+  warning?: string | null;
+  mirror_target?: { alias: string; session: string } | null;
+}

@@ -294,6 +294,18 @@ pub enum EventDto {
         pane_id: String,
         at: i64,
     },
+    /// A session's active window (the one the user is currently looking
+    /// at in the attached tmux client) changed. Emitted within ~1 s of
+    /// the switch so the desktop's auto-follow can react without
+    /// waiting on a full poll cycle. Clients that don't care about
+    /// follow-mode can ignore it safely. Host-aware so we can emit for
+    /// local and remote tmux servers alike.
+    WindowFocusChanged {
+        host: String,
+        session_name: String,
+        window_index: u32,
+        at: i64,
+    },
     /// Reserved session-lifecycle variants — declared for wire
     /// compatibility when we add tmux-session create/destroy broadcast
     /// but not yet emitted by the poller. Keep the shapes frozen so a
