@@ -358,6 +358,27 @@ export function AppProvider(props: { children: JSX.Element }) {
    *  from both — they'll appear when the user switches to that window.
    *  This is the whole point of Fix 1: Mac panes get a "location"
    *  instead of polluting every local window's grid. */
+  /** Drop local SSH-mirror panes whose target Mac pane is already in
+   *  `matched`. Both panes represent the same conceptual remote
+   *  session — render just the richer Mac pane card (project, account,
+   *  Claude state) instead of two cards for the same thing. Falls back
+   *  to keeping the mirror if the Mac pane isn't reachable, so the
+   *  slot doesn't disappear when the Mac is slow / off / SSH down. */
+  function dropDuplicateMirrors(local: TmuxPane[], matched: TmuxPane[]): TmuxPane[] {
+    const targets = new Set(
+      matched.map((p) => `${p.host || ""}/${p.session_name || ""}`),
+    );
+    return local.filter((p) => {
+      const sc = (p.start_command || "").toLowerCase();
+      if (!sc.includes("ssh -t") || !sc.includes("tmux attach-session")) return true;
+      const m = (p.start_command || "").match(
+        /ssh\s+-t\s+([^\s"']+)\s+tmux\s+attach-session\s+-t\s+([^\s"']+)/i,
+      );
+      if (!m) return true;
+      return !targets.has(`${m[1]}/${m[2]}`);
+    });
+  }
+
   function partitionRemotePanes(
     remote: TmuxPane[],
     localWindows: TmuxWindow[],
@@ -400,7 +421,10 @@ export function AppProvider(props: { children: JSX.Element }) {
           activeWin.index,
         );
         batch(() => {
-          setState("tmuxPanes", [...freshState.panes, ...matched]);
+          setState("tmuxPanes", [
+            ...dropDuplicateMirrors(freshState.panes, matched),
+            ...matched,
+          ]);
           setState("unmirroredRemotePanes", unmirrored);
         });
         loadPaneAssignments();
@@ -427,7 +451,10 @@ export function AppProvider(props: { children: JSX.Element }) {
       );
       batch(() => {
         if (matched.length > 0) {
-          setState("tmuxPanes", [...tmuxState.panes, ...matched]);
+          setState("tmuxPanes", [
+            ...dropDuplicateMirrors(tmuxState.panes, matched),
+            ...matched,
+          ]);
         }
         setState("unmirroredRemotePanes", unmirrored);
       });
