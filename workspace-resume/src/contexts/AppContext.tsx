@@ -309,9 +309,16 @@ export function AppProvider(props: { children: JSX.Element }) {
       const windows = await listTmuxWindows(name);
       setState("tmuxWindows", windows);
       if (windows.length > 0) {
-        const firstWindow = windows[0];
-        setState("selectedTmuxWindow", firstWindow.index);
-        await loadTmuxPanes(name, firstWindow.index);
+        // Initial-load follow: prefer tmux's currently-active window
+        // (the one the attached client is showing) over the first
+        // window in the list. This is the ONE place we want to mirror
+        // tmux's view — subsequent transitions are driven by
+        // `WindowFocusChanged` events, and explicit user clicks via
+        // `selectTmuxWindow` should never be overridden by the
+        // poll-driven follow that used to live in `loadTmuxPanes`.
+        const initial = windows.find((w) => w.active) ?? windows[0];
+        setState("selectedTmuxWindow", initial.index);
+        await loadTmuxPanes(name, initial.index);
       } else {
         batch(() => {
           setState("selectedTmuxWindow", null);
@@ -407,32 +414,21 @@ export function AppProvider(props: { children: JSX.Element }) {
     try {
       const tmuxState = await getTmuxState(sessionName, windowIndex);
 
-      // F-52: Auto-follow active tmux window.
-      // If the user switched windows in tmux, sync the dashboard to match.
-      // Suppressed for 2s after a user-initiated tab click to avoid race conditions.
-      const activeWin = tmuxState.windows.find((w) => w.active);
-      if (activeWin && activeWin.index !== windowIndex && Date.now() > autoFollowSuppressedUntil) {
-        setState("tmuxSessions", tmuxState.sessions);
-        setState("tmuxWindows", tmuxState.windows);
-        setState("selectedTmuxWindow", activeWin.index);
-        const freshState = await getTmuxState(sessionName, activeWin.index);
-        const remote = await loadRemotePanes();
-        const { matched, unmirrored } = partitionRemotePanes(
-          remote,
-          freshState.windows,
-          activeWin.index,
-        );
-        batch(() => {
-          setState("tmuxPanes", [
-            ...dropDuplicateMirrors(freshState.panes, matched),
-            ...matched,
-          ]);
-          setState("unmirroredRemotePanes", unmirrored);
-        });
-        loadPaneAssignments();
-        pollPaneStatuses();
-        return;
-      }
+      // Auto-follow used to live here as F-52 — every poll re-evaluated
+      // tmux's active window and overrode `selectedTmuxWindow` if it
+      // differed. That fought explicit user clicks: clicking a Tauri
+      // tab calls `tmux select-window` from a transient wsl.exe client
+      // which immediately exits, so tmux's *active* stays wherever
+      // WezTerm is attached. Once the 2 s suppression expired, F-52
+      // saw the divergence and snapped the dashboard back to whatever
+      // WezTerm was showing — confusing.
+      //
+      // Now: `WindowFocusChanged` events from the Rust poller drive
+      // auto-follow on real transitions only (see
+      // `handleCompanionEvent`). Initial-load follow lives in
+      // `selectTmuxSessionInternal` which picks tmux's active window
+      // exactly once. This function always loads the window it was
+      // asked to load.
 
       // Render local panes immediately so the grid doesn't wait on SSH.
       batch(() => {
