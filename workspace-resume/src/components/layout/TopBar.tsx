@@ -103,11 +103,55 @@ export function TopBar() {
   const [alwaysOnTop, setAlwaysOnTop] = createSignal(false);
   const [sessionDropdownOpen, setSessionDropdownOpen] = createSignal(false);
 
-  const SHELL_WINDOW_NAMES = new Set(["claude", "claude-b", "bash", "zsh", "sh", "fish", "node", "-"]);
+  /** Is `name` a name tmux would have auto-renamed a window to?
+   *
+   *  tmux's default `automatic-rename on` continuously rewrites
+   *  `window_name` to the current command running in the active
+   *  pane. The catppuccin status line in the user's .tmux.conf
+   *  overrides this by displaying `#{b:pane_current_path}` — so
+   *  WezTerm shows project names while `window_name` itself stays
+   *  set to `bash` / `cli-ncld-118.bin` / etc. Without this check
+   *  the Tauri tab row faithfully shows the raw (useless) tmux
+   *  name — three Claude windows all labelled `cli-ncld-118.bin`
+   *  with no way to tell them apart.
+   *
+   *  The predicate is deliberately a bit loose: false-positives
+   *  (treating a user-renamed `bash` window as auto) just route
+   *  through the project-match path, which falls back to the raw
+   *  name if no project hit lands. False-negatives (missing a
+   *  binary pattern) are worse — they show the raw binary name.
+   *  Tune by adding patterns as new auto-rename outputs show up. */
+  function isAutoRenamed(name: string): boolean {
+    const n = name.trim().toLowerCase();
+    if (!n || n === "-") return true;
+    // Known shells.
+    if (["bash", "zsh", "sh", "fish", "dash", "ksh"].includes(n)) return true;
+    // Common interactive commands that auto-rename kicks in on.
+    if (["node", "python", "python3", "ssh", "vim", "nvim", "htop", "top", "less", "more", "tail", "watch"].includes(n)) {
+      return true;
+    }
+    // Claude family — the literal `claude` binary, the profile-suffixed
+    // `claude-b` / `claude-c`, and the `ncld` / `mncld` / `mcld` wrappers,
+    // including the versioned `cli-ncld-118.bin` auto-rename tmux picks
+    // up when the patched Claude binary is running.
+    if (
+      /^claude(-[a-z])?$/.test(n) ||
+      /^m?n?cld\d*$/.test(n) ||
+      /^cli-[mn]?cld/.test(n)
+    ) {
+      return true;
+    }
+    // Generic binary suffixes — any *.bin or *.exe the user might spawn.
+    if (n.endsWith(".bin") || n.endsWith(".exe")) return true;
+    return false;
+  }
 
   function windowDisplayName(win: TmuxWindow): string {
     const rawName = win.name || "";
-    if (!SHELL_WINDOW_NAMES.has(rawName.toLowerCase())) return rawName;
+    // User-renamed windows (e.g. `mac/akamai-v3-bestbuy` mirror
+    // windows, or anything the user set via `prefix+,`) short-circuit
+    // and pass through unchanged.
+    if (!isAutoRenamed(rawName)) return rawName;
     // TopBar's window tabs always belong to the selected LOCAL session
     // (remote sessions aren't yet exposed in tabs), so the lookup is
     // scoped to `local|<selected-session>|<win.index>` in the new
