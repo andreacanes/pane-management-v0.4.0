@@ -117,10 +117,15 @@ export function PaneSlot(props: { pane: TmuxPane; assignment?: string | null }) 
 
   /** Parse `<alias>` and `<session>` out of an ssh-mirror pane's
    *  start_command. Returns null for non-mirrors. Drives the mirror
-   *  card's label. */
+   *  card's label.
+   *
+   *  tmux's pane_start_command format wraps the command in quotes
+   *  (e.g. `"ssh -t mac tmux attach-session -t foo"`). `\S` would
+   *  capture the trailing `"` into the session name; explicit
+   *  exclusion of quote chars keeps the parsed name clean. */
   const mirrorTarget = (): { alias: string; session: string } | null => {
     const sc = props.pane.start_command ?? "";
-    const m = sc.match(/ssh\s+-t\s+(\S+)\s+tmux\s+attach-session\s+-t\s+(\S+)/i);
+    const m = sc.match(/ssh\s+-t\s+([^\s"']+)\s+tmux\s+attach-session\s+-t\s+([^\s"']+)/i);
     return m ? { alias: m[1], session: m[2] } : null;
   };
 
