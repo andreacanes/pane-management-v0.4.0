@@ -93,7 +93,7 @@ export function TopBar() {
   const { state, selectTmuxSession, selectTmuxWindow, refreshTmuxState, pausePolling, resumePolling } = useApp();
   const [showSettings, setShowSettings] = createSignal(false);
   const [showGlobalActive, setShowGlobalActive] = createSignal(false);
-  const [alwaysOnTop, setAlwaysOnTop] = createSignal(true);
+  const [alwaysOnTop, setAlwaysOnTop] = createSignal(false);
   const [sessionDropdownOpen, setSessionDropdownOpen] = createSignal(false);
 
   const SHELL_WINDOW_NAMES = new Set(["claude", "claude-b", "bash", "zsh", "sh", "fish", "node", "-"]);
@@ -128,8 +128,9 @@ export function TopBar() {
   });
 
   onMount(async () => {
-    const win = getCurrentWebviewWindow();
-    await win.setAlwaysOnTop(true);
+    // Don't force always-on-top — let the OS decide window stacking
+    // and let the user opt in via the pin toggle if they want it.
+    await getCurrentWebviewWindow().setAlwaysOnTop(false);
   });
 
   async function toggleAlwaysOnTop() {
